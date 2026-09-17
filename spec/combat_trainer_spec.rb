@@ -1570,6 +1570,34 @@ RSpec.describe 'Cross-process state pollution' do
     expect(states).to eq(%w[kill clear_magic dismiss_pet stow done])
   end
 
+  # drbot hunting health waiver (#1278): cleanup skips the last kill only when
+  # the bleeding stop is actually in force.
+  it 'cleanup keeps the last kill for bleeding while the waiver is active' do
+    gs = build_live_game_state
+    allow(gs).to receive(:bleeding?).and_return(true)
+    gs.instance_variable_set(:@stop_on_bleeding, true)
+    gs.instance_variable_set(:@skip_last_kill, false)
+    reader = Class.new { def self.waived?(_signal) = true }
+    stub_const('DrbotHuntingHealthPolicy', reader)
+
+    gs.next_clean_up_step
+
+    expect(gs.instance_variable_get(:@clean_up_step)).to eq('kill')
+  end
+
+  it 'cleanup skips the last kill for bleeding when the waiver reports normal gates' do
+    gs = build_live_game_state
+    allow(gs).to receive(:bleeding?).and_return(true)
+    gs.instance_variable_set(:@stop_on_bleeding, true)
+    gs.instance_variable_set(:@skip_last_kill, false)
+    reader = Class.new { def self.waived?(_signal) = false }
+    stub_const('DrbotHuntingHealthPolicy', reader)
+
+    gs.next_clean_up_step
+
+    expect(gs.instance_variable_get(:@clean_up_step)).to eq('clear_magic')
+  end
+
   # BUG-FINDING: dancing state and can_engage? interaction.
   # When dancing (npcs <= threshold), can_engage? should still return true
   # if npcs exist -- dancing controls weapon selection, not engagement.
@@ -2168,6 +2196,117 @@ RSpec.describe SafetyProcess do
     DRStats.health = 100
     DRStats.concentration = 100
     allow(DRCA).to receive(:activate_khri?).and_return(true)
+  end
+
+  describe 'drbot hunting health waiver (#1278)' do
+    def stub_waiver(active)
+      reader = Class.new do
+        define_singleton_method(:waived?) { |_signal| active }
+      end
+      stub_const('DrbotHuntingHealthPolicy', reader)
+    end
+
+    it 'does not stop for untendable bleeding while the waiver is active' do
+      stub_waiver(true)
+      instance = build_safety_process(untendable_counter: 3)
+      stub_post_safety(instance)
+      allow(instance).to receive(:bleeding?).and_return(true)
+      allow(DRCH).to receive(:has_tendable_bleeders?).and_return(false)
+
+      instance.execute(build_game_state)
+
+      expect($HUNTING_BUDDY).not_to have_received(:stop_hunting)
+      expect($COMBAT_TRAINER).not_to have_received(:stop)
+    end
+
+    it 'does not send EXIT below the health threshold while the waiver is active' do
+      stub_waiver(true)
+      instance = build_safety_process(health_threshold: 60)
+      stub_post_safety(instance)
+      DRStats.health = 30
+      allow(instance).to receive(:fput)
+
+      instance.execute(build_game_state)
+
+      expect(instance).not_to have_received(:fput).with('exit')
+      expect(DRStats.health).to eq(30)
+    end
+
+    it 'does not stop for bleeding with safety_exit_on_bleeding while the waiver is active' do
+      stub_waiver(true)
+      instance = build_safety_process(safety_exit_on_bleeding: true)
+      stub_post_safety(instance)
+      allow(instance).to receive(:bleeding?).and_return(true)
+      allow(DRCH).to receive(:has_tendable_bleeders?).and_return(false)
+
+      instance.execute(build_game_state)
+
+      expect($HUNTING_BUDDY).not_to have_received(:stop_hunting)
+    end
+
+    it 'keeps the Thief stun escape while only health is waived' do
+      stub_waiver(true)
+      instance = build_safety_process(safety_escape_health_threshold: 50)
+      stub_post_safety(instance)
+      allow(DRStats).to receive(:thief?).and_return(true)
+      DRSpells.known_spells['Vanish'] = true
+      allow(instance).to receive(:stunned?).and_return(true, false) # stun clears during the escape wait
+
+      instance.execute(build_game_state)
+
+      expect($HUNTING_BUDDY).to have_received(:stop_hunting)
+    end
+
+    it 'does not use the Thief health escape while the waiver is active' do
+      stub_waiver(true)
+      instance = build_safety_process(safety_escape_health_threshold: 50)
+      stub_post_safety(instance)
+      allow(DRStats).to receive(:thief?).and_return(true)
+      DRSpells.known_spells['Vanish'] = true
+      DRStats.health = 20
+
+      instance.execute(build_game_state)
+
+      expect($HUNTING_BUDDY).not_to have_received(:stop_hunting)
+    end
+
+    it 'keeps the concentration stop while the waiver is active' do
+      stub_waiver(true)
+      instance = build_safety_process(safety_concentration_minimum: 50)
+      stub_post_safety(instance)
+      DRStats.concentration = 10
+
+      instance.execute(build_game_state)
+
+      expect($HUNTING_BUDDY).to have_received(:stop_hunting)
+    end
+
+    it 'restores every health stop when the waiver reports normal gates' do
+      stub_waiver(false)
+      instance = build_safety_process(untendable_counter: 3, health_threshold: 60)
+      stub_post_safety(instance)
+      allow(instance).to receive(:bleeding?).and_return(true)
+      allow(instance).to receive(:fput)
+      DRStats.health = 30
+
+      instance.execute(build_game_state)
+
+      expect($HUNTING_BUDDY).to have_received(:stop_hunting)
+      expect(instance).to have_received(:fput).with('exit')
+    end
+
+    it 'fails closed when the reader raises' do
+      reader = Class.new { def self.waived?(_signal) = raise(StandardError, 'boom') }
+      stub_const('DrbotHuntingHealthPolicy', reader)
+      instance = build_safety_process(health_threshold: 60)
+      stub_post_safety(instance)
+      allow(instance).to receive(:fput)
+      DRStats.health = 30
+
+      instance.execute(build_game_state)
+
+      expect(instance).to have_received(:fput).with('exit')
+    end
   end
 
   describe '#execute' do

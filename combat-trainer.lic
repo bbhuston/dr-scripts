@@ -1432,11 +1432,26 @@ class SafetyProcess
     @untendable_counter = 0
   end
 
+  # Temporary drbot hunting health waiver (#1278): only health-only stops
+  # consult it; stun, concentration, and every other trigger are unchanged.
+  # A missing or failing reader means the ordinary stop applies.
+  def drbot_health_waived?(signal)
+    return false unless defined?(DrbotHuntingHealthPolicy)
+
+    DrbotHuntingHealthPolicy.waived?(signal) == true
+  rescue StandardError
+    false
+  end
+
   def execute(game_state)
+    waive_untendable = drbot_health_waived?('active_hunt.untendable_bleeding')
+    waive_escape = drbot_health_waived?('active_hunt.health_escape')
+    waive_bleeding = drbot_health_waived?('active_hunt.bleeding')
+    waive_floor = drbot_health_waived?('active_hunt.health_floor')
     # Reset the failure count whenever we are not actively bleeding, so a stale
     # count from an earlier, since-resolved bleed cannot trip the stop below.
     @untendable_counter = 0 unless bleeding?
-    if @untendable_counter >= @safety_untendable_threshold && @stop_on_bleeding
+    if @untendable_counter >= @safety_untendable_threshold && @stop_on_bleeding && !waive_untendable
       echo('Skipping tendme check due to untendable backoff') if $debug_mode_ct
       echo("Couldn't tend bleeders after trying #{@safety_untendable_threshold} time(s). Stopping hunt. Get healed!")
       $HUNTING_BUDDY.stop_hunting
@@ -1445,7 +1460,7 @@ class SafetyProcess
       echo("Concentration below #{@safety_concentration_minimum}. Stopping hunt.")
       $HUNTING_BUDDY.stop_hunting
       $COMBAT_TRAINER.stop
-    elsif @safety_escape_health_threshold && DRStats.thief? && DRSpells.known_spells['Vanish'] && (bleeding? || stunned? || DRStats.health < @safety_escape_health_threshold)
+    elsif @safety_escape_health_threshold && DRStats.thief? && DRSpells.known_spells['Vanish'] && (stunned? || (!waive_escape && (bleeding? || DRStats.health < @safety_escape_health_threshold)))
       pause 0.1 while stunned?
       echo("Bleeding. Activating Vanish and stopping hunt.") if bleeding?
       echo("Stunned. Activating Vanish and stopping hunt.") if stunned?
@@ -1453,7 +1468,7 @@ class SafetyProcess
       DRCA.activate_khri?(false, "Vanish")
       $HUNTING_BUDDY.stop_hunting
       $COMBAT_TRAINER.stop
-    elsif @safety_exit_on_bleeding && (bleeding? || (stunned? && DRStats.health < (@safety_escape_health_threshold || 80)))
+    elsif @safety_exit_on_bleeding && ((bleeding? && !waive_bleeding) || (stunned? && DRStats.health < (@safety_escape_health_threshold || 80) && !waive_floor))
       echo("Bleeding. Stopping hunt.") if bleeding?
       echo("Stunned with low health. Stopping hunt.") if stunned?
       $HUNTING_BUDDY.stop_hunting
@@ -1472,7 +1487,7 @@ class SafetyProcess
       end
     end
 
-    fput 'exit' if DRStats.health < @health_threshold
+    fput 'exit' if DRStats.health < @health_threshold && !waive_floor
     DRC.fix_standing unless standing?
     check_item_recovery(game_state)
     tend_lodged
@@ -5395,11 +5410,20 @@ class GameState
     echo("  @undeads: #{@undeads}") if $debug_mode_ct
   end
 
+  # Temporary drbot hunting health waiver (#1278); see SafetyProcess.
+  def drbot_health_waived?(signal)
+    return false unless defined?(DrbotHuntingHealthPolicy)
+
+    DrbotHuntingHealthPolicy.waived?(signal) == true
+  rescue StandardError
+    false
+  end
+
   def next_clean_up_step
     echo("  Changing from clean up step #{@clean_up_step}") if $debug_mode_ct
     case @clean_up_step
     when nil
-      @clean_up_step = if @stop_on_bleeding && bleeding?
+      @clean_up_step = if @stop_on_bleeding && bleeding? && !drbot_health_waived?('active_hunt.bleeding')
                          'clear_magic'
                        elsif @skip_last_kill
                          'clear_magic'
