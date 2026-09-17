@@ -14,6 +14,13 @@ rescue SyntaxError, StandardError => e
   false
 end
 
+# A missing helper disables only enemy recipes; ordinary attacks remain available.
+begin
+  load File.join(File.dirname(File.realpath(defined?(Script) && Script.current ? Script.current.file_name : __FILE__)), 'combat-trainer-analyze-sequence.rb')
+rescue LoadError, StandardError
+  # Bootstrap verifies the managed helper; tolerate an unavailable runtime copy.
+end
+
 class SetupProcess
   def initialize(settings, equipment_manager)
     @equipment_manager = equipment_manager
@@ -2107,7 +2114,7 @@ class SpellProcess
 
     # Warrior Mage's "elemental barrage" attack
     if @prep == 'target' && @barrage && game_state.can_use_barrage_attack?
-      @custom_cast = "barrage #{game_state.melee_attack_verb}"
+      @custom_cast = "barrage #{game_state.melee_attack_verb(allow_enemy_combo: false)}"
     end
 
     if game_state.is_offense_allowed? || @prepared_spell['harmless']
@@ -3901,23 +3908,7 @@ class TrainerProcess
     return if fail_count > @analyze_retry_count
     return if DRSkill.getxp('Tactics') >= @combat_training_abilities_target
 
-    case DRC.bput('analyze', 'roundtime', 'Analyze what', 'Your analysis reveals a massive opening', /You reveal an? .* (?:weakness|opening)/, /Your analysis reveals an? .* (?:weakness|opening)/, 'You fail to find any holes', 'There is nothing else', 'Face what', 'You must be closer', 'You must be standing', 'Strangely, you don\'t feel like fighting right now', 'flying too high for you to attack', 'Bumbling, you slip') # unless
-    when 'Analyze what'
-      case DRC.bput('face next', 'There is nothing else', 'You turn', 'What are you trying', 'Face what')
-      when 'There is nothing else', 'What are you trying'
-        game_state.engage
-      end
-      analyze(game_state, fail_count)
-    when 'You must be closer'
-      game_state.engage
-    when 'Your analysis reveals a massive opening'
-      waitrt?
-      return
-    when 'You fail to find any holes'
-      analyze(game_state, fail_count + 1)
-    when /You reveal an? .* (?:weakness|opening)/, /Your analysis reveals an? .* (?:weakness|opening)/
-      analyze(game_state, fail_count)
-    end
+    game_state.capture_enemy_analyze(train_only: true)
     waitrt?
   end
 
@@ -4240,7 +4231,9 @@ class AttackProcess
         end
       end
 
-      DRC.bput(command, 'Wouldn\'t it be better if you used a melee weapon?', 'You need two hands to wield this weapon', 'You turn to face', 'Face What?', 'Roundtime', "You aren't close enough to attack", 'It would help if you were closer', 'There is nothing else to face!', 'You must be hidden', 'flying too high for you to attack', 'You can\'t coldcock', 'while it is flying', 'Novel idea, but it\'s a ghost!', 'Bumbling, you slip', 'You can not slam with that', 'You must be hidden or invisible to ambush', 'You don\'t have enough focus', 'You don\'t think you have enough focus', 'You can\'t backstab that', 'is already out cold')
+      unless game_state.dispatch_enemy_combo(command)
+        DRC.bput(command, 'Wouldn\'t it be better if you used a melee weapon?', 'You need two hands to wield this weapon', 'You turn to face', 'Face What?', 'Roundtime', "You aren't close enough to attack", 'It would help if you were closer', 'There is nothing else to face!', 'You must be hidden', 'flying too high for you to attack', 'You can\'t coldcock', 'while it is flying', 'Novel idea, but it\'s a ghost!', 'Bumbling, you slip', 'You can not slam with that', 'You must be hidden or invisible to ambush', 'You don\'t have enough focus', 'You don\'t think you have enough focus', 'You can\'t backstab that', 'is already out cold')
+      end
     end
 
     waitrt?
@@ -5920,6 +5913,7 @@ class GameState
 
   def update_room_npcs
     @cached_npcs = DRRoom.npcs - (@ignored_npcs || [])
+    @enemy_analyze_sequence&.next_verb(context: enemy_analyze_context)
     @dancing = @cached_npcs.length <= @dance_threshold || @cached_npcs.empty?
     @retreating = @retreat_threshold && @cached_npcs.length >= @retreat_threshold
     escape_unsafe_contact if @retreating
@@ -6491,6 +6485,7 @@ class GameState
 
   def stop_analyze_combo
     @use_analyze_combos = false
+    @enemy_analyze_sequence&.stop!
   end
 
   def set_barb_accuracy_flag
@@ -6522,7 +6517,7 @@ class GameState
     true
   end
 
-  def melee_attack_verb
+  def melee_attack_verb(allow_enemy_combo: true)
     if currently_whirlwinding
       determine_whirlwind_action
     elsif (lacking_inner_fire? || need_expertise?) && !brawling?
@@ -6535,8 +6530,18 @@ class GameState
     # !offhand & !brawling are there because you can't use a weapon for brawling commands
     # This issue will cause problems with the combo array system
     elsif @use_analyze_combos && !offhand? && !brawling? && DRSkill.getxp('Tactics') <= @combat_training_abilities_target
-      update_analyze_array if @analyze_combo_array.empty?
-      @analyze_combo_array.empty? ? 'attack' : @analyze_combo_array.shift
+      # A plain ANALYZE yields an enemy recipe even for a Barbarian. Typed
+      # Expertise recipes retain their existing selection semantics.
+      if allow_enemy_combo && enemy_analyze_sequence&.active?
+        enemy_combo_attack_verb
+      elsif DRStats.barbarian?
+        update_analyze_array if @analyze_combo_array.empty?
+        @analyze_combo_array.empty? ? 'attack' : @analyze_combo_array.shift
+      elsif allow_enemy_combo
+        enemy_combo_attack_verb
+      else
+        'attack'
+      end
     else
       'attack'
     end
@@ -6740,7 +6745,140 @@ class GameState
     item && item.bound
   end
 
+  # These methods stay inside the trainer's normal action order. No ambient
+  # flag or separate combat loop can acknowledge a selected enemy step.
+  def enemy_analyze_sequence
+    return nil unless defined?(CombatTrainerAnalyzeSequence)
+
+    @enemy_analyze_sequence ||= CombatTrainerAnalyzeSequence.new
+  end
+
+  def enemy_analyze_context
+    roster = DRRoom.npcs - (@ignored_npcs || [])
+    return nil if roster.empty? || !DRC.right_hand
+    return nil unless roster.all? { |name| name.is_a?(String) && name.match?(/\A[a-zA-Z][a-zA-Z '-]*\z/) }
+    # DRRoom uses noun-only entries and prefix ordinals ("second goblin").
+    # Never guess which duplicate the ANALYZE header or a landing refers to.
+    target = roster.first
+    return nil unless DRRoom.npcs.count { |name| name.split.last == target.split.last } == 1
+
+    { room: Room.current.id, roster: roster, selector: target, weapon: DRC.right_hand,
+      left_weapon: DRC.left_hand, observed_roster: DRRoom.npcs.dup }
+  end
+
+  # DRC.bput retries WAIT/posture/stun internally. An enemy attempt must send
+  # exactly once and collect its complete frame under a fixed deadline instead.
+  def enemy_combo_frame(command, context: nil, wait_for_rt: true)
+    waitrt? if wait_for_rt
+    return [[], false] if context && context != enemy_analyze_context
+
+    clear
+    @enemy_combo_sent_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    put command
+    deadline = @enemy_combo_sent_at + 8.0
+    lines = []
+    while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      line = get?
+      if line
+        lines << line
+        return [lines, true] if line.strip.match?(/\A(?:Roundtime(?:\s*:|\s+\d)|\[Roundtime\s+\d+\s+sec\.\]\z)/i)
+        return [lines, false] if line =~ /^(?:Wait |Sorry,|You (?:must|cannot|can not|can't|need|aren't)|Please wait|Analyze what|What are you trying|There is nothing|Face what)/i
+      else
+        pause 0.05
+      end
+    end
+    [lines, false]
+  end
+
+  def capture_enemy_analyze(train_only: false)
+    sequence = enemy_analyze_sequence
+    return false unless @use_analyze_combos || train_only
+    return false unless can_engage?
+    context = enemy_analyze_context
+    # Standalone Tactics training historically also works empty-handed and
+    # while combo selection is disabled. It must not require a weapon recipe.
+    if train_only && (!@use_analyze_combos || !context || !sequence)
+      sequence&.abandon! unless context
+      command = context ? "analyze #{context[:selector]}" : 'analyze'
+      _lines, complete = enemy_combo_frame(command, context: context)
+      return complete
+    end
+    return false unless sequence
+    unless context
+      sequence.abandon!
+      return false
+    end
+    return false unless sequence.capturing_allowed?
+
+    # Name an unambiguous observed target instead of assuming a room entry is
+    # faced. Reanalysis always replaces the recipe from the actual new response.
+    lines, complete = enemy_combo_frame("analyze #{context[:selector]}", context: context)
+    if !complete || context != enemy_analyze_context
+      sequence.abandon!
+      return false
+    end
+    return true unless @use_analyze_combos
+
+    sequence.capture(lines, context: context.merge(analyze_started_at: @enemy_combo_sent_at))
+  rescue StandardError
+    sequence&.abandon!
+    false
+  end
+
+  def enemy_combo_attack_verb
+    sequence = enemy_analyze_sequence
+    return 'attack' unless sequence && @use_analyze_combos
+
+    context = enemy_analyze_context
+    unless context
+      sequence.abandon!
+      return 'attack'
+    end
+    if sequence.needs_reset?(context: context) || !sequence.active?
+      capture_enemy_analyze
+    end
+    sequence.next_verb(context: enemy_analyze_context) || 'attack'
+  rescue StandardError
+    sequence&.abandon!
+    'attack'
+  end
+
+  # Return true once a combo command was sent, even when its response is unknown:
+  # falling through would issue a second ordinary attack in the same action.
+  def dispatch_enemy_combo(command)
+    sequence = enemy_analyze_sequence
+    return false unless sequence && @use_analyze_combos && sequence.active?
+
+    # ANALYZE may have introduced RT after attack selection. Recheck the
+    # window after that wait, then send without a second intervening wait.
+    waitrt?
+    context = enemy_analyze_context
+    return true if sequence.needs_reset?(context: context)
+    return true unless sequence.active?
+
+    token = sequence.begin_attempt(command: command, context: context)
+    return false unless token
+
+    sent = true
+    lines, complete = enemy_combo_frame("#{command} #{sequence.selector}", context: context, wait_for_rt: false)
+    if complete && @use_analyze_combos
+      sequence.resolve(token, lines: lines, context: enemy_analyze_context)
+    else
+      sequence.abandon!
+    end
+    true
+  rescue StandardError
+    sequence&.abandon!
+    !!sent
+  end
+
+  # Called with an explicit receiver by AbilityProcess and AttackProcess.
+  # Keep the surrounding GameState helpers private.
+  public :capture_enemy_analyze, :dispatch_enemy_combo
+
   def perform_analyze?(combo_type, expertise_requirement)
+    return capture_enemy_analyze if combo_type.to_s.empty?
+
     return false if combo_type != 'flame' && !Flags["ct-#{combo_type}-ready"] && DRStats.barbarian?
     return false if DRSkill.getrank('Expertise') < expertise_requirement
     return false unless can_engage?
