@@ -4310,6 +4310,7 @@ class AttackProcess
       return
     end
 
+    ordinary_attack_confirmed = true
     maneuver_success = false
     if charged_maneuver
       # If you're prioritizing doublestrike but only wielding one melee weapon
@@ -4326,6 +4327,7 @@ class AttackProcess
       maneuver_success = game_state.use_charged_maneuver(charged_maneuver)
 
       game_state.sheath_offhand_weapon(skill) if offhand_weapon_name
+      return if game_state.drbot_attack_ids_required? && !maneuver_success
       if Flags['ct-attack-out-of-range']
         pause 2
         return
@@ -4357,7 +4359,15 @@ class AttackProcess
       end
 
       unless game_state.dispatch_typed_combo(command) || game_state.dispatch_enemy_combo(command)
-        DRC.bput(command, 'Wouldn\'t it be better if you used a melee weapon?', 'You need two hands to wield this weapon', 'You turn to face', 'Face What?', 'Roundtime', "You aren't close enough to attack", 'It would help if you were closer', 'There is nothing else to face!', 'You must be hidden', 'flying too high for you to attack', 'You can\'t coldcock', 'while it is flying', 'Novel idea, but it\'s a ghost!', 'Bumbling, you slip', 'You can not slam with that', 'You must be hidden or invisible to ambush', 'You don\'t have enough focus', 'You don\'t think you have enough focus', 'You can\'t backstab that', 'is already out cold')
+        if game_state.drbot_attack_ids_required?
+          waitrt?
+          expected_id = command[/#([1-9]\d*)\z/, 1]
+          target_id = game_state.drbot_attack_target_id(expected_id)
+          return unless target_id
+          command += " #{target_id}" unless expected_id
+        end
+        attack_result = DRC.bput(command, 'Wouldn\'t it be better if you used a melee weapon?', 'You need two hands to wield this weapon', 'You turn to face', 'Face What?', 'Roundtime', "You aren't close enough to attack", 'It would help if you were closer', 'There is nothing else to face!', 'You must be hidden', 'flying too high for you to attack', 'You can\'t coldcock', 'while it is flying', 'Novel idea, but it\'s a ghost!', 'Bumbling, you slip', 'You can not slam with that', 'You must be hidden or invisible to ambush', 'You don\'t have enough focus', 'You don\'t think you have enough focus', 'You can\'t backstab that', 'is already out cold', /already (?:quite )?dead/, /could not find/i)
+        ordinary_attack_confirmed = !game_state.drbot_attack_ids_required? || attack_result.to_s.match?(/roundtime/i)
       end
     end
 
@@ -4380,7 +4390,7 @@ class AttackProcess
 
     if reget(5, 'You aren\'t close enough to attack', 'It would help if you were closer')
       game_state.engage
-    else
+    elsif ordinary_attack_confirmed
       game_state.action_taken
     end
     return unless reget(5, 'You need two hands')
@@ -4400,12 +4410,20 @@ class AttackProcess
       )
     end
     rush_target = drbot_spear_rush_target(game_state) if respond_to?(:drbot_spear_rush_target) && attack_action.match?(/\A(?:lob|throw|hurl)\z/)
-    attack_action += " #{game_state.weapon_name} at #{rush_target[:selector]}" if rush_target
-    DRC.bput(attack_action, 'roundtime', 'What are you trying to')
+    if game_state.drbot_attack_ids_required?
+      waitrt?
+      target_id = game_state.drbot_attack_target_id(rush_target && rush_target[:id])
+      return unless target_id
+      attack_action += " #{game_state.weapon_name}" unless game_state.offhand?
+      attack_action += " at #{target_id}"
+    elsif rush_target
+      attack_action += " #{game_state.weapon_name} at #{rush_target[:selector]}"
+    end
+    throw_result = DRC.bput(attack_action, 'roundtime', 'What are you trying to', /already (?:quite )?dead/, /could not find/i)
     waitrt?
-    return game_state.action_taken if attack_action.include?('whip')
-
-    drbot_spear_rush_after_throw(game_state, rush_target) if rush_target
+    throw_confirmed = !game_state.drbot_attack_ids_required? || throw_result.to_s.match?(/roundtime/i)
+    return (game_state.action_taken if throw_confirmed) if attack_action.include?('whip')
+    drbot_spear_rush_after_throw(game_state, rush_target) if rush_target && throw_confirmed
 
     if game_state.weapon_name == 'blades'
       until /(Stow what|You put your)/ =~ DRC.bput('stow blade', 'Stow what', 'You pick up .*blade', 'You put your')
@@ -4440,7 +4458,7 @@ class AttackProcess
       DRC.bput('swap', 'You move', 'You have nothing') if game_state.offhand?
     end
 
-    game_state.action_taken
+    game_state.action_taken if throw_confirmed
   end
 
   def held_weapon_matches?(held_item, expected_weapon)
@@ -6272,6 +6290,24 @@ class GameState
     observation
   end
 
+  # ID targeting is required where the complete server census is supported.
+  def drbot_attack_ids_required?
+    @drbot_supervised_group == 'lvt-goblins'
+  end
+
+  def drbot_attack_target_id(expected_id = nil)
+    return nil unless drbot_attack_ids_required?
+    observation = fresh_target_selector
+    return nil unless observation && observation.size == 4
+    context = drbot_target_context
+    id = observation[2].to_s
+    return nil unless id.match?(/\A[1-9]\d*\z/) && observation[3] == "##{id}"
+    return nil unless observation[0] == Room.current.id && observation[1] == context
+    return nil unless context && context[:ids].include?(id)
+    return nil if expected_id && id != expected_id.to_s
+    "##{id}"
+  end
+
   def fresh_target_selector
     personal = drbot_personal_melee_target_selector
     return personal if personal
@@ -6598,7 +6634,24 @@ class GameState
 
     wield_specific_weapon(@rush_shield, 'Shield Usage', false) if is_shield_rush && !shield_already_held
 
-    attempt = DRC.bput("maneuver #{maneuver}", *maneuver_success_messages, *maneuver_failure_messages, *maneuver_retreat_retry_messages)
+    command = "maneuver #{maneuver}"
+    if drbot_attack_ids_required?
+      waitrt?
+      target_id = drbot_attack_target_id
+      unless target_id
+        @equipment_manager.stow_weapon(@rush_shield) if is_shield_rush && !shield_already_held
+        return false
+      end
+      command += " #{target_id}"
+      # Windup is not an attack acknowledgement. Wait for an own terminal
+      # strike/ending; keep a conservative cooldown if its result is unknown.
+      maneuver_success_messages = [
+        /^Your .+ lands an? /,
+        /^With .*you end the attack and maneuver into a better position\./
+      ]
+      @cooldown_timers[maneuver.downcase] = Time.now + 90
+    end
+    attempt = DRC.bput(command, *maneuver_success_messages, *maneuver_failure_messages, *maneuver_retreat_retry_messages, /already (?:quite )?dead/, /could not find/i, /Please rephrase/)
 
     waitrt?
 
@@ -6620,6 +6673,10 @@ class GameState
     when *maneuver_failure_messages
       return false
     when *maneuver_retreat_retry_messages
+      if drbot_attack_ids_required?
+        @cooldown_timers[maneuver.downcase] = Time.now + 10
+        return false
+      end
       if maneuver.casecmp?('rush')
         if @rush_retreat_skip
           # Skip retreat and delay the next rush attempt
