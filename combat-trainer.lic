@@ -6529,7 +6529,7 @@ class GameState
       brawling? ? 'gouge' : 'jab'
     # !offhand & !brawling are there because you can't use a weapon for brawling commands
     # This issue will cause problems with the combo array system
-    elsif @use_analyze_combos && !offhand? && !brawling? && DRSkill.getxp('Tactics') <= @combat_training_abilities_target
+    elsif @use_analyze_combos && !offhand? && !brawling?
       # A plain ANALYZE yields an enemy recipe even for a Barbarian. Typed
       # Expertise recipes retain their existing selection semantics.
       if allow_enemy_combo && enemy_analyze_sequence&.active?
