@@ -564,6 +564,10 @@ class HuntingBuddy
 
   # ------------------------------------------------------------
 
+  def drbot_supervised_group_held?
+    respond_to?(:supervised_group_hold) && !!supervised_group_hold(self)
+  end
+
   def hunt(args, duration, stop_on_high_skills, stop_on_low_skills, stop_on_boxes, stop_on_no_moons, stop_on_encumbrance, stop_on_burgle_cooldown)
     $COMBAT_TRAINER = nil
     hunting_room = Room.current.id
@@ -595,6 +599,12 @@ class HuntingBuddy
       # The object can retain running=true after its script crashes. The live
       # script must still exist before any countdown or trainer-dependent check.
       unless Script.running?('combat-trainer') && $COMBAT_TRAINER&.running
+        if drbot_supervised_group_held?
+          # A failed child cannot defend the room. Keep the waiting parent
+          # contained until fenced script stop; shared stop flags are not authority.
+          DRC.message("***STATUS*** Combat trainer failed during supervised group hold; held in place for operator recovery")
+          loop { pause 1 }
+        end
         @hunt_stop_reason = :combat_trainer_failed
         @stop_hunting = true
         DRC.message("***STATUS*** Combat trainer stopped unexpectedly or failed to initialize; ending all hunts without restarting")
@@ -615,6 +625,14 @@ class HuntingBuddy
         @stopped_for_bleeding = true
         @hunt_stop_reason = :bleeding
         break
+      end
+      # Unverified group continuity revokes group permissions but does not
+      # stop ordinary individual combat or trigger the return/restart path.
+      # Critical health/bleeding checks above and fenced script stops stay
+      # effective; freeze ordinary completion until the original group returns.
+      if drbot_supervised_group_held?
+        pause 1
+        next
       end
       if stop_on_boxes && over_box_limit?
         DRC.message("***STATUS*** Stopping hunt because have enough boxes")
