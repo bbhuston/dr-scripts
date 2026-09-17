@@ -90,7 +90,7 @@ class CombatTrainerGroupThreats
       return nil unless ids.empty? && (self_row || subject&.match?(/\A-?[1-9]\d*\z/))
       return nil unless target == 'you' ? target_id.nil? : target_id&.match?(/\A-?[1-9]\d*\z/)
 
-      entries << { name: name, id: subject, target: target, target_id: target_id, self: self_row }
+      entries << { name: name, id: subject, target: target, target_id: target_id, self: self_row, range: match[:range] }
     end
     creatures = entries.select { |entry| !entry[:self] && !entry[:id].start_with?('-') }
     peers = entries.select { |entry| !entry[:self] && entry[:id].start_with?('-') }
@@ -112,7 +112,7 @@ class CombatTrainerGroupThreats
     return nil unless peers.map { |entry| entry[:name] }.uniq.length == peers.length
     return nil unless entries.count { |entry| entry[:self] } <= 1
 
-    { creatures: creatures, peers: peers }
+    { creatures: creatures, peers: peers, self: entries.find { |entry| entry[:self] } }
   rescue StandardError
     nil
   end
@@ -137,6 +137,32 @@ class CombatTrainerGroupThreats
   rescue StandardError
     nil
   end
+  # Prefer an opponent already within this character's melee, preserving the
+  # server identity and noun-relative ordinal from the same complete frame.
+  def self.personal_melee_selector(frame, before, after)
+    parsed = entries(frame, before, after, complete: false)
+    return nil unless parsed
+    rows = parsed[:creatures]
+    own = parsed[:self]
+    own = nil unless own && own[:range] == 'melee'
+    creature = rows.find { |row| !row[:self] && row[:id] == own&.dig(:target_id) && before[:ids].include?(row[:id]) }
+    creature ||= rows.find { |row| !row[:self] && row[:target] == 'you' && row[:range] == 'melee' && before[:ids].include?(row[:id]) }
+    return nil unless creature
+
+    frame.scan(SEGMENT).flatten.each do |raw|
+      next unless raw[/<d cmd=["']look #([1-9]\d*)["']>/, 1] == creature[:id]
+      row = CGI.unescapeHTML(raw.gsub(/<[^>]*>/, '')).strip.gsub(/\s+/, ' ').match(ROW)
+      next unless row && row[:name].downcase == creature[:name]
+      number = row[:number].to_i
+      return nil unless number.between?(1, ORDINALS.length)
+      noun = creature[:name].split.last
+      return [creature[:id], "##{creature[:id]}", noun]
+    end
+    nil
+  rescue StandardError
+    nil
+  end
+
   ORDINALS = %w[first second third fourth fifth sixth seventh eighth ninth tenth].freeze
 
   def self.selector(frame, before, after, target)

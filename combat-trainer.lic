@@ -5668,7 +5668,7 @@ class GameState
     observation = fresh_target_selector
     return false unless observation && @target_observation == observation
 
-    result = DRC.bput("engage #{observation.last}", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/)
+    result = DRC.bput("engage #{observation.last}", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/, /^You will have to retreat from your current melee first/, /^You had better stand up first/, /^You spin around to face/)
     case result
     when /You are already (?:stealthily )?at melee/
       true
@@ -5687,7 +5687,7 @@ class GameState
     observation = fresh_target_selector
     return unless observation && @target_observation == observation
 
-    case DRC.bput("engage #{observation.last}", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/)
+    case DRC.bput("engage #{observation.last}", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/, /^You will have to retreat from your current melee first/, /^You had better stand up first/, /^You spin around to face/)
     when /You are already advancing/, /You begin to advance/, /You begin to stealthily advance/
       pause 2
     when /You are already (?:stealthily )?at melee/
@@ -6183,13 +6183,34 @@ class GameState
   end
 
 
+  def drbot_personal_melee_target_selector
+    return nil unless @drbot_supervised_group == 'lvt-goblins'
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    return nil if @drbot_target_retry_at && now < @drbot_target_retry_at
+    context = drbot_target_context
+    return nil unless context
+    cached = @drbot_personal_melee_target
+    return cached[:observation] if cached && cached[:context] == context && now - cached[:at] < 2.0
+
+    @drbot_personal_melee_target = nil
+    result = drbot_group_threat_observation(target: true, individual: true)
+    return nil unless result
+    chosen = CombatTrainerGroupThreats.personal_melee_selector(result[:frame], result[:context], result[:context])
+    observation = chosen && [Room.current.id, result[:context], chosen[0], chosen[1]]
+    @drbot_personal_melee_target = { context: result[:context], observation: observation, noun: chosen && chosen[2], at: Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+    observation
+  end
+
   def fresh_target_selector
+    personal = drbot_personal_melee_target_selector
+    return personal if personal
+
     @cached_npcs = DRRoom.npcs - (@ignored_npcs || [])
     target = @cached_npcs.first
     return unless target && target.match?(/\A[a-zA-Z][a-zA-Z '-]*\z/)
 
     dead = DRRoom.respond_to?(:dead_npcs) ? DRRoom.dead_npcs : []
-    if @drbot_supervised_group == 'lvt-goblins' && (@drbot_target_rejected || dead.any? { |name| name.split.last == target.split.last })
+    if @drbot_supervised_group == 'lvt-goblins'
       return drbot_corpse_target_selector(target)
     end
 
@@ -6216,14 +6237,14 @@ class GameState
     chosen = CombatTrainerGroupThreats.selector(result[:frame], result[:context], result[:context], target)
     return nil unless chosen
 
-    observation = [Room.current.id, result[:context], chosen.first, chosen.last]
+    observation = [Room.current.id, result[:context], chosen.first, "##{chosen.first}"]
     @drbot_corpse_target = { context: result[:context], observation: observation, at: now }
     @drbot_target_retry_at = nil
     observation
   end
 
   def reject_target_observation
-    @target_observation = @drbot_corpse_target = nil
+    @target_observation = @drbot_corpse_target = @drbot_personal_melee_target = nil
     @drbot_target_rejected = true
     @drbot_target_retry_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2.0
     pause 2
@@ -7147,7 +7168,12 @@ class GameState
     target = context[:npcs].first
     return false unless target && DRC.right_hand
 
-    observation = drbot_corpse_target_selector(target)
+    observation = drbot_personal_melee_target_selector
+    if observation
+      target = @drbot_personal_melee_target[:noun]
+    else
+      observation = drbot_corpse_target_selector(target)
+    end
     current = drbot_target_context
     return false unless observation && observation.length == 4 && current && observation[1] == current
     id = observation[-2]
