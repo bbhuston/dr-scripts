@@ -4095,6 +4095,15 @@ class AttackProcess
   def attack_melee(charged_maneuver, game_state)
     waitrt?
 
+    # BACKSTAB, AMBUSH, and Brawling require an actual target at melee.  A room
+    # roster can briefly be empty, can contain a creature that is still
+    # approaching, or can lag behind a departure.  Issuing the attack every
+    # loop tick in any of those states only produces command spam.
+    # AbilityProcess has already run for this tick, so returning here preserves
+    # ambient training and otherwise lets the main loop idle.
+    close_melee_attack = game_state.brawling? || game_state.backstab? || game_state.ambush? || game_state.ambush_stun_training?
+    return if close_melee_attack && !game_state.engage
+
     maneuver_success = false
     if charged_maneuver
       # If you're prioritizing doublestrike but only wielding one melee weapon
@@ -4130,6 +4139,10 @@ class AttackProcess
           command = command.sub(verb, 'ambush stun')
         else
           command = command.sub(verb, 'backstab')
+          selector = game_state.target_selector
+          return unless selector
+
+          command += " #{selector}"
         end
       end
 
@@ -5011,6 +5024,8 @@ class GameState
 
     @retreat_threshold = settings.retreat_threshold
     echo("  @retreat_threshold: #{@retreat_threshold}") if $debug_mode_ct
+    @escape_unsafe_multi_enemy = settings.escape_unsafe_multi_enemy || false
+    echo("  @escape_unsafe_multi_enemy: #{@escape_unsafe_multi_enemy}") if $debug_mode_ct
 
     @damaris_weapon_sets = settings.damaris_weapon_sets
     echo("  @damaris_weapon_sets: #{@damaris_weapon_sets}") if $debug_mode_ct
@@ -5311,6 +5326,9 @@ class GameState
     return false unless can_face?
     return false if retreating?
 
+    @target_observation = fresh_target_selector
+    return false unless @target_observation
+
     true
   end
 
@@ -5406,21 +5424,33 @@ class GameState
   end
 
   def engage
-    return unless can_engage?
-    return if stomp
-    return if pounce
-    return if rush
+    return false unless can_engage?
+    return false if stomp
+    return false if pounce
+    return false if rush
 
-    case DRC.bput("engage", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/)
+    observation = fresh_target_selector
+    return false unless observation && @target_observation == observation
+
+    result = DRC.bput("engage #{observation.last}", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/)
+    case result
+    when /You are already (?:stealthily )?at melee/
+      true
     when /You are already advancing/, /You begin to advance/, /You begin to stealthily advance/
       pause 2
+      false
+    else
+      false
     end
   end
 
   def engage_slow
     return unless can_engage?
 
-    case DRC.bput("engage", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/)
+    observation = fresh_target_selector
+    return unless observation && @target_observation == observation
+
+    case DRC.bput("engage #{observation.last}", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/)
     when /You are already advancing/, /You begin to advance/, /You begin to stealthily advance/
       pause 2
     end
@@ -5772,6 +5802,45 @@ class GameState
     @cached_npcs = DRRoom.npcs - (@ignored_npcs || [])
     @dancing = @cached_npcs.length <= @dance_threshold || @cached_npcs.empty?
     @retreating = @retreat_threshold && @cached_npcs.length >= @retreat_threshold
+    escape_unsafe_contact if @retreating
+  end
+
+  def fresh_target_selector
+    @cached_npcs = DRRoom.npcs - (@ignored_npcs || [])
+    target = @cached_npcs.first
+    return unless target && target.match?(/\A[a-zA-Z][a-zA-Z '-]*\z/)
+
+    [Room.current.id, DRRoom.npcs.dup, target]
+  end
+
+  def target_selector
+    observation = fresh_target_selector
+    return unless observation && @target_observation == observation
+
+    @target_observation = nil
+    observation.last
+  end
+
+  def escape_unsafe_contact
+    return false unless @escape_unsafe_multi_enemy
+    return false unless retreating? && retreat_weapons.empty?
+
+    origin = Room.current.id
+    destination = Room.current.wayto.keys.compact.sort_by(&:to_s).first
+    moved = false
+    if destination
+      DRC.retreat
+      begin
+        DRCT.walk_to(destination)
+        moved = Room.current.id != origin
+      rescue StandardError => e
+        echo "Unsafe-contact exit failed: #{e.message}" if $debug_mode_ct
+      end
+    end
+    DRC.message(moved ? 'Left unsafe multi-enemy contact; stopping hunt.' : 'Unable to verify an exit from unsafe multi-enemy contact; stopping hunt.')
+    $HUNTING_BUDDY&.stop_hunting
+    $COMBAT_TRAINER&.stop
+    true
   end
 
   def retreat_weapons

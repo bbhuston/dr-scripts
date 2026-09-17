@@ -246,6 +246,81 @@ RSpec.describe GameState do
       DRRoom.npcs = ['rat']
       expect(build_offense_state.can_engage?).to be true
     end
+
+    it 'invalidates the selector when movement follows engagement gating' do
+      DRRoom.npcs = ['goblin']
+      gs = build_offense_state
+      allow(Room).to receive(:current).and_return(
+        double('Room', id: 10), double('Room', id: 11)
+      )
+      expect(gs.can_engage?).to be true
+      expect(gs.target_selector).to be_nil
+    end
+
+    it 'invalidates the selector when target death churns duplicate ordinals' do
+      DRRoom.npcs = ['goblin', 'second goblin']
+      room = double('Room', id: 10)
+      allow(Room).to receive(:current).and_return(room)
+      gs = build_offense_state
+
+      expect(gs.can_engage?).to be true
+      DRRoom.npcs = ['goblin']
+      expect(gs.target_selector).to be_nil
+    end
+
+    it 'invalidates the selector when the ordered target roster changes' do
+      DRRoom.npcs = %w[goblin hog]
+      room = double('Room', id: 10)
+      allow(Room).to receive(:current).and_return(room)
+      gs = build_offense_state
+
+      expect(gs.can_engage?).to be true
+      DRRoom.npcs = %w[hog goblin]
+      expect(gs.target_selector).to be_nil
+    end
+
+    it 'consumes each fresh selector after one use' do
+      DRRoom.npcs = ['goblin']
+      room = double('Room', id: 10)
+      allow(Room).to receive(:current).and_return(room)
+      gs = build_offense_state
+
+      expect(gs.can_engage?).to be true
+      expect(gs.target_selector).to eq('goblin')
+      expect(gs.target_selector).to be_nil
+    end
+  end
+
+  describe '#engage' do
+    def build_engage_state
+      gs = build_offense_state
+      allow(gs).to receive(:stomp).and_return(false)
+      allow(gs).to receive(:pounce).and_return(false)
+      allow(gs).to receive(:rush).and_return(false)
+      allow(gs).to receive(:pause)
+      gs
+    end
+
+    it 'returns false without sending a command when no combatants are present' do
+      DRRoom.npcs = []
+      expect(DRC).not_to receive(:bput)
+      expect(build_engage_state.engage).to be false
+    end
+
+    it 'returns false and waits while the target is still approaching' do
+      DRRoom.npcs = ['rat']
+      gs = build_engage_state
+      allow(DRC).to receive(:bput).and_return('You begin to advance')
+
+      expect(gs.engage).to be false
+      expect(gs).to have_received(:pause).with(2)
+    end
+
+    it 'returns true only after melee engagement is confirmed' do
+      DRRoom.npcs = ['rat']
+      allow(DRC).to receive(:bput).and_return('You are already at melee')
+      expect(build_engage_state.engage).to be true
+    end
   end
 
   # ---- NPC handling ----
@@ -301,6 +376,40 @@ RSpec.describe GameState do
       gs = build_npc_state(retreat_threshold: nil)
       gs.update_room_npcs
       expect(gs.retreating?).to be_falsy
+    end
+
+    it 'leaves through a mapped exit and stops unsafe melee-only contact' do
+      gs = build_npc_state(dance_threshold: 0, retreat_threshold: 2)
+      gs.instance_variable_set(:@escape_unsafe_multi_enemy, true)
+      gs.instance_variable_set(:@weapons_to_train, { 'Small Edged' => 'kris' })
+      DRRoom.npcs = %w[goblin hog]
+      origin = double('Room', id: 10, wayto: { 11 => 'east' })
+      destination = double('Room', id: 11, wayto: {})
+      current_room = origin
+      allow(Room).to receive(:current) { current_room }
+      allow(DRC).to receive(:retreat)
+      allow(DRCT).to receive(:walk_to) { current_room = destination }
+
+      gs.update_room_npcs
+      expect(DRCT).to have_received(:walk_to).with(11).once
+      expect($HUNTING_BUDDY).to have_received(:stop_hunting).once
+      expect($COMBAT_TRAINER).to have_received(:stop).once
+    end
+
+    it 'stops without retrying when no mapped exit can be verified' do
+      gs = build_npc_state(dance_threshold: 0, retreat_threshold: 2)
+      gs.instance_variable_set(:@escape_unsafe_multi_enemy, true)
+      gs.instance_variable_set(:@weapons_to_train, { 'Small Edged' => 'kris' })
+      DRRoom.npcs = %w[goblin hog]
+      allow(Room).to receive(:current).and_return(
+        double('Room', id: 10, wayto: {})
+      )
+      allow(DRCT).to receive(:walk_to)
+
+      gs.update_room_npcs
+      expect(DRCT).not_to have_received(:walk_to)
+      expect($HUNTING_BUDDY).to have_received(:stop_hunting).once
+      expect($COMBAT_TRAINER).to have_received(:stop).once
     end
 
     # BUG-FINDING: all npcs ignored leaves empty room
@@ -686,6 +795,7 @@ RSpec.describe AttackProcess do
       action_taken: nil, can_engage?: true, use_weak_attacks?: false,
       attack_override: 'attack', melee_attack_verb: 'attack',
       engage: nil, set_dance_queue: nil, next_dance_action: 'bob',
+      target_selector: 'rat',
       next_clean_up_step: nil
     }
     double('GameState', defaults.merge(attrs))
@@ -753,6 +863,75 @@ RSpec.describe AttackProcess do
       allow(gs).to receive(:loaded=)
       allow(DRC).to receive(:bput).and_return('Roundtime')
       expect(build_attack.execute(gs)).to be false
+    end
+
+    it 'drops a departed target without issuing another backstab command' do
+      gs = gs_double(npcs: [], backstab?: true, engage: false)
+      allow(gs).to receive(:loaded=)
+      expect(DRC).not_to receive(:bput)
+
+      expect(build_attack.execute(gs)).to be false
+      expect(gs).to have_received(:engage)
+    end
+
+    it 'drops a departed target without issuing another brawling command' do
+      gs = gs_double(npcs: [], brawling?: true, engage: false, melee_attack_verb: 'gouge')
+      allow(gs).to receive(:loaded=)
+      expect(DRC).not_to receive(:bput)
+
+      expect(build_attack.execute(gs)).to be false
+      expect(gs).to have_received(:engage)
+    end
+
+    it 'does not issue backstab commands while a target is approaching' do
+      gs = gs_double(backstab?: true, engage: false)
+      allow(gs).to receive(:loaded=)
+      expect(DRC).not_to receive(:bput)
+
+      expect(build_attack.execute(gs)).to be false
+      expect(gs).to have_received(:engage)
+    end
+
+    it 'does not issue brawling commands while a target is approaching' do
+      gs = gs_double(brawling?: true, engage: false, melee_attack_verb: 'gouge')
+      allow(gs).to receive(:loaded=)
+      expect(DRC).not_to receive(:bput)
+
+      expect(build_attack.execute(gs)).to be false
+      expect(gs).to have_received(:engage)
+    end
+
+    it 'issues backstab only after melee engagement is confirmed' do
+      gs = gs_double(backstab?: true, engage: true)
+      allow(gs).to receive(:loaded=)
+      allow(DRC).to receive(:hide?).and_return(true)
+      allow(DRC).to receive(:bput).and_return('Roundtime')
+      attack = build_attack
+      allow(attack).to receive(:hiding?).and_return(true)
+
+      expect(attack.execute(gs)).to be false
+      expect(DRC).to have_received(:bput).with('backstab rat', any_args)
+    end
+
+    it 'drops a backstab when the fresh selector was invalidated' do
+      gs = gs_double(backstab?: true, engage: true, target_selector: nil)
+      allow(gs).to receive(:loaded=)
+      allow(DRC).to receive(:hide?).and_return(true)
+      attack = build_attack
+      allow(attack).to receive(:hiding?).and_return(true)
+      expect(DRC).not_to receive(:bput)
+
+      expect(attack.execute(gs)).to be false
+    end
+
+    it 'issues one brawling command after melee engagement is confirmed' do
+      gs = gs_double(brawling?: true, engage: true, melee_attack_verb: 'gouge')
+      allow(gs).to receive(:loaded=)
+      allow(DRC).to receive(:bput).and_return('Roundtime')
+
+      expect(build_attack.execute(gs)).to be false
+      expect(gs).to have_received(:engage).once
+      expect(DRC).to have_received(:bput).with('gouge', any_args).once
     end
   end
 end
