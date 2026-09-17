@@ -759,3 +759,113 @@ RSpec.describe HuntingBuddy do
     end
   end
 end
+
+# =============================================================================
+# drbot temporary hunting health waiver (#1278)
+# =============================================================================
+RSpec.describe HuntingBuddy, 'drbot hunting health waiver' do
+  let(:buddy) { HuntingBuddy.allocate }
+
+  before(:each) do
+    buddy.instance_variable_set(:@settings, OpenStruct.new(health_threshold: 80, stop_hunting_if_bleeding: true))
+    buddy.instance_variable_set(:@stopped_for_bleeding, false)
+    allow(DRC).to receive(:message)
+  end
+
+  def stub_waiver(active)
+    reader = Class.new do
+      define_singleton_method(:waived?) { |_signal| active }
+    end
+    stub_const('DrbotHuntingHealthPolicy', reader)
+  end
+
+  describe '#drbot_health_waived?' do
+    it 'is false when no reader is loaded' do
+      hide_const('DrbotHuntingHealthPolicy')
+      expect(buddy.drbot_health_waived?('active_hunt.health_floor')).to be false
+    end
+
+    it 'is false when the reader raises' do
+      reader = Class.new { def self.waived?(_signal) = raise(StandardError, 'boom') }
+      stub_const('DrbotHuntingHealthPolicy', reader)
+      expect(buddy.drbot_health_waived?('active_hunt.health_floor')).to be false
+    end
+
+    it 'is true only for an exact true answer' do
+      reader = Class.new { def self.waived?(_signal) = 'yes' }
+      stub_const('DrbotHuntingHealthPolicy', reader)
+      expect(buddy.drbot_health_waived?('active_hunt.health_floor')).to be false
+      stub_waiver(true)
+      expect(buddy.drbot_health_waived?('active_hunt.health_floor')).to be true
+    end
+  end
+
+  describe '#stop_for_low_health?' do
+    it 'keeps the upstream low-health stop without a waiver' do
+      hide_const('DrbotHuntingHealthPolicy')
+      DRStats.health = 50
+      expect(buddy.stop_for_low_health?).to be true
+    end
+
+    it 'does not stop for low health while the waiver is active' do
+      stub_waiver(true)
+      DRStats.health = 50
+      expect(buddy.stop_for_low_health?).to be false
+    end
+
+    it 'restores the stop when the waiver reports normal gates' do
+      stub_waiver(false)
+      DRStats.health = 50
+      expect(buddy.stop_for_low_health?).to be true
+    end
+
+    it 'never stops at or above the threshold' do
+      stub_waiver(false)
+      DRStats.health = 80
+      expect(buddy.stop_for_low_health?).to be false
+    end
+  end
+
+  describe '#stop_for_bleeding?' do
+    it 'keeps the upstream bleeding stop without a waiver' do
+      hide_const('DrbotHuntingHealthPolicy')
+      allow(buddy).to receive(:bleeding?).and_return(true)
+      expect(buddy.stop_for_bleeding?).to be true
+    end
+
+    it 'does not stop for bleeding while the waiver is active' do
+      stub_waiver(true)
+      allow(buddy).to receive(:bleeding?).and_return(true)
+      expect(buddy.stop_for_bleeding?).to be false
+    end
+
+    it 'still honors stop_hunting_if_bleeding false' do
+      stub_waiver(false)
+      buddy.settings.stop_hunting_if_bleeding = false
+      allow(buddy).to receive(:bleeding?).and_return(true)
+      expect(buddy.stop_for_bleeding?).to be false
+    end
+  end
+
+  describe '#restart_blocked_for_bleeding?' do
+    it 'blocks the restart without a waiver and keeps the flag' do
+      hide_const('DrbotHuntingHealthPolicy')
+      buddy.stopped_for_bleeding = true
+      expect(buddy.restart_blocked_for_bleeding?).to be true
+      expect(buddy.stopped_for_bleeding).to be true
+    end
+
+    it 'clears the flag and continues while the waiver is active' do
+      stub_waiver(true)
+      buddy.stopped_for_bleeding = true
+      expect(buddy.restart_blocked_for_bleeding?).to be false
+      expect(buddy.stopped_for_bleeding).to be false
+      expect(DRC).to have_received(:message).with(/bleeding observed; restart not blocked/)
+    end
+
+    it 'is false when nothing stopped for bleeding' do
+      stub_waiver(false)
+      expect(buddy.restart_blocked_for_bleeding?).to be false
+    end
+  end
+end

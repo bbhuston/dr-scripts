@@ -20,6 +20,7 @@ class HuntingBuddy
 
   attr_reader :settings, :hunting_data, :hunting_zones, :hunting_info
   attr_accessor :my_room_claim, :need_relocation, :stopped_for_bleeding, :hunt_stop_reason
+  attr_reader :search_refused_for_injury
 
   private
 
@@ -174,7 +175,7 @@ class HuntingBuddy
         break
       end
 
-      if @stopped_for_bleeding
+      if restart_blocked_for_bleeding?
         DRC.message("***STATUS*** Stopping all hunting because bleeding")
         DRC.retreat
         stop_script('tendme') if Script.running?('tendme')
@@ -231,7 +232,7 @@ class HuntingBuddy
         next unless find_hunting_room?(hunting_zones, waiting_room, prefer_buddies, avoid_buddies)
       end
 
-      if @stopped_for_bleeding
+      if restart_blocked_for_bleeding?
         DRC.message("***STATUS*** Stopping all hunting because bleeding")
         DRC.retreat
         stop_script('tendme') if Script.running?('tendme')
@@ -431,13 +432,26 @@ class HuntingBuddy
                                         end
                                         room_is_empty
                                       when /You're not in any condition to be searching around/i
-                                        DRC.message("***STATUS*** You're too injured to hunt!")
-                                        @stop_hunting = true
-                                        @stopped_for_bleeding = bleeding?
-                                        # Ironically, return true so the search for a suitable hunting room
-                                        # stops and then the hunting buddy loop will detect that you need help
-                                        # sooner rather than later.
-                                        true
+                                        # SEARCH refused for injury is a mechanical result: this room could
+                                        # not be verified free of hidden players.  Under the drbot hunting
+                                        # health waiver that refusal is recorded and the room is rejected;
+                                        # it is not turned into a universal "too injured to hunt" stop.
+                                        # A plugin :find_room census (visible, grouped, stable) admits a
+                                        # room without SEARCH; otherwise no room is admitted and the hunt
+                                        # is skipped truthfully.
+                                        if drbot_health_waived?('pre_hunt.wound')
+                                          @search_refused_for_injury = true
+                                          DRC.message("***STATUS*** SEARCH refused for injury; hidden-player census unavailable here, room not admitted")
+                                          false
+                                        else
+                                          DRC.message("***STATUS*** You're too injured to hunt!")
+                                          @stop_hunting = true
+                                          @stopped_for_bleeding = bleeding?
+                                          # Ironically, return true so the search for a suitable hunting room
+                                          # stops and then the hunting buddy loop will detect that you need help
+                                          # sooner rather than later.
+                                          true
+                                        end
                                       end
                                     end,
                                     @settings.hunting_room_min_mana,
@@ -582,12 +596,12 @@ class HuntingBuddy
       plugin_break = fire_hook(:hunt_tick, self, counter: counter)
       break if plugin_break == :break
 
-      if DRStats.health < @settings.health_threshold
+      if stop_for_low_health?
         DRC.message("***STATUS*** Exiting because low health: #{DRStats.health} < #{@settings.health_threshold}")
         fput('avoid all')
         fput('exit')
       end
-      if @settings.stop_hunting_if_bleeding && bleeding?
+      if stop_for_bleeding?
         DRC.message("***STATUS*** Stopping because bleeding")
         @stopped_for_bleeding = true
         @hunt_stop_reason = :bleeding
@@ -685,6 +699,39 @@ class HuntingBuddy
 
   def next_hunt
     @next_hunt = true
+  end
+
+  # Temporary drbot hunting health waiver (#1278).  DrbotHuntingHealthPolicy
+  # is the shared read-only reader loaded by the drbot health plugin; when it
+  # is absent, unavailable, or reports normal gates every health stop below
+  # keeps its ordinary upstream behavior.  Observed values are never changed.
+  def drbot_health_waived?(signal)
+    return false unless defined?(DrbotHuntingHealthPolicy)
+
+    DrbotHuntingHealthPolicy.waived?(signal) == true
+  rescue StandardError
+    false
+  end
+
+  def stop_for_low_health?
+    return false unless DRStats.health < @settings.health_threshold
+
+    !drbot_health_waived?('active_hunt.health_floor')
+  end
+
+  def stop_for_bleeding?
+    return false unless @settings.stop_hunting_if_bleeding && bleeding?
+
+    !drbot_health_waived?('active_hunt.bleeding')
+  end
+
+  def restart_blocked_for_bleeding?
+    return false unless @stopped_for_bleeding
+    return true unless drbot_health_waived?('restart.bleeding')
+
+    DRC.message("***STATUS*** DRBOT hunting health waiver: bleeding observed; restart not blocked")
+    @stopped_for_bleeding = false
+    false
   end
 
   # Forward method calls to plugins that implement them.
