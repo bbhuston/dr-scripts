@@ -76,8 +76,11 @@ class SetupProcess
       return true
     end
 
+    return false if game_state.safety_stopping?
+
     was_retreating = game_state.retreating?
     game_state.update_room_npcs
+    return true if game_state.safety_stopping?
     if game_state.dancing?
       game_state.dance
     elsif game_state.retreating?
@@ -2816,7 +2819,7 @@ class PetProcess
   end
 
   def execute(game_state)
-    check_zombie(game_state)
+    check_zombie(game_state) unless game_state.safety_stopping?
     if game_state.dismiss_pet?
       dismiss_zombie(game_state)
       dismiss_bonebug(game_state)
@@ -3704,7 +3707,9 @@ class TrainerProcess
     when /^Analyze$/i
       analyze(game_state, 0)
     when /^Hunt$/i
-      DRC.bput('hunt', 'You take note of ', 'You find yourself unable to hunt in this area') unless game_state.retreating?
+      # HUNT imposes a long noncombat roundtime; let the attack process run
+      # while any live creature is present, even before it reaches melee.
+      DRC.bput('hunt', 'You take note of ', 'You find yourself unable to hunt in this area') if !game_state.retreating? && DRRoom.npcs.empty?
     when /^Teach$/i
       UserVars.friends.select { |c| DRRoom.pcs.include?(c) }.each do |character|
         DRC.bput("teach #{@combat_teaching_skill} to #{character}", 'You begin to', 'is already listening to you', 'is listening to someone else', 'I could not find who you were referring to', 'You have already offered', 'That person is too busy teaching', 'You are already teaching', 'You cannot teach two different classes at the same time', 'is not paying attention to you', 'You cannot listen to a teacher and teach', 'already trying to teach you something', 'trying to teach someone else')
@@ -5066,11 +5071,15 @@ class CombatTrainer
       waitrt?
       @safety_process.execute(@game_state)
       @combat_processes.each do |process|
+        # An unsafe-contact exit must finish cleanup without starting more
+        # buffs, optional training, corpse work or attacks in the destination.
+        next if @game_state.safety_stopping? && ![SetupProcess, SpellProcess, PetProcess].any? { |type| process.is_a?(type) }
+
         break if process.execute(@game_state)
       end
       tick += 1
       # Give plugins a per-iteration seam; any plugin returning :break stops combat.
-      break if self.class.fire_hook(:combat_tick, self, @game_state, counter: tick) == :break
+      break if !@game_state.safety_stopping? && self.class.fire_hook(:combat_tick, self, @game_state, counter: tick) == :break
 
       pause @loop_tick
       if @game_state.done_cleaning_up?
@@ -6030,10 +6039,24 @@ class GameState
     observation.last
   end
 
+  def safety_stopping?
+    @safety_stopping == true
+  end
+
+  def begin_safety_cleanup
+    @safety_stopping = true
+    # Preserve the normal spell, pet and weapon cleanup stages, but never
+    # enter the ordinary stop policy's optional finish-killing phase.
+    @clean_up_step = 'clear_magic'
+    stop_weak_attacks
+    stop_analyze_combo
+  end
+
   def escape_unsafe_contact
     return false unless @escape_unsafe_multi_enemy
     return false unless retreating? && retreat_weapons.empty?
 
+    begin_safety_cleanup
     origin = Room.current.id
     destination = Room.current.wayto.keys.compact.sort_by(&:to_s).first
     moved = false
