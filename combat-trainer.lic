@@ -6238,9 +6238,10 @@ class GameState
     return nil unless context && $HUNTING_BUDDY&.respond_to?(:supervised_group_observation)
 
     group = $HUNTING_BUDDY.supervised_group_observation($HUNTING_BUDDY)
-    return nil unless group && group[:names] == CombatTrainerGroupThreats::MEMBERS && group[:room] == context[:room]
+    shared = context.merge(group: group)
+    return nil unless CombatTrainerGroupThreats.valid_group?(shared)
 
-    context.merge(group: group)
+    shared
   rescue StandardError
     nil
   end

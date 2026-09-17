@@ -6,6 +6,8 @@ require 'cgi'
 # for corpse-safe targeting. Retreat thresholds and room NPC census stay intact.
 class CombatTrainerGroupThreats
   MEMBERS = %w[lanjefast thargrund vrakk].freeze
+  PAIRS = { 'lanjefast-thargrund' => %w[lanjefast thargrund].freeze,
+            'lanjefast-vrakk' => %w[lanjefast vrakk].freeze }.freeze
   HEADER = /<pushStream id=["']assess["']\/><clearStream id=["']assess["']\/>You assess your combat situation\.\.\./
   PROMPT = /<prompt\b[^>]*>[^<]*<\/prompt>/
   SEGMENT = /<pushStream id=["']assess["']\/>(.*?)<popStream\/>/m
@@ -117,9 +119,26 @@ class CombatTrainerGroupThreats
     nil
   end
 
+  # Only the buddy's complete native admission frame publishes this marker.
+  # A missing peer is never promoted from a trio to an implicit pair.
+  def self.valid_group?(context)
+    group = context && context[:group]
+    return false unless group.is_a?(Hash) && group[:room] == context[:room]
+
+    expected = if group.key?(:supervised_pair)
+                 return false unless context[:room] == 1473
+                 PAIRS[group[:supervised_pair]]
+               else
+                 MEMBERS
+               end
+    expected && group[:names] == expected && expected.include?(context[:self]) &&
+      context[:visible].is_a?(Array) && (context[:visible] - (expected - [context[:self]])).empty?
+  rescue StandardError
+    false
+  end
+
   def self.count(frame, before, after)
-    return nil unless before && before[:group].is_a?(Hash) &&
-                      before[:group][:names] == MEMBERS && before[:group][:room] == before[:room]
+    return nil unless valid_group?(before)
 
     parsed = entries(frame, before, after, complete: false)
     return nil unless parsed
@@ -127,6 +146,7 @@ class CombatTrainerGroupThreats
     # Individual target proof never supplies peer exclusions. Only a separate,
     # complete current group proof can authorize this shared threat count.
     creatures, peers = parsed.values_at(:creatures, :peers)
+    return nil unless (peers.map { |entry| entry[:name] } - (before[:group][:names] - [before[:self]])).empty?
     excluded = creatures.count do |creature|
       peer = peers.find { |entry| entry[:id] == creature[:target_id] }
       peer && peer[:name] == creature[:target] && before[:visible].include?(peer[:name])
