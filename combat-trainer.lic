@@ -1197,6 +1197,8 @@ class LootProcess
     return unless game_state.skinnable?(mob_noun)
     return if game_state.necro_casting?
 
+    return if @drbot_harvest_ids && @drbot_harvest_corpse && @drbot_harvest_corpse[:skinned]
+
     arranges = 0
     type = @arrange_types[mob_noun] || 'skin'
     arrange_message = @arrange_all ? "arrange #{harvest_corpse_selector} all for #{type}" : "arrange #{harvest_corpse_selector} for #{type}"
@@ -1205,7 +1207,10 @@ class LootProcess
       return unless harvest_corpse_present?(mob_noun, game_state)
 
       arranges += 1 # rubocop:disable Lint/UselessAssignment
-      case DRC.bput(arrange_message.squeeze(' '), 'You begin to arrange', 'You continue arranging', 'You make a mistake', 'You complete arranging', 'That creature cannot', 'That has already been arranged', 'Arrange what', 'cannot be skinned', 'You make a serious mistake in the arranging process', 'The .* is currently being arranged to produce')
+      case DRC.bput(arrange_message.squeeze(' '), 'You begin to arrange', 'You continue arranging', 'You make a mistake', 'You complete arranging', 'That creature cannot', 'That has already been arranged', 'Arrange what', 'cannot be skinned', 'You make a serious mistake in the arranging process', 'The .* is currently being arranged to produce', /already been skinned, there's no point/i)
+      when /already been skinned, there's no point/i
+        @drbot_harvest_corpse[:skinned] = true if @drbot_harvest_ids && @drbot_harvest_corpse
+        return
       when 'You complete arranging', 'That has already been arranged', 'You make a serious mistake in the arranging process', 'Arrange what'
         break
       when 'cannot be skinned'
@@ -1405,6 +1410,7 @@ class LootProcess
   def check_skinning(mob_noun, game_state, hand_retry = false)
     return unless game_state.skinnable?(mob_noun)
     return unless harvest_corpse_present?(mob_noun, game_state)
+    return if @drbot_harvest_ids && @drbot_harvest_corpse && @drbot_harvest_corpse[:skinned]
 
     if game_state.need_bundle
       case DRC.bput('tap my bundle', 'You tap a \w+ bundle\b.*that you are wearing', 'I could not find what you were referring to', 'You tap a tight bundle inside')
