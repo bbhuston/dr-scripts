@@ -1233,6 +1233,59 @@ RSpec.describe LootProcess do
     it('sets need_bundle to false') { expect(game_state).to have_received(:need_bundle=).with(false) }
   end
 
+  describe 'stored skinning knife custody' do
+    let(:equipment_manager) do
+      double('EquipmentManager', stow_weapon: true, wield_weapon?: true, is_listed_item?: false)
+    end
+    let(:game_state) { gs_double(need_bundle: false, weapon_name: 'scimitar', weapon_skill: 'Small Edged') }
+
+    it 'stows the weapon, gets and restores the configured knife, then re-wields' do
+      instance = build_loot(
+        skin: true,
+        skinning_knife: 'skinning knife',
+        skinning_knife_container: 'backpack',
+        equipment_manager: equipment_manager
+      )
+      allow(DRCI).to receive(:get_item?).with('skinning knife', 'backpack').and_return(true)
+      allow(DRCI).to receive(:put_away_item?).with('skinning knife', 'backpack').and_return(true)
+
+      expect(instance.prepare_skinning_knife(game_state)).to be(true)
+      expect(instance.restore_skinning_weapon(game_state)).to be(true)
+      expect(equipment_manager).to have_received(:stow_weapon).with('scimitar').ordered
+      expect(DRCI).to have_received(:get_item?).with('skinning knife', 'backpack').ordered
+      expect(DRCI).to have_received(:put_away_item?).with('skinning knife', 'backpack').ordered
+      expect(equipment_manager).to have_received(:wield_weapon?).with('scimitar', 'Small Edged').ordered
+      expect(DRCI).not_to have_received(:dispose_trash)
+    end
+
+    it 'disables skinning and restores the weapon when the configured knife is missing' do
+      instance = build_loot(
+        skin: true,
+        skinning_knife: 'skinning knife',
+        skinning_knife_container: 'backpack',
+        equipment_manager: equipment_manager
+      )
+      allow(DRCI).to receive(:get_item?).with('skinning knife', 'backpack').and_return(false)
+      allow(DRC).to receive(:message)
+
+      expect(instance.prepare_skinning_knife(game_state)).to be(false)
+      expect(instance.instance_variable_get(:@skin)).to be(false)
+      expect(equipment_manager).to have_received(:wield_weapon?).with('scimitar', 'Small Edged')
+      expect(DRCI).not_to have_received(:dispose_trash)
+    end
+
+    it 'preserves upstream hand behavior when no knife is configured' do
+      instance = build_loot(skin: true, equipment_manager: equipment_manager)
+
+      expect(instance.prepare_skinning_knife(game_state)).to be(true)
+      expect(instance.restore_skinning_weapon(game_state)).to be(true)
+      expect(equipment_manager).not_to have_received(:stow_weapon)
+      expect(equipment_manager).not_to have_received(:wield_weapon?)
+      expect(DRCI).not_to have_received(:get_item?)
+      expect(DRCI).not_to have_received(:put_away_item?)
+    end
+  end
+
   describe '#execute' do
     before(:each) do
       allow(DRC).to receive(:bput).and_return('Roundtime')

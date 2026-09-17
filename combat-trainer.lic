@@ -490,6 +490,12 @@ class LootProcess
     @skin = skinning['skin'] || false
     echo("  @skin: #{@skin}") if $debug_mode_ct
 
+    @skinning_knife = skinning['knife']
+    echo("  @skinning_knife: #{@skinning_knife}") if $debug_mode_ct
+
+    @skinning_knife_container = skinning['knife_container']
+    echo("  @skinning_knife_container: #{@skinning_knife_container}") if $debug_mode_ct
+
     @dissect = skinning['dissect'] || false
     echo("  @dissect: #{@dissect}") if $debug_mode_ct
 
@@ -1303,8 +1309,13 @@ class LootProcess
       end
     end
 
+    return unless prepare_skinning_knife(game_state)
+
     snap = [DRC.left_hand, DRC.right_hand]
-    case DRC.bput('skin', 'roundtime', 'skin what', 'cannot be skinned', 'carrying far too many items', 'need a more appropriate weapon', 'need to have a bladed instrument to skin', 'You must have one hand free to skin')
+    skin_result = DRC.bput('skin', 'roundtime', 'skin what', 'cannot be skinned', 'carrying far too many items', 'need a more appropriate weapon', 'need to have a bladed instrument to skin', 'You must have one hand free to skin')
+    return unless restore_skinning_weapon(game_state)
+
+    case skin_result
     when 'You must have one hand free to skin'
       temp_item = DRC.left_hand
       if DRCI.lower_item?(temp_item)
@@ -1354,6 +1365,44 @@ class LootProcess
     end
     DRCI.dispose_trash(DRC.left_hand) if snap.first != DRC.left_hand && !@equipment_manager.is_listed_item?(DRC.left_hand)
     DRCI.dispose_trash(DRC.right_hand) if snap.last != DRC.right_hand && !@equipment_manager.is_listed_item?(DRC.right_hand)
+  end
+
+  def prepare_skinning_knife(game_state)
+    return true unless @skinning_knife
+
+    @pre_skinning_weapon = game_state.weapon_name
+    if @pre_skinning_weapon && !@pre_skinning_weapon.empty?
+      unless @equipment_manager.stow_weapon(@pre_skinning_weapon)
+        return stop_for_skinning_knife("failed to stow #{@pre_skinning_weapon}")
+      end
+    end
+
+    return true if DRCI.get_item?(@skinning_knife, @skinning_knife_container)
+
+    @equipment_manager.wield_weapon?(@pre_skinning_weapon, game_state.weapon_skill) if @pre_skinning_weapon && !@pre_skinning_weapon.empty?
+    @skin = false
+    DRC.message("*** combat-trainer: Missing configured skinning knife #{@skinning_knife}; disabling skinning for this run.")
+    false
+  end
+
+  def restore_skinning_weapon(game_state)
+    return true unless @skinning_knife
+
+    unless DRCI.put_away_item?(@skinning_knife, @skinning_knife_container)
+      return stop_for_skinning_knife("failed to stow #{@skinning_knife} in #{@skinning_knife_container}")
+    end
+    return true unless @pre_skinning_weapon && !@pre_skinning_weapon.empty?
+    return true if @equipment_manager.wield_weapon?(@pre_skinning_weapon, game_state.weapon_skill)
+
+    stop_for_skinning_knife("failed to re-wield #{@pre_skinning_weapon}")
+  end
+
+  def stop_for_skinning_knife(reason)
+    @skin = false
+    DRC.message("*** combat-trainer: Skinning knife custody failure: #{reason}. Stopping hunt.")
+    $HUNTING_BUDDY&.stop_hunting
+    $COMBAT_TRAINER&.stop
+    false
   end
 end
 
