@@ -5128,6 +5128,8 @@ class CombatTrainer
   end
 end
 
+load File.join(File.dirname(File.realpath(defined?(Script) && Script.current ? Script.current.file_name : __FILE__)), 'combat-trainer-group-threats.rb')
+
 class GameState
   $martial_skills = ['Brawling']
   $edged_skills = ['Small Edged', 'Large Edged', 'Twohanded Edged']
@@ -5233,6 +5235,7 @@ class GameState
     @dance_threshold = settings.dance_threshold.to_i
     echo("  @dance_threshold: #{@dance_threshold}") if $debug_mode_ct
 
+    @drbot_supervised_group = settings.drbot_supervised_group
     @retreat_threshold = settings.retreat_threshold
     echo("  @retreat_threshold: #{@retreat_threshold}") if $debug_mode_ct
     @escape_unsafe_multi_enemy = settings.escape_unsafe_multi_enemy || false
@@ -5660,6 +5663,7 @@ class GameState
       pause 2
       false
     else
+      reject_target_observation
       false
     end
   end
@@ -5673,6 +5677,10 @@ class GameState
     case DRC.bput("engage #{observation.last}", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/)
     when /You are already advancing/, /You begin to advance/, /You begin to stealthily advance/
       pause 2
+    when /You are already (?:stealthily )?at melee/
+      nil
+    else
+      reject_target_observation
     end
   end
 
@@ -6017,18 +6025,195 @@ class GameState
 
   def update_room_npcs
     @cached_npcs = DRRoom.npcs - (@ignored_npcs || [])
+    observation = drbot_group_threat_observation
+    # ASSESS may observe arrivals/deaths. Always refresh the ordinary census,
+    # and use its total unless the complete attribution context still matches.
+    @cached_npcs = DRRoom.npcs - (@ignored_npcs || [])
+    verified = observation && observation[:context] == drbot_group_threat_context
+    threats = verified ? observation[:count] : @cached_npcs.length
+    drbot_group_threat_status(threats, verified)
     @enemy_analyze_sequence&.next_verb(context: enemy_analyze_context)
     @dancing = @cached_npcs.length <= @dance_threshold || @cached_npcs.empty?
-    @retreating = @retreat_threshold && @cached_npcs.length >= @retreat_threshold
+    @retreating = @retreat_threshold && threats >= @retreat_threshold
     escape_unsafe_contact if @retreating
   end
+
+  # Individual creature identity does not depend on shared group attribution.
+  def drbot_target_context
+    return nil unless @drbot_supervised_group == 'lvt-goblins'
+    return nil unless defined?(CombatTrainerGroupThreats) && defined?(Lich::DragonRealms::Creature)
+    room = Room.current&.id
+    return nil unless room
+
+    npcs = DRRoom.npcs.dup
+    return nil unless (npcs & (@ignored_npcs || [])).empty?
+
+    creatures = Lich::DragonRealms::Creature.targets
+    ids = creatures.map { |creature| creature.id.to_s }.sort
+    return nil unless ids.length == npcs.length && ids.uniq.length == ids.length
+    return nil unless ids.all? { |id| id.match?(/\A[1-9]\d*\z/) }
+
+    visible = DRRoom.pcs.map { |name| name.to_s.downcase }.sort
+    self_name = XMLData.name.to_s.downcase
+    return nil unless CombatTrainerGroupThreats::MEMBERS.include?(self_name)
+    return nil unless (visible - (CombatTrainerGroupThreats::MEMBERS - [self_name])).empty?
+
+    { room: room, room_count: XMLData.room_count, xml_room: XMLData.room_id,
+      self: self_name, visible: visible, npcs: npcs, ids: ids,
+      dead: DRRoom.respond_to?(:dead_npcs) ? DRRoom.dead_npcs.dup : [] }
+  rescue StandardError
+    nil
+  end
+
+  # Shared exclusions and harvesting still require the buddy's full proof.
+  def drbot_group_threat_context
+    context = drbot_target_context
+    return nil unless context && $HUNTING_BUDDY&.respond_to?(:supervised_group_observation)
+
+    group = $HUNTING_BUDDY.supervised_group_observation($HUNTING_BUDDY)
+    return nil unless group && group[:names] == CombatTrainerGroupThreats::MEMBERS && group[:room] == context[:room]
+
+    context.merge(group: group)
+  rescue StandardError
+    nil
+  end
+
+  def drbot_group_threat_observation(target: false, individual: false)
+    return nil unless target || (@retreat_threshold && @cached_npcs.length >= @retreat_threshold)
+    context_method = individual ? :drbot_target_context : :drbot_group_threat_context
+    @drbot_group_threat_failure = :group_or_room_census_unverified
+    return nil unless public_send(context_method)
+
+    waitrt?
+    @drbot_group_threat_failure = :direct_control_unavailable
+    control = defined?($DRBOT_DIRECT_CONTROL) && $DRBOT_DIRECT_CONTROL
+    return nil unless control.is_a?(Hash) && defined?(Monitor) && control['lock'].is_a?(Monitor)
+
+    frame = CombatTrainerGroupThreats::Frame.new
+    @drbot_group_assess_generation = (@drbot_group_assess_generation || 0) + 1
+    hook = "combat-trainer-group-assess-#{object_id}-#{@drbot_group_assess_generation}"
+    written = false
+    before = nil
+    deadline = nil
+    # The pinned final writer uses this same reentrant Monitor. Check readiness,
+    # install the observer, and call ordinary put under it: a waiting old result
+    # cannot be mistaken for the new ASSESS. No socket/fence bypass is involved.
+    control['lock'].synchronize do
+      @drbot_group_threat_failure = :producer_not_ready
+      return nil unless control['mode'] == 'B' && control['closed'] == false && control['confirm_by'].nil? &&
+                        control['character'].to_s.casecmp?(XMLData.name.to_s)
+      @drbot_group_threat_failure = :pending_result
+      return nil unless control['pending_result'] == false
+      @drbot_group_threat_failure = :roundtime_active
+      return nil if checkrt.positive? || checkcastrt.positive?
+      @drbot_group_threat_failure = :group_or_room_census_unverified
+      before = public_send(context_method)
+      return nil unless before
+      @drbot_group_threat_failure = :write_boundary_unverified
+      return nil unless control['write_count'].is_a?(Integer)
+
+      expected_write = control['write_count'] + 1
+      producer = [control['session'], control['producer'], control['mode'], control['closed']]
+      DownstreamHook.add(hook, proc do |raw|
+        # Record eligibility at callback entry, before it can wait on the
+        # writer's Monitor. Delayed old callbacks cannot inherit a later write.
+        arrived_written = written
+        arrived_write = control['write_count']
+        control['lock'].synchronize do
+          current = [control['session'], control['producer'], control['mode'], control['closed']]
+          if arrived_written && arrived_write == expected_write && written && control.equal?($DRBOT_DIRECT_CONTROL) && current == producer && control['write_count'] == expected_write
+            frame.feed(raw)
+          else
+            frame.invalidate!
+          end
+        end
+        raw
+      end, persist: false)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 3.0
+      put 'assess'
+      written = control['write_count'] == expected_write
+      return nil unless written
+    end
+
+    # One bounded response, no retry loop. Pending-result reconciliation remains
+    # the final writer's responsibility; a later call refuses outstanding work.
+    pause 0.05 until frame.finished? || Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+    @drbot_group_threat_failure = :response_deadline_exceeded
+    return nil if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+    after = public_send(context_method)
+    @drbot_group_threat_failure = frame.complete_text ? :frame_or_context_unverified : :missing_complete_response
+    if individual
+      return nil unless CombatTrainerGroupThreats.entries(frame.complete_text, before, after)
+
+      return { context: after, frame: frame.complete_text }
+    end
+    count = CombatTrainerGroupThreats.count(frame.complete_text, before, after)
+    count.nil? ? nil : { count: count, context: after, frame: frame.complete_text }
+  rescue StandardError
+    nil
+  ensure
+    DownstreamHook.remove(hook) if hook
+  end
+
+  def drbot_group_threat_status(threats, verified)
+    return unless @drbot_supervised_group == 'lvt-goblins' && @retreat_threshold
+
+    reason = verified ? :complete_assess : (@drbot_group_threat_failure || :room_total)
+    decision = [threats, @cached_npcs.length, reason]
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    return if decision == @drbot_group_threat_status || (@drbot_group_threat_status_at && now - @drbot_group_threat_status_at < 5.0)
+
+    @drbot_group_threat_status = decision
+    @drbot_group_threat_status_at = now
+    DRC.message("***STATUS*** GROUP THREATS: #{verified ? 'validated personal count' : 'room-total fallback'} #{threats}/#{@cached_npcs.length}; threshold #{@retreat_threshold}; #{reason}")
+  end
+
 
   def fresh_target_selector
     @cached_npcs = DRRoom.npcs - (@ignored_npcs || [])
     target = @cached_npcs.first
     return unless target && target.match?(/\A[a-zA-Z][a-zA-Z '-]*\z/)
 
+    dead = DRRoom.respond_to?(:dead_npcs) ? DRRoom.dead_npcs : []
+    if @drbot_supervised_group == 'lvt-goblins' && (@drbot_target_rejected || dead.any? { |name| name.split.last == target.split.last })
+      return drbot_corpse_target_selector(target)
+    end
+
     [Room.current.id, DRRoom.npcs.dup, target]
+  end
+
+  # ASSESS's displayed number is the server's noun-relative ordinal, including
+  # intervening corpses. DRRoom.npcs numbers only living entries and cannot
+  # safely supply a selector when a corpse has the same noun.
+  def drbot_corpse_target_selector(target)
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    return nil if @drbot_target_retry_at && now < @drbot_target_retry_at
+
+    context = drbot_target_context
+    cached = @drbot_corpse_target
+    return cached[:observation] if cached && cached[:context] == context && now - cached[:at] < 2.0
+
+    @drbot_corpse_target = nil
+    @drbot_target_retry_at = now + 2.0
+    result = drbot_group_threat_observation(target: true, individual: true)
+    @drbot_target_retry_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2.0
+    return nil unless result
+
+    chosen = CombatTrainerGroupThreats.selector(result[:frame], result[:context], result[:context], target)
+    return nil unless chosen
+
+    observation = [Room.current.id, result[:context], chosen.first, chosen.last]
+    @drbot_corpse_target = { context: result[:context], observation: observation, at: now }
+    @drbot_target_retry_at = nil
+    observation
+  end
+
+  def reject_target_observation
+    @target_observation = @drbot_corpse_target = nil
+    @drbot_target_rejected = true
+    @drbot_target_retry_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2.0
+    pause 2
   end
 
   def target_selector
