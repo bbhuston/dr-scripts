@@ -4286,8 +4286,13 @@ class AttackProcess
     # loop tick in any of those states only produces command spam.
     # AbilityProcess has already run for this tick, so returning here preserves
     # ambient training and otherwise lets the main loop idle.
-    close_melee_attack = game_state.brawling? || game_state.backstab? || game_state.ambush? || game_state.ambush_stun_training?
-    return if close_melee_attack && !game_state.engage
+    # Every melee weapon needs the same fresh, positively confirmed range as
+    # BACKSTAB/Brawling. A weapon restore or target death can leave the next
+    # ordinary swing at missile range; do not spin on refused attacks.
+    unless game_state.engage
+      pause 1
+      return
+    end
 
     maneuver_success = false
     if charged_maneuver
@@ -4305,6 +4310,10 @@ class AttackProcess
       maneuver_success = game_state.use_charged_maneuver(charged_maneuver)
 
       game_state.sheath_offhand_weapon(skill) if offhand_weapon_name
+      if Flags['ct-attack-out-of-range']
+        pause 2
+        return
+      end
     end
 
     # If we didn't try a maneuver, or we did but it wasn't successful, then fallback to normal attack.
@@ -4331,7 +4340,7 @@ class AttackProcess
         end
       end
 
-      unless game_state.dispatch_enemy_combo(command)
+      unless game_state.dispatch_typed_combo(command) || game_state.dispatch_enemy_combo(command)
         DRC.bput(command, 'Wouldn\'t it be better if you used a melee weapon?', 'You need two hands to wield this weapon', 'You turn to face', 'Face What?', 'Roundtime', "You aren't close enough to attack", 'It would help if you were closer', 'There is nothing else to face!', 'You must be hidden', 'flying too high for you to attack', 'You can\'t coldcock', 'while it is flying', 'Novel idea, but it\'s a ghost!', 'Bumbling, you slip', 'You can not slam with that', 'You must be hidden or invisible to ambush', 'You don\'t have enough focus', 'You don\'t think you have enough focus', 'You can\'t backstab that', 'is already out cold')
       end
     end
@@ -5881,10 +5890,10 @@ class GameState
       'whirlwind'
     elsif lacking_inner_fire? || (@flame_for_ww_expertise && need_expertise?)
       update_analyze_array('flame') if @analyze_combo_array.empty?
-      @analyze_combo_array.empty? ? 'attack' : @analyze_combo_array.shift
+      typed_combo_attack_verb
     elsif Flags['ct-accuracy-ready']
       update_analyze_array('accuracy') if @analyze_combo_array.empty?
-      @analyze_combo_array.empty? ? 'attack' : @analyze_combo_array.shift
+      typed_combo_attack_verb
     elsif (npcs.length > 2) && !balance_low?
       'whirlwind'
     else
@@ -6455,6 +6464,8 @@ class GameState
     ]
 
     maneuver_failure_messages = [
+      # Range rejection is a completed refusal, never a retry invitation.
+      /^You aren't close enough to attack/,
       # You are not engaged with any enemies
       /^There is nothing else to face/,
       /^What are you trying to attack/,
@@ -6499,7 +6510,7 @@ class GameState
 
     if Flags['ct-attack-out-of-range']
       engage
-      return use_charged_maneuver(maneuver, attempts + 1)
+      return false
     end
 
     case attempt
@@ -6838,11 +6849,12 @@ class GameState
   end
 
   def melee_attack_verb(allow_enemy_combo: true)
+    @typed_combo_selection = nil
     if currently_whirlwinding
       determine_whirlwind_action
     elsif (lacking_inner_fire? || need_expertise?) && !brawling?
       update_analyze_array('flame') if @analyze_combo_array.empty?
-      @analyze_combo_array.empty? ? 'attack' : @analyze_combo_array.shift
+      typed_combo_attack_verb
     elsif attack_override
       attack_override
     elsif @use_weak_attacks
@@ -6856,7 +6868,7 @@ class GameState
         enemy_combo_attack_verb
       elsif DRStats.barbarian?
         update_analyze_array if @analyze_combo_array.empty?
-        @analyze_combo_array.empty? ? 'attack' : @analyze_combo_array.shift
+        typed_combo_attack_verb
       elsif allow_enemy_combo
         enemy_combo_attack_verb
       else
@@ -6865,6 +6877,54 @@ class GameState
     else
       'attack'
     end
+  end
+
+  # Selecting a typed Expertise move is not evidence that it landed. Preserve
+  # the server recipe until this exact action's complete own-attack frame proves
+  # the step; misses and range refusals retain the same step for the next tick.
+  def typed_combo_attack_verb
+    verb = @analyze_combo_array.first
+    return 'attack' unless verb
+
+    @typed_combo_selection = { verb: verb, room: Room.current.id,
+                               right: DRC.right_hand, left: DRC.left_hand }
+    verb
+  end
+
+  def dispatch_typed_combo(command)
+    selected = @typed_combo_selection
+    @typed_combo_selection = nil
+    return false unless selected && @use_analyze_combos && DRStats.barbarian?
+    return false unless @analyze_combo_array.first == selected[:verb]
+    expected = offhand? ? "#{selected[:verb]} left" : selected[:verb]
+    return false unless command == expected
+
+    attempting = true
+    waitrt?
+    unless selected[:room] == Room.current.id && selected[:right] == DRC.right_hand && selected[:left] == DRC.left_hand
+      @analyze_combo_array = []
+      return true
+    end
+    # can_engage? alone admits an advancing creature; require melee again after
+    # selection/RT before writing this one action. No fallback attack this tick.
+    unless engage
+      pause 1
+      return true
+    end
+    sent = true
+    lines, complete = enemy_combo_frame(command, wait_for_rt: false)
+    own = lines.map(&:strip).grep(/\A<[^\n]*, you #{Regexp.escape(selected[:verb])}\b/i)
+    landed = complete && own.length == 1 && own.first.match?(/\.\s+[^\n]*\bThe [^.]+ lands an?\s/i)
+    if landed && selected[:room] == Room.current.id && @use_analyze_combos
+      @analyze_combo_array.shift
+    else
+      pause 2
+    end
+    true
+  rescue StandardError
+    # A lost frame is never a landing or permission for a second command.
+    pause 2
+    !!attempting
   end
 
   def thrown_attack_verb
