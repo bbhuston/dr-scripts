@@ -7,7 +7,7 @@ class CombatTrainerAnalyzeSequence
   UNSUPPORTED = /You (?:can not|cannot|can't) \w+ with that|Wouldn't it be better if you used a melee weapon|You need two hands to wield this weapon|You need to hold/i
   ROUND_TIME = /\A(?:Roundtime(?:\s*:|\s+\d)|\[Roundtime\s+\d+\s+sec\.\]\z)/i
 
-  attr_reader :target, :selector, :deadline
+  attr_reader :target, :target_id, :selector, :deadline
 
   def initialize(clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) },
                  max_misses: 2, window: 30.0, strike_budget: 5.0, cooldown: 30.0)
@@ -52,9 +52,16 @@ class CombatTrainerAnalyzeSequence
     end
     matches = normalized_context && headers.length == 1 ? normalized_context['roster'].select { |entry| target_matches?(headers.first, entry) } : []
     recipes = frame.filter_map { |line| line.match(/\bby landing an? (.+)\.\z/i)&.[](1) }
+    id_bound = normalized_context && normalized_context['selector'] == "##{normalized_context['target_id']}"
+    target_valid = if id_bound
+                     expected = normalized_context['target_noun']
+                     expected.is_a?(String) && !matches.empty? && target_matches?(headers.first, expected)
+                   else
+                     matches.length == 1 &&
+                       (!normalized_context['selector'] || normalized_context['selector'] == matches.first)
+                   end
     if !complete?(frame) || !normalized_context || headers.length != 1 || recipes.length != 1 ||
-       matches.length != 1 ||
-       (normalized_context['selector'] && normalized_context['selector'] != matches.first) ||
+       !target_valid ||
        (@reset_pending && normalized_context != @context)
       abandon!
       return false
@@ -70,7 +77,8 @@ class CombatTrainerAnalyzeSequence
     @reset_pending = false
     @context = normalized_context
     @target = headers.first
-    @selector = matches.first
+    @target_id = normalized_context['target_id']
+    @selector = normalized_context['selector'] || matches.first
     @steps = steps
     @misses = 0
     @attempt = nil
@@ -163,6 +171,7 @@ class CombatTrainerAnalyzeSequence
     @attempt = nil
     @reset_pending = false
     @target = nil
+    @target_id = nil
     @selector = nil
     @context = nil
     @deadline = nil
@@ -203,7 +212,11 @@ class CombatTrainerAnalyzeSequence
 
     value = plain_copy(context)
     return nil unless value['room'] && value['roster'].is_a?(Array) && value['roster'].all? { |n| n.is_a?(String) } &&
-                      value['weapon'].is_a?(String) && !noun(value['weapon']).empty?
+                      value['weapon'].is_a?(String) && !noun(value['weapon']).empty? &&
+                      value['target_id'].is_a?(String) && value['target_id'].match?(/\A[1-9]\d*\z/) &&
+                      value['live_ids'].is_a?(Array) && value['live_ids'].all? { |id| id.is_a?(String) && id.match?(/\A[1-9]\d*\z/) } &&
+                      value['live_ids'].uniq.length == value['live_ids'].length && value['live_ids'].include?(value['target_id']) &&
+                      value['room_generation'].is_a?(Integer)
 
     value['weapon'] = noun(value['weapon'])
     value

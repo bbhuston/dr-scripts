@@ -7137,16 +7137,46 @@ class GameState
     @enemy_analyze_sequence ||= CombatTrainerAnalyzeSequence.new
   end
 
-  def enemy_analyze_context
-    roster = DRRoom.npcs - (@ignored_npcs || [])
-    return nil if roster.empty? || !DRC.right_hand
-    return nil unless roster.all? { |name| name.is_a?(String) && name.match?(/\A[a-zA-Z][a-zA-Z '-]*\z/) }
-    # DRRoom uses noun-only entries and prefix ordinals ("second goblin").
-    # Never guess which duplicate the ANALYZE header or a landing refers to.
-    target = roster.first
-    return nil unless DRRoom.npcs.count { |name| name.split.last == target.split.last } == 1
+  # Identity comes from the server's fresh individual ASSESS proof. Nouns and
+  # ordinals are command adapters only, never a durable creature identity.
+  def refresh_enemy_analyze_target
+    @enemy_analyze_target = nil
+    return false unless respond_to?(:drbot_target_context) && respond_to?(:drbot_corpse_target_selector)
+    context = drbot_target_context
+    return false unless context && context[:room_count].is_a?(Integer)
+    target = context[:npcs].first
+    return false unless target && DRC.right_hand
 
-    { room: Room.current.id, roster: roster, selector: target, weapon: DRC.right_hand,
+    observation = drbot_corpse_target_selector(target)
+    current = drbot_target_context
+    return false unless observation && observation.length == 4 && current && observation[1] == current
+    id = observation[-2]
+    return false unless id.is_a?(String) && id.match?(/\A[1-9]\d*\z/) && current[:ids].include?(id)
+    # Native ANALYZE and melee attacks accept server IDs. Keep the ID in
+    # command text so corpse decay cannot retarget an ordinal between checks.
+    @enemy_analyze_target = { context: current, id: id, noun: target, selector: "##{id}" }
+    true
+  rescue StandardError
+    @enemy_analyze_target = nil
+    false
+  end
+
+  # Read-only revalidation is also used after the command frame. An identical
+  # noun roster with a replacement server ID cannot preserve an old recipe.
+  def enemy_analyze_context
+    identity = @enemy_analyze_target
+    current = respond_to?(:drbot_target_context) && drbot_target_context
+    return nil unless identity && current && identity[:context] == current
+    return nil unless current[:ids].include?(identity[:id]) && DRC.right_hand
+    roster = DRRoom.npcs - (@ignored_npcs || [])
+    return nil if roster.empty?
+    return nil unless roster.all? { |name| name.is_a?(String) && name.match?(/\A[a-zA-Z][a-zA-Z '-]*\z/) }
+    return nil unless roster == current[:npcs]
+
+    { room: current[:room], room_generation: current[:room_count], xml_room: current[:xml_room],
+      target_id: identity[:id], target_noun: identity[:noun], live_ids: current[:ids].dup,
+      dead_roster: current[:dead].dup,
+      roster: roster, selector: identity[:selector], weapon: DRC.right_hand,
       left_weapon: DRC.left_hand, observed_roster: DRRoom.npcs.dup }
   end
 
@@ -7178,6 +7208,7 @@ class GameState
     sequence = enemy_analyze_sequence
     return false unless @use_analyze_combos || train_only
     return false unless can_engage?
+    refresh_enemy_analyze_target if @use_analyze_combos && sequence
     context = enemy_analyze_context
     # Standalone Tactics training historically also works empty-handed and
     # while combo selection is disabled. It must not require a weapon recipe.
@@ -7213,6 +7244,7 @@ class GameState
     sequence = enemy_analyze_sequence
     return 'attack' unless sequence && @use_analyze_combos
 
+    refresh_enemy_analyze_target
     context = enemy_analyze_context
     unless context
       sequence.abandon!
@@ -7236,6 +7268,7 @@ class GameState
     # ANALYZE may have introduced RT after attack selection. Recheck the
     # window after that wait, then send without a second intervening wait.
     waitrt?
+    refresh_enemy_analyze_target
     context = enemy_analyze_context
     return true if sequence.needs_reset?(context: context)
     return true unless sequence.active?
