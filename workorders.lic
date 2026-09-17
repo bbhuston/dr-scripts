@@ -24,6 +24,8 @@ class WorkOrders
 
   NPC_NOT_FOUND_PATTERN = "What is it you're trying to give".freeze
 
+  GIVE_LOGBOOK_ACCEPTED_PATTERN = /\AYou hand .+? your logbook and bundled items, and are given [\d,]+ \w+ in return\.\z/i.freeze
+
   # The clerk's repair quote, e.g. "That will cost 4,447 Kronars to repair.
   # Just give it to me again..." -- captured (cost included) so we can read the
   # price and top up from the bank if we are short before confirming. This only
@@ -55,6 +57,11 @@ class WorkOrders
     "That's not going to work"
   ].freeze
 
+  SAFE_BUNDLE_FAILURE_PATTERNS = [
+    *BUNDLE_SUCCESS_PATTERNS.drop(1),
+    'You need to be holding'
+  ].freeze
+
   BUNDLE_FAILURE_PATTERN = /requires items of|Only undamaged enchanted/.freeze
 
   WORK_ORDER_REQUEST_PATTERNS = [
@@ -74,6 +81,16 @@ class WorkOrders
   ].freeze
 
   LOGBOOK_REMAINING_PATTERN = /You must bundle and deliver (?<remaining>\d+) more/.freeze
+  LOGBOOK_ITEM_PATTERN = /This logbook is tracking a work order requiring you to craft (?<item>.+?) from any/i.freeze
+  LOGBOOK_NO_ORDER_PATTERN = /\AThis logbook is not currently tracking (?:a work order|any work orders)\.\z/i.freeze
+  RESUME_LOGBOOK_PATTERNS = [
+    LOGBOOK_ITEM_PATTERN,
+    'This work order appears to be complete.',
+    LOGBOOK_NO_ORDER_PATTERN,
+    'has expired',
+    'I could not find',
+    'What were you'
+  ].freeze
 
   COUNT_PATTERN = /(?<count>\d+)/.freeze
   POLISH_COUNT_PATTERN = /The surface polish has (?<count>\d+) uses remaining/.freeze
@@ -122,6 +139,7 @@ class WorkOrders
     @workorders_repair = @settings.workorders_repair
     @workorders_override_store = @settings.workorders_override_store
     @workorders_materials = @settings.workorders_materials
+    @resume_or_request = @settings.workorders_resume_or_request
 
     Flags.add('proper-repair', 'Your excellent training in the ways of tool repair')
 
@@ -145,12 +163,22 @@ class WorkOrders
       exit
     end
 
+    if @resume_or_request && (discipline != 'blacksmithing' || repair || turnin || @use_own_ingot_type)
+      Lich::Messaging.msg('bold', 'WorkOrders: Safe resume-or-request mode only admits purchased-stock blacksmithing work orders')
+      exit
+    end
+
     unless repair
-      if @settings.workorder_diff.is_a?(Hash)
-        item_name, quantity = request_work_order(recipes, info['npc-rooms'], info['npc'], info['npc_last_name'], discipline, info['logbook'], @settings.workorder_diff[discipline])
-      else
-        item_name, quantity = request_work_order(recipes, info['npc-rooms'], info['npc'], info['npc_last_name'], discipline, info['logbook'], @settings.workorder_diff)
-      end
+      diff = if @settings.workorder_diff.is_a?(Hash)
+               @settings.workorder_diff[discipline]
+             else
+               @settings.workorder_diff
+             end
+      item_name, quantity = if @resume_or_request
+                              resume_or_request_work_order(recipes, info['npc-rooms'], info['npc'], info['npc_last_name'], discipline, info['logbook'], diff)
+                            else
+                              request_work_order(recipes, info['npc-rooms'], info['npc'], info['npc_last_name'], discipline, info['logbook'], diff)
+                            end
       item = recipes.find { |r| r['name'] == item_name }
     end
     tools = []
@@ -229,6 +257,11 @@ class WorkOrders
 
     return repair_items(info, tools) if repair
 
+    if @resume_or_request && quantity.zero?
+      complete_work_order(info)
+      return
+    end
+
     if DRSkill.getxp(skill) > @craft_max_mindstate
       Lich::Messaging.msg('bold', "WorkOrders: Exiting because your current mindstate for #{skill} (#{DRSkill.getxp(skill)}) is over the set maximum craft_max_mindstate: #{@craft_max_mindstate}")
       exit
@@ -240,15 +273,19 @@ class WorkOrders
         bundle_item(item['noun'], info['logbook'])
       end
     else
-      send(craft_method, info, materials_info, item, quantity)
+      craft_completed = send(craft_method, info, materials_info, item, quantity)
+      return if @resume_or_request && craft_completed == false
     end
 
-    complete_work_order(info)
+    turned_in = complete_work_order(info)
+    return if @resume_or_request && turned_in == false
 
     repair_items(info, tools) if @workorders_repair
   end
 
   def complete_work_order(info)
+    return complete_work_order_safely(info) if @resume_or_request
+
     DRCI.stow_hands
     loop do
       unless find_npc(info['npc-rooms'], info['npc_last_name'])
@@ -265,6 +302,153 @@ class WorkOrders
     end
     stow_tool('logbook')
     Lich::Messaging.msg('plain', 'WorkOrders: Work order completed and turned in')
+  end
+
+  def complete_work_order_safely(info)
+    remaining = logbook_remaining(info['logbook'])
+    unless remaining == 0
+      detail = remaining.nil? ? 'could not be read' : "still needs #{remaining} more"
+      Lich::Messaging.msg('bold', "WorkOrders: Work order #{detail} - not turning it in")
+      return false
+    end
+
+    DRCI.stow_hands
+    unless find_npc(info['npc-rooms'], info['npc_last_name'])
+      Lich::Messaging.msg('bold', "WorkOrders: Could not find NPC #{info['npc_last_name']} in any of the expected rooms")
+      return false
+    end
+    unless DRCI.get_item?("#{info['logbook']} logbook")
+      Lich::Messaging.msg('bold', "WorkOrders: Failed to get #{info['logbook']} logbook for turn-in")
+      return false
+    end
+    unless held_logbook?(info['logbook'])
+      Lich::Messaging.msg('bold', "WorkOrders: #{info['logbook']} logbook is not positively held for turn-in")
+      return false
+    end
+    DRC.release_invisibility
+    result = DRC.bput(
+      "give my #{info['logbook']} logbook to #{info['npc']}",
+      GIVE_LOGBOOK_ACCEPTED_PATTERN,
+      *GIVE_LOGBOOK_SUCCESS_PATTERNS.drop(1),
+      NPC_NOT_FOUND_PATTERN
+    )
+    unless result && GIVE_LOGBOOK_ACCEPTED_PATTERN.match?(result)
+      stow_tool('logbook')
+      Lich::Messaging.msg('bold', "WorkOrders: Turn-in was not accepted - #{result}. Order preserved")
+      return false
+    end
+    stow_tool('logbook')
+    Lich::Messaging.msg('plain', 'WorkOrders: Work order completed and turned in')
+    true
+  end
+
+  def held_item?(noun)
+    [DRC.left_hand, DRC.right_hand].compact.any? do |held|
+      held.to_s.match?(/\b#{Regexp.escape(noun.to_s)}\b/i)
+    end
+  end
+
+  def held_logbook?(logbook)
+    [DRC.left_hand, DRC.right_hand].compact.any? do |held|
+      held.to_s.match?(/\b#{Regexp.escape(logbook.to_s)}(?: work order)? logbook\b/i)
+    end
+  end
+
+  # Returns 0 for complete, a positive remaining count, or nil on ambiguity.
+  def logbook_remaining(logbook)
+    unless held_logbook?(logbook) || DRCI.get_item?("#{logbook} logbook")
+      Lich::Messaging.msg('bold', "WorkOrders: Failed to get #{logbook} logbook for status check")
+      return nil
+    end
+    unless held_logbook?(logbook)
+      Lich::Messaging.msg('bold', "WorkOrders: #{logbook} logbook is not positively held for status check")
+      return nil
+    end
+
+    result = DRC.bput("read my #{logbook} logbook", *READ_LOGBOOK_PATTERNS, 'has expired', LOGBOOK_NO_ORDER_PATTERN, 'I could not find', 'What were you')
+    stow_tool('logbook')
+    return 0 if result && result.include?('appears to be complete')
+
+    match = result&.match(LOGBOOK_REMAINING_PATTERN)
+    match ? match[:remaining].to_i : nil
+  end
+
+  def resume_or_request_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
+    unless DRCI.get_item?("#{logbook} logbook")
+      Lich::Messaging.msg('bold', "WorkOrders: Failed to get #{logbook} logbook before resume")
+      exit
+    end
+    unless held_logbook?(logbook)
+      Lich::Messaging.msg('bold', "WorkOrders: #{logbook} logbook is not positively held before resume")
+      exit
+    end
+
+    result = DRC.bput("read my #{logbook} logbook", *RESUME_LOGBOOK_PATTERNS)
+    if result && result.include?('appears to be complete')
+      stow_tool('logbook')
+      Lich::Messaging.msg('plain', 'WorkOrders: Existing work order is complete and ready for turn-in')
+      return [nil, 0]
+    end
+
+    if result && LOGBOOK_NO_ORDER_PATTERN.match?(result)
+      stow_tool('logbook')
+      requested = request_work_order(
+        recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff,
+        max_requests: 1, allow_bundled_cleanup: false
+      )
+      confirmed = read_active_work_order(recipes, logbook)
+      unless confirmed && confirmed == requested
+        Lich::Messaging.msg('bold', 'WorkOrders: Requested order did not match the confirmed logbook state; stopping before purchase')
+        exit
+      end
+      return confirmed
+    end
+
+    match = result&.match(LOGBOOK_ITEM_PATTERN)
+    unless match
+      stow_tool('logbook')
+      Lich::Messaging.msg('bold', 'WorkOrders: Logbook state is ambiguous - no request or purchase was made')
+      exit
+    end
+
+    recipe = recipes.find { |candidate| candidate['name'] == match[:item] }
+    unless recipe
+      stow_tool('logbook')
+      Lich::Messaging.msg('bold', "WorkOrders: Could not match active logbook item '#{match[:item]}' to a recipe")
+      exit
+    end
+
+    remaining = logbook_remaining(logbook)
+    if remaining.nil?
+      Lich::Messaging.msg('bold', 'WorkOrders: Active logbook count is ambiguous - no request or purchase was made')
+      exit
+    end
+    if remaining.zero?
+      Lich::Messaging.msg('plain', 'WorkOrders: Existing work order is complete and ready for turn-in')
+      return [nil, 0]
+    end
+
+    Lich::Messaging.msg('plain', "WorkOrders: Resuming active order for #{remaining} #{recipe['name']}")
+    [recipe['name'], remaining]
+  end
+
+  def read_active_work_order(recipes, logbook)
+    unless DRCI.get_item?("#{logbook} logbook")
+      Lich::Messaging.msg('bold', "WorkOrders: Failed to get #{logbook} logbook for order confirmation")
+      return nil
+    end
+    unless held_logbook?(logbook)
+      Lich::Messaging.msg('bold', "WorkOrders: #{logbook} logbook is not positively held for order confirmation")
+      return nil
+    end
+
+    result = DRC.bput("read my #{logbook} logbook", *RESUME_LOGBOOK_PATTERNS)
+    match = result&.match(LOGBOOK_ITEM_PATTERN)
+    recipe = match && recipes.find { |candidate| candidate['name'] == match[:item] }
+    remaining = recipe && logbook_remaining(logbook)
+    return nil unless recipe && remaining&.positive?
+
+    [recipe['name'], remaining]
   end
 
   def get_tool(name)
@@ -753,6 +937,8 @@ class WorkOrders
   end
 
   def forge_items(info, materials_info, item, quantity)
+    return forge_items_safely(info, materials_info, item, quantity) if @resume_or_request
+
     recipe = find_recipe(materials_info, item, quantity).first
     remaining_volume = 0
 
@@ -774,6 +960,53 @@ class WorkOrders
       remaining_volume -= recipe['volume']
     end
     DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive?
+  end
+
+  def forge_items_safely(info, materials_info, item, quantity)
+    recipe = find_recipe(materials_info, item, quantity).first
+    remaining_volume = 0
+
+    info['trash-room'] = nil if @worn_trashcan && @worn_trashcan_verb
+
+    attempts = 0
+    while attempts < quantity
+      remaining = logbook_remaining(info['logbook'])
+      unless remaining == quantity - attempts
+        detail = remaining.nil? ? 'unreadable' : "unexpectedly #{remaining}"
+        Lich::Messaging.msg('bold', "WorkOrders: Logbook remaining count is #{detail}; stopping before further spending")
+        return false
+      end
+
+      if remaining_volume < recipe['volume']
+        DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive?
+        funded = DRCM.ensure_copper_on_hand(@cash_on_hand || 5000, @settings, @hometown)
+        if funded == false
+          Lich::Messaging.msg('bold', 'WorkOrders: Could not verify workorder funds; stopping before material purchase')
+          return false
+        end
+        DRCT.order_item(info['stock-room'], materials_info['stock-number'])
+        DRCC.stow_crafting_item("#{materials_info['stock-name']} ingot", @bag, @belt)
+        remaining_volume = materials_info['stock-volume']
+      end
+
+      crafted = DRC.wait_for_script_to_complete('smith', [materials_info['stock-name'], item['name']])
+      unless crafted
+        Lich::Messaging.msg('bold', 'WorkOrders: Smith did not complete; preserving custody and stopping before bundle')
+        return false
+      end
+      return false unless bundle_item(recipe['noun'], info['logbook'], remaining)
+
+      remaining_volume -= recipe['volume']
+      attempts += 1
+    end
+
+    unless logbook_remaining(info['logbook']) == 0
+      Lich::Messaging.msg('bold', 'WorkOrders: Forging ended without a complete logbook; preserving materials and order')
+      return false
+    end
+
+    DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive?
+    true
   end
 
   def ingot_volume
@@ -1094,7 +1327,9 @@ class WorkOrders
     end
   end
 
-  def bundle_item(noun, logbook)
+  def bundle_item(noun, logbook, expected_remaining = nil)
+    return bundle_item_safely(noun, logbook, expected_remaining) if @resume_or_request
+
     noun = 'fount' if noun == 'small sphere'
     unless DRCI.get_item?("#{logbook} logbook")
       Lich::Messaging.msg('bold', "WorkOrders: Failed to get #{logbook} logbook for bundling")
@@ -1108,19 +1343,72 @@ class WorkOrders
     DRCI.stow_hands
   end
 
-  def request_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
+  def bundle_item_safely(noun, logbook, expected_remaining)
+    noun = 'fount' if noun == 'small sphere'
+
+    unless held_item?(noun) || DRCI.get_item?(noun, @settings.default_container)
+      Lich::Messaging.msg('bold', "WorkOrders: Failed to get #{noun} for bundling; custody preserved")
+      return false
+    end
+    unless held_item?(noun)
+      Lich::Messaging.msg('bold', "WorkOrders: #{noun} is not positively held for bundling; custody preserved")
+      return false
+    end
+
+    unless held_logbook?(logbook) || DRCI.get_item?("#{logbook} logbook")
+      Lich::Messaging.msg('bold', "WorkOrders: Failed to get #{logbook} logbook for bundling")
+      return false
+    end
+    unless held_item?(noun) && held_logbook?(logbook)
+      Lich::Messaging.msg('bold', 'WorkOrders: Item and matching logbook are not both held; custody preserved')
+      return false
+    end
+
+    accepted_pattern = /\AYou notate the #{Regexp.escape(noun)} in the logbook then bundle it up for delivery\.\z/i
+    result = DRC.bput(
+      "bundle my #{noun} with my #{logbook} logbook",
+      accepted_pattern,
+      *SAFE_BUNDLE_FAILURE_PATTERNS
+    )
+    unless result && accepted_pattern.match?(result)
+      Lich::Messaging.msg('bold', "WorkOrders: Bundle was not accepted - #{result}. Custody preserved")
+      return false
+    end
+
+    observed_remaining = logbook_remaining(logbook)
+    unless expected_remaining && observed_remaining == expected_remaining - 1
+      Lich::Messaging.msg('bold', 'WorkOrders: Bundle did not verify a one-item logbook decrement; stopping')
+      return false
+    end
+
+    DRCI.stow_hands
+    true
+  end
+
+  def request_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff, max_requests: 500, allow_bundled_cleanup: true)
     match_names = recipes.map { |x| x['name'] }
     diff ||= 'challenging'
     DRCI.stow_hands
-    500.times do
+    max_requests.times do
       unless find_npc(npc_rooms, npc_last_name)
         Lich::Messaging.msg('bold', "WorkOrders: Could not find NPC #{npc_last_name} - will retry")
         next
       end
-      unless DRC.left_hand || DRC.right_hand
-        unless DRCI.get_item?("#{logbook} logbook")
-          Lich::Messaging.msg('bold', "WorkOrders: Failed to get #{logbook} logbook for work order request")
-          next
+      if allow_bundled_cleanup
+        unless DRC.left_hand || DRC.right_hand
+          unless DRCI.get_item?("#{logbook} logbook")
+            Lich::Messaging.msg('bold', "WorkOrders: Failed to get #{logbook} logbook for work order request")
+            next
+          end
+        end
+      else
+        unless held_logbook?(logbook) || DRCI.get_item?("#{logbook} logbook")
+          Lich::Messaging.msg('bold', "WorkOrders: Failed to get #{logbook} logbook for bounded request")
+          break
+        end
+        unless held_logbook?(logbook)
+          Lich::Messaging.msg('bold', "WorkOrders: #{logbook} logbook is not positively held for bounded request")
+          break
         end
       end
       result = DRC.bput("ask #{npc} for #{diff} #{discipline} work", *WORK_ORDER_REQUEST_PATTERNS)
@@ -1140,6 +1428,10 @@ class WorkOrders
           end
         end
       when 'You realize you have items bundled with the logbook'
+        unless allow_bundled_cleanup
+          Lich::Messaging.msg('bold', 'WorkOrders: Unexpected bundled items while requesting; preserving them and stopping')
+          break
+        end
         unless DRCI.untie_item?('logbook')
           Lich::Messaging.msg('bold', 'WorkOrders: Failed to untie logbook')
         end
@@ -1156,7 +1448,7 @@ class WorkOrders
       end
     end
     stow_tool('logbook')
-    Lich::Messaging.msg('bold', 'WorkOrders: Failed to get a suitable work order after 500 attempts')
+    Lich::Messaging.msg('bold', "WorkOrders: Failed to get a suitable work order after #{max_requests} attempt(s)")
     exit
   end
 
