@@ -5,9 +5,20 @@ require 'cgi'
 # the supervised group's personal retreat count and provide server ordinals
 # for corpse-safe targeting. Retreat thresholds and room NPC census stay intact.
 class CombatTrainerGroupThreats
-  MEMBERS = %w[lanjefast thargrund vrakk].freeze
-  PAIRS = { 'lanjefast-thargrund' => %w[lanjefast thargrund].freeze,
-            'lanjefast-vrakk' => %w[lanjefast vrakk].freeze }.freeze
+  # The fleet roster is configured per character from `hunting_buddies` plus
+  # the character itself (see GameState#initialize). It replaces the fixed
+  # Lanjefast/Thargrund/Vrakk trio and the room-1473 pairs: any grouped fleet
+  # member may exclude threats, and strangers in the room no longer disable
+  # server-ID targeting (2026-09-17 operator direction).
+  @members = [].freeze
+
+  def self.members
+    @members
+  end
+
+  def self.members=(names)
+    @members = Array(names).map { |name| name.to_s.downcase }.reject(&:empty?).uniq.sort.freeze
+  end
   HEADER = /<pushStream id=["']assess["']\/><clearStream id=["']assess["']\/>You assess your combat situation\.\.\./
   PROMPT = /<prompt\b[^>]*>[^<]*<\/prompt>/
   SEGMENT = /<pushStream id=["']assess["']\/>(.*?)<popStream\/>/m
@@ -61,10 +72,7 @@ class CombatTrainerGroupThreats
 
   def self.entries(frame, before, after, complete: true)
     return nil unless frame && before && before == after
-    return nil unless before[:room] && before[:self] &&
-                      MEMBERS.include?(before[:self]) &&
-                      before[:visible].is_a?(Array) &&
-                      (before[:visible] - (MEMBERS - [before[:self]])).empty?
+    return nil unless before[:room] && before[:self] && before[:visible].is_a?(Array)
     return nil unless frame.scan(HEADER).length == 1 && frame.scan(PROMPT).length == 1
 
     # ASSESS consists only of complete stream segments, followed by its prompt.
@@ -109,7 +117,6 @@ class CombatTrainerGroupThreats
     room_nouns = before[:npcs].map { |name| name.split.last.downcase }.tally
     return nil unless observed_nouns.all? { |noun, count| count <= room_nouns.fetch(noun, 0) }
     return nil if complete && observed_nouns != room_nouns
-    return nil unless (peers.map { |entry| entry[:name] } - (MEMBERS - [before[:self]])).empty?
     return nil unless peers.map { |entry| entry[:id] }.uniq.length == peers.length
     return nil unless peers.map { |entry| entry[:name] }.uniq.length == peers.length
     return nil unless entries.count { |entry| entry[:self] } <= 1
@@ -119,20 +126,19 @@ class CombatTrainerGroupThreats
     nil
   end
 
-  # Only the buddy's complete native admission frame publishes this marker.
-  # A missing peer is never promoted from a trio to an implicit pair.
+  # Only the buddy's complete native GROUP LIST frame publishes the group.
+  # Every grouped name must be this character or a configured fleet member;
+  # the group may be any size, and unrelated visible players are ignored.
   def self.valid_group?(context)
     group = context && context[:group]
     return false unless group.is_a?(Hash) && group[:room] == context[:room]
 
-    expected = if group.key?(:supervised_pair)
-                 return false unless context[:room] == 1473
-                 PAIRS[group[:supervised_pair]]
-               else
-                 MEMBERS
-               end
-    expected && group[:names] == expected && expected.include?(context[:self]) &&
-      context[:visible].is_a?(Array) && (context[:visible] - (expected - [context[:self]])).empty?
+    names = group[:names]
+    return false unless names.is_a?(Array) && !names.empty? && names.uniq.length == names.length
+    return false unless context[:self] && names.include?(context[:self])
+    return false unless context[:visible].is_a?(Array)
+
+    (names - members - [context[:self]]).empty?
   rescue StandardError
     false
   end

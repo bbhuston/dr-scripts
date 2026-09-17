@@ -5382,6 +5382,10 @@ class GameState
     echo("  @dance_threshold: #{@dance_threshold}") if $debug_mode_ct
 
     @drbot_supervised_group = settings.drbot_supervised_group
+    # Fleet roster for peer attribution: this character plus hunting_buddies.
+    if defined?(CombatTrainerGroupThreats)
+      CombatTrainerGroupThreats.members = [XMLData.name.to_s] + Array(settings.hunting_buddies)
+    end
     @retreat_threshold = settings.retreat_threshold
     echo("  @retreat_threshold: #{@retreat_threshold}") if $debug_mode_ct
     @escape_unsafe_multi_enemy = settings.escape_unsafe_multi_enemy || false
@@ -6228,8 +6232,6 @@ class GameState
 
     visible = DRRoom.pcs.map { |name| name.to_s.downcase }.sort
     self_name = XMLData.name.to_s.downcase
-    return nil unless CombatTrainerGroupThreats::MEMBERS.include?(self_name)
-    return nil unless (visible - (CombatTrainerGroupThreats::MEMBERS - [self_name])).empty?
 
     { room: room, room_count: XMLData.room_count, xml_room: XMLData.room_id,
       self: self_name, visible: visible, npcs: npcs, ids: ids,
