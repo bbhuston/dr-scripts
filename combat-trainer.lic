@@ -1155,6 +1155,7 @@ class LootProcess
     end
 
     waitrt?
+    @drbot_harvest_corpse = nil
     corpse = DRRoom.dead_npcs.first
     return unless harvest_corpse_present?(corpse, game_state)
     return if harvest_peer_busy?
@@ -1172,7 +1173,7 @@ class LootProcess
     game_state.sheath_whirlwind_offhand
 
     echo("DRRoom.dead_npcs.first is: #{DRRoom.dead_npcs.first}") if $debug_mode_ct
-    skin_or_dissect(DRRoom.dead_npcs.first, game_state) if check_rituals?(game_state)
+    skin_or_dissect(corpse, game_state) if check_rituals?(game_state)
 
     game_state.wield_whirlwind_offhand
     return if @drbot_harvest_deferred
@@ -1180,7 +1181,7 @@ class LootProcess
     unless game_state.necro_casting?
       return unless harvest_corpse_present?(corpse, game_state)
 
-      while DRC.bput("loot #{@custom_loot_type}".strip, 'You search', 'I could not find what you were referring to', 'and get ready to search it') == 'and get ready to search it'
+      while DRC.bput("loot #{harvest_corpse_selector} #{@custom_loot_type}".squeeze(' ').strip, 'You search', 'I could not find what you were referring to', 'and get ready to search it') == 'and get ready to search it'
         pause
         waitrt?
         return unless harvest_corpse_present?(corpse, game_state)
@@ -1198,13 +1199,13 @@ class LootProcess
 
     arranges = 0
     type = @arrange_types[mob_noun] || 'skin'
-    arrange_message = @arrange_all ? "arrange all for #{type}" : "arrange for #{type}"
+    arrange_message = @arrange_all ? "arrange #{harvest_corpse_selector} all for #{type}" : "arrange #{harvest_corpse_selector} for #{type}"
     while arranges < @arrange_count
       # Each arrange adds roundtime; a new arrival must stop the next step.
       return unless harvest_corpse_present?(mob_noun, game_state)
 
       arranges += 1 # rubocop:disable Lint/UselessAssignment
-      case DRC.bput(arrange_message, 'You begin to arrange', 'You continue arranging', 'You make a mistake', 'You complete arranging', 'That creature cannot', 'That has already been arranged', 'Arrange what', 'cannot be skinned', 'You make a serious mistake in the arranging process', 'The .* is currently being arranged to produce')
+      case DRC.bput(arrange_message.squeeze(' '), 'You begin to arrange', 'You continue arranging', 'You make a mistake', 'You complete arranging', 'That creature cannot', 'That has already been arranged', 'Arrange what', 'cannot be skinned', 'You make a serious mistake in the arranging process', 'The .* is currently being arranged to produce')
       when 'You complete arranging', 'That has already been arranged', 'You make a serious mistake in the arranging process', 'Arrange what'
         break
       when 'cannot be skinned'
@@ -1213,7 +1214,7 @@ class LootProcess
         break
       when 'That creature cannot'
         arranges = 0
-        arrange_message = @arrange_all ? 'arrange all' : 'arrange'
+        arrange_message = @arrange_all ? "arrange #{harvest_corpse_selector} all" : "arrange #{harvest_corpse_selector}"
       end
     end
   end
@@ -1229,7 +1230,49 @@ class LootProcess
     @drbot_peer_harvest_until && Time.now < @drbot_peer_harvest_until
   end
 
+  # Bind a harvest pass to one server corpse identity. Names remain only
+  # creature-type metadata for skin/dissection configuration. Never silently
+  # substitute another same-named corpse after decay or another hunter's loot.
+  def harvest_corpse_identity?(mob_noun)
+    return DRRoom.dead_npcs.first == mob_noun unless @drbot_harvest_ids
+
+    return false unless defined?(Lich::DragonRealms::Creature)
+    room = [Room.current&.id, XMLData.room_id]
+    return false unless room.all?
+
+    corpses = Lich::DragonRealms::Creature.in_room.select do |creature|
+      creature.id.to_s.match?(/\A[1-9]\d*\z/) && creature.crtr_flag?(:dead)
+    end
+    return false unless corpses.map(&:id).uniq.length == corpses.length
+
+    bound = @drbot_harvest_corpse
+    if bound
+      return false unless bound[:room] == room && bound[:noun] == mob_noun
+      corpse = corpses.find { |entry| entry.id.to_s == bound[:id] }
+      return !!(corpse && corpse.noun.to_s.casecmp?(mob_noun.split.last))
+    end
+    corpse = corpses.find do |entry|
+      !entry.name.to_s.empty? && entry.noun.to_s.casecmp?(mob_noun.split.last)
+    end
+    return false unless corpse
+
+    @drbot_harvest_corpse = { room: room, noun: mob_noun, id: corpse.id.to_s }
+    true
+  rescue StandardError
+    false
+  end
+
+  def harvest_corpse_selector
+    return '' unless @drbot_harvest_ids
+
+    bound = @drbot_harvest_corpse
+    raise 'harvest corpse identity unavailable' unless bound && bound[:id].match?(/\A[1-9]\d*\z/)
+
+    "##{bound[:id]}"
+  end
+
   def harvest_corpse_present?(mob_noun, game_state)
+    @drbot_harvest_ids = game_state.respond_to?(:drbot_corpse_ids?) && game_state.drbot_corpse_ids?
     return false if mob_noun.nil? || mob_noun.empty?
 
     waitrt?
@@ -1243,7 +1286,7 @@ class LootProcess
     # both visible group partners are holding every live enemy.
     result = DRC.bput('look', /^Obvious (?:paths|exits):/, /You can't see anything/, /It's pitch dark/)
     ready = result.to_s.match?(/^Obvious (?:paths|exits):/) &&
-      DRRoom.npcs.is_a?(Array) && DRRoom.dead_npcs.first == mob_noun
+      DRRoom.npcs.is_a?(Array) && harvest_corpse_identity?(mob_noun)
     if ready && !DRRoom.npcs.empty?
       ready = false
       if game_state.respond_to?(:drbot_group_threat_observation)
@@ -1252,7 +1295,7 @@ class LootProcess
         ready = observation && observation[:count] == 0 && context &&
           context == game_state.drbot_group_threat_context &&
           context[:visible].sort == (context[:group][:names] - [context[:self]]).sort &&
-          DRRoom.dead_npcs.first == mob_noun
+          harvest_corpse_identity?(mob_noun)
       end
     end
     ready &&= !harvest_peer_busy?
@@ -1407,7 +1450,7 @@ class LootProcess
     # checks current custody and engagement before loot.
     Flags.reset('ct-successful-skin')
     snap = [DRC.left_hand, DRC.right_hand]
-    skin_result = DRC.bput('skin', 'roundtime', 'skin what', 'cannot be skinned', 'carrying far too many items', 'need a more appropriate weapon', 'need to have a bladed instrument to skin', 'You must have one hand free to skin')
+    skin_result = DRC.bput("skin #{harvest_corpse_selector}".strip, 'roundtime', 'skin what', 'cannot be skinned', 'carrying far too many items', 'need a more appropriate weapon', 'need to have a bladed instrument to skin', 'You must have one hand free to skin')
     return unless restore_skinning_weapon(game_state)
     if Flags['ct-successful-skin']
       @drbot_harvest_deferred = false
@@ -6141,6 +6184,11 @@ class GameState
   end
 
   # Individual creature identity does not depend on shared group attribution.
+  # Roll out strict corpse IDs only where the live ID collector is exercised.
+  def drbot_corpse_ids?
+    @drbot_supervised_group == 'lvt-goblins'
+  end
+
   def drbot_target_context
     return nil unless @drbot_supervised_group == 'lvt-goblins'
     return nil unless defined?(CombatTrainerGroupThreats) && defined?(Lich::DragonRealms::Creature)
