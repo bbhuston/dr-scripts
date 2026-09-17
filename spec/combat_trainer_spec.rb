@@ -34,6 +34,178 @@ class Harness::UserVars
   end
 end
 
+# ===================================================================
+# Weapon custody during weapon transitions and thrown attacks
+# ===================================================================
+RSpec.describe 'combat-trainer weapon custody' do
+  before(:each) do
+    ct_setup
+    allow(DRC).to receive(:message)
+    allow(DRC).to receive(:bput).and_return('roundtime')
+  end
+
+  def weapon_switch_state
+    state = double(
+      'GameState',
+      last_weapon_skill: 'Large Edged', weapon_skill: 'Light Thrown',
+      last_weapon_name: 'broadsword', weapon_name: 'wide-bladed dagger',
+      aimed_skill?: false, whirlwind_trainable?: false
+    )
+    allow(state).to receive(:summoned_info).and_return(nil)
+    allow(state).to receive(:sheath_whirlwind_offhand)
+    allow(state).to receive(:loaded=)
+    allow(state).to receive(:wield_weapon).and_return(true)
+    allow(state).to receive(:currently_whirlwinding=)
+    allow(state).to receive(:cleaning_up?).and_return(false)
+    allow(state).to receive(:next_clean_up_step)
+    state
+  end
+
+  def setup_process(equipment_manager)
+    process = SetupProcess.allocate
+    process.instance_variable_set(:@equipment_manager, equipment_manager)
+    process.instance_variable_set(:@last_seen_weapon_skill, nil)
+    process.instance_variable_set(:@firing_check, 0)
+    process
+  end
+
+  def thrown_state(offhand: false)
+    double(
+      'GameState',
+      weapon_name: 'wide-bladed dagger', offhand?: offhand,
+      thrown_attack_verb: 'lob', thrown_retrieve_verb: 'get my wide-bladed dagger',
+      action_taken: :acted, cleaning_up?: false, next_clean_up_step: nil
+    )
+  end
+
+  def attack_process
+    process = AttackProcess.allocate
+    allow(process).to receive(:waitrt?)
+    process
+  end
+
+  it 'treats a failed stow with both hands empty as already stowed' do
+    $right_hand = nil
+    $left_hand = nil
+    equipment_manager = double('EquipmentManager', stow_weapon: false)
+    state = weapon_switch_state
+
+    result = setup_process(equipment_manager).send(:check_weapon, state)
+
+    expect(result).not_to eq(:weapon_custody_failure)
+    expect(state).to have_received(:wield_weapon)
+    expect($HUNTING_BUDDY).not_to have_received(:stop_hunting)
+    expect($COMBAT_TRAINER).not_to have_received(:stop)
+    expect(DRC).not_to have_received(:message).with(/failed to stow.*broadsword/i)
+  end
+
+  it 'stops when a reported successful stow leaves the primary in hand' do
+    $right_hand = 'a broadsword'
+    equipment_manager = double('EquipmentManager', stow_weapon: true)
+    state = weapon_switch_state
+
+    result = setup_process(equipment_manager).send(:check_weapon, state)
+
+    expect(result).to eq(:weapon_custody_failure)
+    expect(state).to have_received(:next_clean_up_step).once
+    expect(DRC).to have_received(:message).with(/broadsword.*remains in hand/i)
+  end
+
+  it 'continues the switch only after the primary is no longer held' do
+    $right_hand = 'a broadsword'
+    equipment_manager = double('EquipmentManager')
+    allow(equipment_manager).to receive(:stow_weapon) do
+      $right_hand = nil
+      true
+    end
+    state = weapon_switch_state
+
+    result = setup_process(equipment_manager).send(:check_weapon, state)
+
+    expect(result).not_to eq(:weapon_custody_failure)
+    expect(state).to have_received(:wield_weapon)
+    expect($HUNTING_BUDDY).not_to have_received(:stop_hunting)
+    expect($COMBAT_TRAINER).not_to have_received(:stop)
+  end
+
+  it 'stops when the next configured weapon cannot be wielded' do
+    $right_hand = 'a broadsword'
+    equipment_manager = double('EquipmentManager')
+    allow(equipment_manager).to receive(:stow_weapon) do
+      $right_hand = nil
+      true
+    end
+    state = weapon_switch_state
+    allow(state).to receive(:wield_weapon).and_return(false)
+
+    result = setup_process(equipment_manager).send(:check_weapon, state)
+
+    expect(result).to eq(:weapon_custody_failure)
+    expect(DRC).to have_received(:message).with(/failed to wield.*wide-bladed dagger.*Light Thrown/i)
+    expect($HUNTING_BUDDY).to have_received(:stop_hunting)
+    expect($COMBAT_TRAINER).to have_received(:stop)
+  end
+
+  it 'allows an intentionally weaponless Brawling rotation' do
+    $right_hand = 'a broadsword'
+    equipment_manager = double('EquipmentManager')
+    allow(equipment_manager).to receive(:stow_weapon) do
+      $right_hand = nil
+      true
+    end
+    state = weapon_switch_state
+    allow(state).to receive(:weapon_skill).and_return('Brawling')
+    allow(state).to receive(:weapon_name).and_return('')
+    allow(state).to receive(:wield_weapon).and_return(nil)
+
+    result = setup_process(equipment_manager).send(:check_weapon, state)
+
+    expect(result).not_to eq(:weapon_custody_failure)
+    expect($HUNTING_BUDDY).not_to have_received(:stop_hunting)
+    expect($COMBAT_TRAINER).not_to have_received(:stop)
+  end
+
+  it 'stops without lobbing when the configured weapon is in the wrong hand' do
+    $right_hand = 'a broadsword'
+    $left_hand = 'a wide-bladed dagger'
+    state = thrown_state(offhand: false)
+
+    result = attack_process.send(:attack_thrown, state)
+
+    expect(result).to eq(:weapon_custody_failure)
+    expect(DRC).not_to have_received(:bput).with(/^lob/, anything, anything)
+    expect(DRC).to have_received(:message).with(/wide-bladed dagger.*right hand.*broadsword/i)
+    expect($HUNTING_BUDDY).to have_received(:stop_hunting)
+    expect($COMBAT_TRAINER).to have_received(:stop)
+  end
+
+  it 'lobs a matching configured weapon from the right hand' do
+    $right_hand = 'a wide-bladed dagger'
+    $left_hand = 'a broadsword'
+    allow(DRC).to receive(:bput).and_return('roundtime', 'You pick up')
+    state = thrown_state(offhand: false)
+
+    expect(attack_process.send(:attack_thrown, state)).to eq(:acted)
+
+    expect(DRC).to have_received(:bput).with('lob', 'roundtime', 'What are you trying to')
+    expect(state).to have_received(:action_taken)
+    expect($COMBAT_TRAINER).not_to have_received(:stop)
+  end
+
+  it 'lobs a matching configured weapon from the left hand when offhand' do
+    $right_hand = 'a broadsword'
+    $left_hand = 'a wide-bladed dagger'
+    allow(DRC).to receive(:bput).and_return('roundtime', 'You pick up')
+    state = thrown_state(offhand: true)
+
+    expect(attack_process.send(:attack_thrown, state)).to eq(:acted)
+
+    expect(DRC).to have_received(:bput).with('lob left', 'roundtime', 'What are you trying to')
+    expect(state).to have_received(:action_taken)
+    expect($COMBAT_TRAINER).not_to have_received(:stop)
+  end
+end
+
 # Reopen the harness DRSpells (do NOT shadow with a fresh top-level class --
 # a fresh class would lose active_spells/_set_active_spells that several specs
 # rely on). Add known_spells and slivers backed by their own class vars, and

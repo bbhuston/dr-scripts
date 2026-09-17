@@ -84,12 +84,12 @@ class SetupProcess
       # then switch to your new weapon. This ensures you have a weapon in hand
       # to parry with while you're stanced to parry.
       check_stance(game_state)
-      check_weapon(game_state)
+      return true if check_weapon(game_state) == :weapon_custody_failure
     else
       # And vice versa, if you're not parrying but you might stance to that next
       # then ensure you have a weapon in hand then choose an appropriate stance.
       # This also ensures the stance you choose respects any weapon-stance overrides.
-      check_weapon(game_state)
+      return true if check_weapon(game_state) == :weapon_custody_failure
       check_stance(game_state)
     end
 
@@ -362,8 +362,6 @@ class SetupProcess
   def check_weapon(game_state)
     return if @last_seen_weapon_skill == game_state.weapon_skill
 
-    @last_seen_weapon_skill = game_state.weapon_skill
-
     echo("checking weapons as #{game_state.last_weapon_skill.inspect}!=#{game_state.weapon_skill}") if $debug_mode_ct
 
     last_summoned = game_state.summoned_info(game_state.last_weapon_skill)
@@ -371,7 +369,19 @@ class SetupProcess
 
     # Clean up the previous weapon
     if !last_summoned
-      @equipment_manager.stow_weapon(game_state.last_weapon_name)
+      if game_state.last_weapon_name
+        unless @equipment_manager.stow_weapon(game_state.last_weapon_name) || (!DRC.right_hand && !DRC.left_hand)
+          return stop_for_weapon_custody(
+            "failed to stow #{game_state.last_weapon_name.inspect} before switching to #{game_state.weapon_name.inspect}", game_state
+          )
+        end
+        if held_weapon_matches?(DRC.right_hand, game_state.last_weapon_name) ||
+           held_weapon_matches?(DRC.left_hand, game_state.last_weapon_name)
+          return stop_for_weapon_custody(
+            "#{game_state.last_weapon_name.inspect} remains in hand after stow before switching to #{game_state.weapon_name.inspect}", game_state
+          )
+        end
+      end
       game_state.sheath_whirlwind_offhand
     elsif !next_summoned && !DRStats.moon_mage?
       DRCS.break_summoned_weapon(game_state.last_weapon_name)
@@ -391,7 +401,12 @@ class SetupProcess
       game_state.prepare_summoned_weapon(last_summoned)
     else
       DRC.bput('aim stop', "But you're not aiming", 'You stop concentrating', 'You are already') if game_state.aimed_skill?
-      game_state.wield_weapon
+      wielded = game_state.wield_weapon
+      if game_state.weapon_name && !game_state.weapon_name.empty? && !wielded
+        return stop_for_weapon_custody(
+          "failed to wield #{game_state.weapon_name.inspect} for #{game_state.weapon_skill.inspect}", game_state
+        )
+      end
       if game_state.whirlwind_trainable?
         game_state.currently_whirlwinding = true
         determine_whirlwind_weapon(game_state)
@@ -401,12 +416,27 @@ class SetupProcess
       end
     end
 
+    @last_seen_weapon_skill = game_state.weapon_skill
+
     # Invoke Focus
     return unless game_state.weapon_skill == 'Targeted Magic' && game_state.weapon_name
     return unless DRCI.get_item?(game_state.weapon_name)
 
     DRC.bput("invoke #{game_state.weapon_name}", 'You')
     waitrt?
+  end
+
+  def held_weapon_matches?(held_item, expected_weapon)
+    return false unless held_item && expected_weapon
+
+    held_item.to_s.match?(/\b#{Regexp.escape(expected_weapon.to_s)}\b/i)
+  end
+
+  def stop_for_weapon_custody(reason, game_state = nil)
+    DRC.message("*** combat-trainer: Weapon custody failure: #{reason}. Stopping hunt.")
+    $HUNTING_BUDDY&.stop_hunting
+    $COMBAT_TRAINER&.stop; game_state&.next_clean_up_step unless game_state&.cleaning_up?
+    :weapon_custody_failure
   end
 
   def determine_whirlwind_weapon(game_state)
@@ -4180,6 +4210,13 @@ class AttackProcess
   def attack_thrown(game_state)
     attack_action = game_state.thrown_attack_verb
     attack_action += ' left' if game_state.offhand?
+    expected_hand = game_state.offhand? ? 'left' : 'right'
+    held_weapon = game_state.offhand? ? DRC.left_hand : DRC.right_hand
+    unless held_weapon_matches?(held_weapon, game_state.weapon_name)
+      return stop_for_weapon_custody(
+        "expected #{game_state.weapon_name.inspect} in #{expected_hand} hand before #{attack_action}, observed #{held_weapon.inspect}", game_state
+      )
+    end
     DRC.bput(attack_action, 'roundtime', 'What are you trying to')
     waitrt?
     return game_state.action_taken if attack_action.include?('whip')
@@ -4218,6 +4255,19 @@ class AttackProcess
     end
 
     game_state.action_taken
+  end
+
+  def held_weapon_matches?(held_item, expected_weapon)
+    return false unless held_item && expected_weapon
+
+    held_item.to_s.match?(/\b#{Regexp.escape(expected_weapon.to_s)}\b/i)
+  end
+
+  def stop_for_weapon_custody(reason, game_state = nil)
+    DRC.message("*** combat-trainer: Weapon custody failure: #{reason}. Stopping hunt.")
+    $HUNTING_BUDDY&.stop_hunting
+    $COMBAT_TRAINER&.stop; game_state&.next_clean_up_step unless game_state&.cleaning_up?
+    :weapon_custody_failure
   end
 
   def shoot_aimed(command, game_state)
@@ -5558,19 +5608,16 @@ class GameState
   #   Which hand to equip the weapon into?
   #   True to equip in main hand, false to equip in offhand.
   #   If not specified then defaults to true unless currently training 'Offhand Weapon' skill.
-  # @returns name of the wielded weapon
+  # @returns true when the configured weapon was equipped, false otherwise
   def wield_specific_weapon(weapon_name, skill, equip_main_hand = !offhand?)
     echo "wield_specific_weapon: weapon_name=#{weapon_name}, skill=#{skill}, equip_main_hand=#{equip_main_hand}" if $debug_mode_ct
     if is_damaris_weapon?(weapon_name)
       return wield_damaris_weapon(weapon_name, equip_main_hand)
     end
 
-    if equip_main_hand
-      @equipment_manager.wield_weapon?(weapon_name, skill)
-    else
-      @equipment_manager.wield_weapon_offhand?(weapon_name, skill)
-    end
-    return weapon_name
+    return @equipment_manager.wield_weapon?(weapon_name, skill) if equip_main_hand
+
+    @equipment_manager.wield_weapon_offhand?(weapon_name, skill)
   end
 
   # Wields a weapon to train the specified skill.
