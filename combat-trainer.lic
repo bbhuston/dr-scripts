@@ -6093,6 +6093,20 @@ class GameState
   # Prioritizes dual wield to maximize weapons training.
   # Next chooses based on the current weapon skill being trained.
   # Finally, may attempt a shield rush.
+  # Preserve only the configured gear shield, never an arbitrary left-hand item.
+  # Missing gear/hand metadata leaves the upstream empty-hand path unchanged.
+  def drbot_rush_shield_held?
+    return false unless @rush_shield && DRC.respond_to?(:left_hand_noun)
+    return false unless DRC.left_hand_noun.to_s.casecmp?('shield')
+
+    item = @equipment_manager.item_by_desc(@rush_shield)
+    return false unless item && item.name.to_s.casecmp?('shield')
+
+    !!(item.short_regex =~ DRC.left_hand.to_s)
+  rescue StandardError
+    false
+  end
+
   def determine_charged_maneuver
     return nil unless @use_charged_maneuvers
 
@@ -6100,7 +6114,7 @@ class GameState
 
     can_dual_wield_whirlwind = @currently_whirlwinding && !twohanded_weapon_skill?
     can_dual_wield_doublestrike = @prioritize_maneuver_doublestrike && doublestrikable_weapon_skill?
-    can_shield_rush = @rush_shield && !aimed_skill? && !DRC.left_hand
+    can_shield_rush = @rush_shield && !aimed_skill? && (!DRC.left_hand || drbot_rush_shield_held?)
 
     if charged_maneuver_off_cooldown?(@charged_maneuvers['Dual Wield']) && (can_dual_wield_whirlwind || can_dual_wield_doublestrike)
       maneuver = @charged_maneuvers['Dual Wield']
@@ -6169,13 +6183,16 @@ class GameState
 
     is_shield_rush = maneuver.casecmp?(@charged_maneuvers['Shield Usage'])
 
-    wield_specific_weapon(@rush_shield, 'Shield Usage', false) if is_shield_rush
+    shield_already_held = is_shield_rush && drbot_rush_shield_held?
+    return false if is_shield_rush && DRC.left_hand && !shield_already_held
+
+    wield_specific_weapon(@rush_shield, 'Shield Usage', false) if is_shield_rush && !shield_already_held
 
     attempt = DRC.bput("maneuver #{maneuver}", *maneuver_success_messages, *maneuver_failure_messages, *maneuver_retreat_retry_messages)
 
     waitrt?
 
-    @equipment_manager.stow_weapon(@rush_shield) if is_shield_rush
+    @equipment_manager.stow_weapon(@rush_shield) if is_shield_rush && !shield_already_held
 
     if Flags['ct-attack-out-of-range']
       engage
