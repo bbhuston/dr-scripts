@@ -4383,9 +4383,13 @@ class AttackProcess
         "expected #{game_state.weapon_name.inspect} in #{expected_hand} hand before #{attack_action}, observed #{held_weapon.inspect}", game_state
       )
     end
+    rush_target = drbot_spear_rush_target(game_state) if respond_to?(:drbot_spear_rush_target) && attack_action.match?(/\A(?:lob|throw|hurl)\z/)
+    attack_action += " #{game_state.weapon_name} at #{rush_target[:selector]}" if rush_target
     DRC.bput(attack_action, 'roundtime', 'What are you trying to')
     waitrt?
     return game_state.action_taken if attack_action.include?('whip')
+
+    drbot_spear_rush_after_throw(game_state, rush_target) if rush_target
 
     if game_state.weapon_name == 'blades'
       until /(Stow what|You put your)/ =~ DRC.bput('stow blade', 'Stow what', 'You pick up .*blade', 'You put your')
