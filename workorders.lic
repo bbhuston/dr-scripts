@@ -82,7 +82,7 @@ class WorkOrders
 
   LOGBOOK_REMAINING_PATTERN = /You must bundle and deliver (?<remaining>\d+) more/.freeze
   LOGBOOK_ITEM_PATTERN = /This logbook is tracking a work order requiring you to craft (?<item>.+?) from any/i.freeze
-  LOGBOOK_NO_ORDER_PATTERN = /\AThis logbook is not currently tracking (?:a work order|any work orders)\.\z/i.freeze
+  LOGBOOK_NO_ORDER_PATTERN = /(?:\AThis logbook is not currently tracking (?:a work order|any work orders)\.\z|This logbook has been used to complete:)/i.freeze
   RESUME_LOGBOOK_PATTERNS = [
     LOGBOOK_ITEM_PATTERN,
     'This work order appears to be complete.',
@@ -390,11 +390,11 @@ class WorkOrders
       return [nil, 0]
     end
 
-    if result && LOGBOOK_NO_ORDER_PATTERN.match?(result)
+    if result && (LOGBOOK_NO_ORDER_PATTERN.match?(result) || result.include?("has expired"))
       stow_tool('logbook')
       requested = request_work_order(
         recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff,
-        max_requests: 1, allow_bundled_cleanup: false
+        max_requests: @settings.workorders_max_requests || 50, allow_bundled_cleanup: false
       )
       confirmed = read_active_work_order(recipes, logbook)
       unless confirmed && confirmed == requested
@@ -1376,7 +1376,7 @@ class WorkOrders
     end
 
     observed_remaining = logbook_remaining(logbook)
-    unless expected_remaining && observed_remaining == expected_remaining - 1
+    if expected_remaining && observed_remaining != expected_remaining - 1
       Lich::Messaging.msg('bold', 'WorkOrders: Bundle did not verify a one-item logbook decrement; stopping')
       return false
     end
