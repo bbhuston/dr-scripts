@@ -4016,6 +4016,22 @@ class TrainerProcess
     return if game_state.retreating?
     return if game_state.npcs.empty?
 
+    if game_state.drbot_identity_targets?
+      context = game_state.drbot_target_context
+      return unless context
+      scope = context.values_at(:room, :room_count, :xml_room)
+      @drbot_no_app_ids = [] if @drbot_no_app_scope != scope
+      @drbot_no_app_scope = scope
+      @drbot_no_app_ids ||= []
+      @drbot_no_app_ids &= context[:ids]
+      target = game_state.drbot_capture_living_target(@drbot_no_app_ids)
+      return unless target && game_state.drbot_living_target_current?(target)
+      return if DRSkill.getrank('Appraisal') < 76
+      result = DRC.bput("app ##{target[:id]} #{modifier}", 'Taking stock of', "It's dead", "You can't determine anything about this creature.", 'I could not find', 'You cannot appraise that', 'roundtime', '^Perhaps that', 'Appraise what')
+      @drbot_no_app_ids << target[:id] if result =~ /Perhaps that/ && game_state.drbot_living_target_current?(target)
+      return
+    end
+
     target = (game_state.npcs - @no_app).first
     return unless target
     return if DRSkill.getrank('Appraisal') < 76
@@ -4441,6 +4457,14 @@ class AttackProcess
   end
 
   def shoot_aimed(command, game_state)
+    if game_state.drbot_identity_targets?
+      unless game_state.drbot_living_target_current?(@drbot_aim_target)
+        drbot_cancel_identity_aim(game_state)
+        return :target_lost
+      end
+      # Rebuild the adapter on retries; never append a second selector.
+      command = "#{command.sub(/\s+#\d+\z/, '')} ##{@drbot_aim_target[:id]}"
+    end
     echo("Time now: #{Time.now}") if $debug_mode_ct
     echo("@firing_timer: #{@firing_timer}") if $debug_mode_ct
     echo("@firing_delay: #{@firing_delay}") if $debug_mode_ct
@@ -4451,27 +4475,33 @@ class AttackProcess
     # rather than relying on the first message returned from bput.
     Flags.reset('ct-ranged-ammo')
 
-    result = DRC.bput(command, /you (fire|poach|snipe)/i, /isn't loaded/i, /There is nothing/i, /But your/i, /I could not find/i, /with no effect and falls (to the ground|to your feet)/i, /Face what/i, /How can you (poach|snipe)/i, /you don't feel like fighting right now/i, /That weapon must be in your right hand to fire/i, /But you don't have a ranged weapon in your hand to fire with/i)
+    result = DRC.bput(command, /you (fire|poach|snipe)/i, /isn't loaded/i, /There is nothing/i, /already dead|is dead|It's dead/i, /But your/i, /I could not find/i, /with no effect and falls (to the ground|to your feet)/i, /Face what/i, /How can you (poach|snipe)/i, /you don't feel like fighting right now/i, /That weapon must be in your right hand to fire/i, /But you don't have a ranged weapon in your hand to fire with/i)
     waitrt?
 
     case result
+    when /I could not find|already dead|is dead|It's dead|Face what/i
+      if game_state.drbot_identity_targets?
+        drbot_cancel_identity_aim(game_state)
+        return :target_lost
+      end
     when /How can you (poach|snipe)/i
-      shoot_aimed('shoot', game_state)
+      return shoot_aimed('shoot', game_state)
     when /That weapon must be in your right hand to fire|But you don't have a ranged weapon in your hand to fire with/i
       # Explicitly say 'swap right' because if you're holding a swappable weapon (e.g. riste)
       # then just 'swap' will try to switch the weapon mode, not move it to other hand.
       if fput('swap right') =~ /You (swap|move)/i
-        shoot_aimed(command, game_state)
+        return shoot_aimed(command, game_state)
       end
     when /you don't feel like fighting right now/i
       pause 1
-      shoot_aimed(command, game_state)
+      return shoot_aimed(command, game_state)
     when /with no effect and falls (to the ground|to your feet)/i
       # If you fired without Bless at an incorporeal undead then it'll have no effect.
       # However, that's still considered an action taken, just you missed.
       game_state.action_taken
     when /you (fire|poach|snipe)/i
       # Successful fire, increment action_taken
+      @drbot_aim_target = nil
       game_state.action_taken
     end
 
@@ -4485,24 +4515,22 @@ class AttackProcess
     end
   end
 
-  def attack_aimed(charged_maneuver, game_state)
-    # This little conditional appears to have been the source of the aim bug, at least in part.
-    # The idea behind this as it is written was to reaquire a new target after a mob dies, with CT assuming you
-    # did the killing. The game_state checks were to ignore dead things that necros were playing with.
-    # However, in practice, when hunting with someone else, things get dead, things that have nothing
-    # to do with you aiming, and sometimes they persist for longer than is strictly necessary. CT would continue
-    # quietly returning to this little conditional in a vain attempt to see if you were ready to fire.
-    # CT hits this first which would tell CT, falsly, that your ranged weapon was unloaded.
-    # So CT dutifully attempted to reload, reaim, and then goes to check, again, if you're ready to fire. This
-    # loop only broke if both 1. the bodies departed and 2. CT had reason to reassess game_state.mob_died. Until
-    # both occurred, we looped. With this excluded, when a mob dies while we are aiming, we carry on with our aim_fillers
-    # until the timer expires, then shoot. If our target died, it's a snap shot at the next available mob. Otherwise, it's
-    # just business as usual, a fully aimed shot at our target.
-    # if game_state.mob_died && !(game_state.casting_consume || game_state.prepare_consume)
-    #   game_state.loaded = false
-    #   @firing_check = 0
-    # end
+  def drbot_cancel_identity_aim(game_state)
+    DRC.bput('aim stop', "But you're not aiming", 'You stop concentrating', 'You are already') if @drbot_aim_target
+    @drbot_aim_target = nil
+    Flags.reset('ct-ranged-ready')
+    @firing_check = 0
+    game_state.clear_aim_queue
+    # Keep the loaded weapon: losing a target does not consume ammunition.
+  end
 
+  def attack_aimed(charged_maneuver, game_state)
+    if game_state.drbot_identity_targets? && game_state.loaded && !game_state.drbot_living_target_current?(@drbot_aim_target)
+      drbot_cancel_identity_aim(game_state)
+      aim(game_state)
+      return
+    end
+    # Loaded identity-bound shots must retain their original living target.
     if Flags['ct-aim-failed']
       game_state.loaded = false
       @firing_check = 0
@@ -4520,7 +4548,7 @@ class AttackProcess
                 else
                   'shoot'
                 end
-      shoot_aimed(command, game_state)
+      return if shoot_aimed(command, game_state) == :target_lost
       game_state.clear_aim_queue
       game_state.loaded = false
       @firing_check = 0
@@ -4672,6 +4700,15 @@ class AttackProcess
             # When dual loading, powershot only fires one of the arrows.
             # So let's take advantage of the remaining arrow that's still loaded.
             if game_state.dual_load?
+              if game_state.drbot_identity_targets?
+                # Powershot consumed one arrow. Acquire an explicit fresh aim
+                # for the remaining arrow rather than an unbound snap shot.
+                @drbot_aim_target = nil
+                game_state.action_taken
+                game_state.set_aim_queue
+                aim(game_state)
+                return
+              end
               shoot_aimed('shoot', game_state)
             end
             game_state.loaded = false
@@ -4724,6 +4761,15 @@ class AttackProcess
   end
 
   def aim(game_state)
+    command = 'aim'
+    if game_state.drbot_identity_targets?
+      unless game_state.drbot_living_target_current?(@drbot_aim_target)
+        drbot_cancel_identity_aim(game_state)
+        @drbot_aim_target = game_state.drbot_capture_living_target
+      end
+      return unless game_state.drbot_living_target_current?(@drbot_aim_target)
+      command = "aim ##{@drbot_aim_target[:id]}"
+    end
     aim_success_messages = [
       /You are already/,
       /You begin to target/,
@@ -4739,6 +4785,7 @@ class AttackProcess
 
     no_enemy_messages = [
       /There is nothing else/,
+      /I could not find|already dead|is dead|It's dead/i,
       /Face what/
     ]
 
@@ -4747,8 +4794,12 @@ class AttackProcess
       /You don't seem to be able to move to do that/
     ]
 
-    case DRC.bput("aim", *aim_success_messages, *unloaded_messages, *no_enemy_messages, *wait_and_retry_messages)
+    case DRC.bput(command, *aim_success_messages, *unloaded_messages, *no_enemy_messages, *wait_and_retry_messages)
     when *aim_success_messages
+      if game_state.drbot_identity_targets? && !game_state.drbot_living_target_current?(@drbot_aim_target)
+        drbot_cancel_identity_aim(game_state)
+        return
+      end
       game_state.loaded = true
       check_firing_time
     when *unloaded_messages
@@ -6049,6 +6100,26 @@ class GameState
     @dancing = @cached_npcs.length <= @dance_threshold || @cached_npcs.empty?
     @retreating = @retreat_threshold && threats >= @retreat_threshold
     escape_unsafe_contact if @retreating
+  end
+
+  # Identity-bound operations are enabled only where the census is validated.
+  def drbot_identity_targets?
+    @drbot_supervised_group == 'lvt-goblins'
+  end
+
+  def drbot_capture_living_target(excluded = [])
+    context = drbot_target_context
+    return nil unless context
+    id = context[:ids].find { |candidate| !excluded.include?(candidate) }
+    return nil unless id
+    { id: id, room: context[:room], generation: context[:room_count], xml_room: context[:xml_room] }
+  end
+
+  def drbot_living_target_current?(target)
+    context = drbot_target_context
+    target && context && context[:room] == target[:room] &&
+      context[:room_count] == target[:generation] && context[:xml_room] == target[:xml_room] &&
+      context[:ids].include?(target[:id])
   end
 
   # Individual creature identity does not depend on shared group attribution.
