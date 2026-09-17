@@ -3924,7 +3924,17 @@ class TrainerProcess
     return if game_state.brawling? || game_state.offhand? || game_state.aimed_skill?
     return if DRC.right_hand.nil?
 
-    DRC.bput("smite", "Drawing strength from your conviction", "Drawing upon holy wrath", "You aren't close enough", "What are you trying to attack")
+    command = 'smite'
+    if game_state.drbot_attack_ids_required?
+      held_weapon = DRC.right_hand
+      waitrt?
+      target = game_state.drbot_attack_target_id
+      return unless target && DRC.right_hand == held_weapon
+
+      command += " #{target}"
+    end
+    DRC.bput(command, "Drawing strength from your conviction", "Drawing upon holy wrath", "You aren't close enough", "What are you trying to attack", /already (?:quite )?dead/, /could not find/i, /Please rephrase/)
+    waitrt? if game_state.drbot_attack_ids_required?
   end
 
   def meraud_commune(game_state)
@@ -4353,6 +4363,11 @@ class AttackProcess
       return
     end
 
+    # A target may reach melee between maneuver selection and ENGAGE. Skip
+    # ordinary rush before equipping its shield, then use the normal attack.
+    if game_state.drbot_attack_ids_required? && game_state.drbot_ordinary_rush_blocked_by_melee?(charged_maneuver)
+      charged_maneuver = nil
+    end
     ordinary_attack_confirmed = true
     maneuver_success = false
     if charged_maneuver
@@ -5818,6 +5833,8 @@ class GameState
     return false unless npcs.any? # We should have an NPC to rush
     return false unless @rush_to_engage && charged_maneuver_off_cooldown?(@charged_maneuvers['Shield Usage']) # ability is off cooldown and we've elected to use it
 
+    return false if drbot_attack_ids_required? && drbot_ordinary_rush_blocked_by_melee?('rush')
+
     use_charged_maneuver(@charged_maneuvers['Shield Usage'])
   end
 
@@ -6599,6 +6616,14 @@ class GameState
     false
   end
 
+  # This applies only to ordinary maneuver selection. The operator's
+  # same-ID post-throw rush hook deliberately retains its own attempt policy.
+  def drbot_ordinary_rush_blocked_by_melee?(maneuver)
+    return false unless drbot_attack_ids_required? && maneuver.to_s.casecmp?('rush')
+
+    !drbot_personal_melee_target_selector.nil?
+  end
+
   def determine_charged_maneuver
     return nil unless @use_charged_maneuvers
 
@@ -6616,6 +6641,8 @@ class GameState
       maneuver = @charged_maneuvers['Shield Usage']
     end
 
+    maneuver = nil if drbot_attack_ids_required? && drbot_ordinary_rush_blocked_by_melee?(maneuver)
+
     echo "***Determined next available charged maneuver: #{maneuver}***" if $debug_mode_ct
 
     maneuver
@@ -6624,6 +6651,7 @@ class GameState
   def use_charged_maneuver(maneuver, attempts = 0)
     return false unless maneuver
     return false if attempts >= 3 # bound the out-of-range / retreat-retry recursion below
+    return false if drbot_attack_ids_required? && drbot_ordinary_rush_blocked_by_melee?(maneuver)
 
     Flags.reset('ct-powershot-ammo')
     Flags.reset('ct-maneuver-cooldown-reduced')
