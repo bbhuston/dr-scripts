@@ -57,6 +57,7 @@ class Coordinator
     return unless (task = get_next_task)
 
     echo("Found task to execute: #{task}") if @debug
+    started = Time.now
     case task[:type]
     when :hunting
       run_hunting_task(task)
@@ -69,8 +70,27 @@ class Coordinator
     when :idle
       run_idle_task
     end
+    report_completed_task(task, Time.now - started)
     update_predicates_for_completed_task(task)
     true
+  end
+
+  # The same completion line t2 emits, so a long-running schedule leaves the
+  # per-task evidence a supervisor reads. Lich prefixes a script echo with its
+  # own name, so this arrives as `[coordinator: ***STATUS*** Completed ...]`.
+  def report_completed_task(task, elapsed)
+    return if task[:type] == :idle
+
+    seconds = elapsed.to_i
+    echo(format('***STATUS*** Completed %s in %dh:%02dm:%02ds', task_label(task),
+                seconds / 3600, (seconds % 3600) / 60, seconds % 60))
+  end
+
+  def task_label(task)
+    return "hunt #{task[:file]}" if task[:file]
+    return "action #{task[:action]}" if task[:action]
+    return [task[:script], *Array(task[:args])].join(' ') if task[:script]
+    task[:type].to_s
   end
 
   # A long-running scheduler needs a stop that halts the whole schedule, not
