@@ -14,12 +14,13 @@ class Coordinator
 
     @debug = debug
     @settings = get_settings
-    @hunting_tasks = @settings.coordinator_hunting_tasks
-    @hunting_tasks.each { |task| task[:type] = :hunting }
-    @town_tasks = @settings.coordinator_town_tasks
-    @town_tasks.each { |task| task[:type] = :town }
-    @cleanup_tasks = @settings.coordinator_hunting_cleanup
-    @cleanup_tasks.each { |task| task[:type] = :cleanup }
+    @hunting_tasks = task_list('coordinator_hunting_tasks', :hunting)
+    @town_tasks = task_list('coordinator_town_tasks', :town)
+    @cleanup_tasks = task_list('coordinator_hunting_cleanup', :cleanup)
+    if all_tasks.empty?
+      raise ArgumentError, 'coordinator requires at least one of coordinator_hunting_tasks, ' \
+                           'coordinator_town_tasks or coordinator_hunting_cleanup'
+    end
 
     @song_list = get_data('perform').perform_options
 
@@ -164,6 +165,17 @@ class Coordinator
 
   def all_tasks
     @cleanup_tasks + @hunting_tasks + @town_tasks
+  end
+
+  def task_list(key, type)
+    tasks = @settings.send(key)
+    # None of the three keys exists in base.yaml or in base-empty.yaml's
+    # coercion map, so an unconfigured character resolves all three to nil.
+    # Lich's NilClass patch makes `nil.each` a no-op, so the script used to
+    # walk to safe_room, start afk and pause forever without reporting
+    # anything wrong. Refuse to start instead.
+    raise ArgumentError, "#{key} must be a list of tasks" unless tasks.nil? || tasks.is_a?(Array)
+    Array(tasks).each { |task| task[:type] = type }
   end
 
   def terminal_predicates(task)
