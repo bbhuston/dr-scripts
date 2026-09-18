@@ -167,6 +167,18 @@ class Coordinator
     when 'any_skill_less_than', 'any_skill_under'
       echo("Checking skills #{value['skills']} < #{value['target']}") if @debug
       value['skills'].any? { |skill| skill_less_than?(skill, value['target']) }
+    # skill_* above read the learning rate (DRSkill.getxp, mindstate 0..34).
+    # Guild circle requirements are stated in ranks, which no predicate could
+    # reach, so a task could not be gated on "until Warding is rank 18".
+    when 'rank_under'
+      echo("Checking rank #{value['skill']} < #{value['target']}") if @debug
+      rank_less_than?(value['skill'], value['target'])
+    when 'rank_over'
+      echo("Checking rank #{value['skill']} > #{value['target']}") if @debug
+      rank_greater_than?(value['skill'], value['target'])
+    when 'any_rank_under'
+      echo("Checking ranks #{value['skills']} < #{value['target']}") if @debug
+      value['skills'].any? { |skill| rank_less_than?(skill, value['target']) }
     when 'after_every_hunt'
       key = value['key']
       raise ArgumentError, "Unknown hunt counter: #{key}" unless @hunt_counters.key?(key)
@@ -319,6 +331,16 @@ class Coordinator
   def skill_greater_than?(skill, target)
     echo("Skill level is #{DRSkill.getxp(skill)}") if @debug
     DRSkill.getxp(skill) > target
+  end
+
+  def rank_less_than?(skill, target)
+    echo("Skill rank is #{DRSkill.getrank(skill)}") if @debug
+    DRSkill.getrank(skill) < target
+  end
+
+  def rank_greater_than?(skill, target)
+    echo("Skill rank is #{DRSkill.getrank(skill)}") if @debug
+    DRSkill.getrank(skill) > target
   end
 
   def update_box_count
