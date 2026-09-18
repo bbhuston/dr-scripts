@@ -39,7 +39,11 @@ class Coordinator
     case task[:type]
     when :hunting
       run_hunting_task(task)
-    when :town
+    when :cleanup, :town
+      # Cleanup entries are ordinary town tasks that only become selectable
+      # after a hunt. Without this branch they were marked, selected, and then
+      # silently unmarked with their timers reset, so a cleanup task could
+      # never run.
       run_town_task(task)
     when :idle
       run_idle_task
