@@ -112,11 +112,15 @@ class Coordinator
       echo("Checking skills #{value['skills']} < #{value['target']}") if @debug
       value['skills'].any? { |skill| skill_less_than?(skill, value['target']) }
     when 'after_every_hunt'
-      echo("Checking hunt counter #{value['key']}: #{@hunt_counters[value['key']]}") if @debug
-      @hunt_counters[value['key']] > 0
+      key = value['key']
+      raise ArgumentError, "Unknown hunt counter: #{key}" unless @hunt_counters.key?(key)
+      echo("Checking hunt counter #{key}: #{@hunt_counters[key]}") if @debug
+      @hunt_counters[key] > 0
     when 'on_first_run'
-      echo("Checking first-run counter #{value['key']}: #{@first_run_counters[value['key']]}") if @debug
-      @first_run_counters[value['key']]
+      key = value['key']
+      raise ArgumentError, "Unknown first-run counter: #{key}" unless @first_run_counters.key?(key)
+      echo("Checking first-run counter #{key}: #{@first_run_counters[key]}") if @debug
+      @first_run_counters[key]
     when 'boxes_over'
       @num_boxes > value
     when 'boxes_under'
@@ -139,7 +143,27 @@ class Coordinator
   def prepare_tasks
     update_box_count
     @local_timers = {}
+    # Seed every counter the configured predicates actually name. Neither hash
+    # was ever assigned, and Lich's NilClass patch turns `nil['key'] > 0` and a
+    # bare `nil` into falsy rather than an error, so both predicates read false
+    # forever and any task gated on one never started.
+    @hunt_counters = {}
+    @first_run_counters = {}
+    all_tasks.each do |task|
+      terminal_predicates(task).each do |predicate|
+        case predicate.keys.first
+        when 'after_every_hunt'
+          @hunt_counters[predicate['after_every_hunt']['key']] = 0
+        when 'on_first_run'
+          @first_run_counters[predicate['on_first_run']['key']] = true
+        end
+      end
+    end
     @cleanup_tasks.each { |task| task[:marked] = !task[:skip_first_run] }
+  end
+
+  def all_tasks
+    @cleanup_tasks + @hunting_tasks + @town_tasks
   end
 
   def terminal_predicates(task)
@@ -175,6 +199,15 @@ class Coordinator
       task[:marked] = false
     elsif task[:type] == :hunting && !task[:no_cleanup]
       @cleanup_tasks.each { |task| task[:marked] = true }
+    end
+    @hunt_counters.each_key { |key| @hunt_counters[key] += 1 } if task[:type] == :hunting
+    terminal_predicates(task).each do |predicate|
+      case predicate.keys.first
+      when 'after_every_hunt'
+        @hunt_counters[predicate['after_every_hunt']['key']] = 0
+      when 'on_first_run'
+        @first_run_counters[predicate['on_first_run']['key']] = false
+      end
     end
     get_timers(task).each { |timer| reset_timer(timer) }
   end
