@@ -11,6 +11,8 @@
 class Coordinator
   def initialize(debug)
     UserVars.coordinator_timers ||= {}
+    # A hold recorded by a previous producer is not this one's observation.
+    UserVars.coordinator_safety_hold = nil
     $COORDINATOR = self
 
     arg_definitions = [
@@ -94,6 +96,7 @@ class Coordinator
     if floor.is_a?(Numeric) && health.is_a?(Numeric) && health < floor
       return "health #{health}% below the profile floor #{floor}%"
     end
+    UserVars.coordinator_safety_hold = nil
     nil
   end
 
@@ -102,8 +105,13 @@ class Coordinator
       @tend_attempted = true
       wait_for_child('tendme') if DRCH.has_tendable_bleeders?
     end
-    # Echo every pass: the daemon reads this stream, and a silent hold is
-    # indistinguishable from a hung script.
+    # The echo lands in this character's Lich transcript, which an operator
+    # reads through the console; it is not parsed by the daemon. The UserVars
+    # key is the readable state (`;e UserVars.coordinator_safety_hold`), so a
+    # held schedule is distinguishable from a hung script without scrolling
+    # the transcript. It is cleared at startup, when the hold clears, and in
+    # before_dying, because UserVars survives a Lich restart.
+    UserVars.coordinator_safety_hold ||= {'reason' => reason, 'since' => Time.now.to_f}
     echo("***COORDINATOR HOLD*** #{reason}")
     pause 60
   end
@@ -641,6 +649,7 @@ before_dying do
   unpause_script('sanowret-crystal')
   # The matcher registered in the constructor otherwise outlives the script.
   Flags.delete('coord-song')
+  UserVars.coordinator_safety_hold = nil
   $COORDINATOR = nil
 end
 
