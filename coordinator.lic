@@ -48,6 +48,10 @@ class Coordinator
   end
 
   def run_next_task
+    if (reason = schedule_hold_reason)
+      hold_schedule(reason)
+      return true
+    end
     return unless (task = get_next_task)
 
     echo("Found task to execute: #{task}") if @debug
@@ -65,6 +69,43 @@ class Coordinator
     end
     update_predicates_for_completed_task(task)
     true
+  end
+
+  # A long-running scheduler needs a stop that halts the whole schedule, not
+  # just the current hunt. Neither condition is a hunting-task predicate: a
+  # town walk with a bleeder or at the health floor is the dangerous part.
+  #
+  # Bleeding latches. One tend attempt is made and then the schedule holds
+  # until an operator stops the script: a stopped bleeder is not evidence that
+  # re-entering the same activity is safe, and a character has bled out after
+  # a completed extraction.
+  #
+  # The health floor does not latch. Resting in place is how it recovers, and
+  # the hold is exactly that, so the schedule resumes on its own once health
+  # is back above the profile's threshold.
+  def schedule_hold_reason
+    return @bleeding_hold if @bleeding_hold
+    if @settings.stop_hunting_if_bleeding && bleeding?
+      @bleeding_hold = 'bleeding observed; schedule held'
+      return @bleeding_hold
+    end
+    floor = @settings.health_threshold
+    health = DRStats.health
+    if floor.is_a?(Numeric) && health.is_a?(Numeric) && health < floor
+      return "health #{health}% below the profile floor #{floor}%"
+    end
+    nil
+  end
+
+  def hold_schedule(reason)
+    if @bleeding_hold && !@tend_attempted
+      @tend_attempted = true
+      wait_for_child('tendme') if DRCH.has_tendable_bleeders?
+    end
+    # Echo every pass: the daemon reads this stream, and a silent hold is
+    # indistinguishable from a hung script.
+    echo("***COORDINATOR HOLD*** #{reason}")
+    pause 60
   end
 
   def get_next_task
