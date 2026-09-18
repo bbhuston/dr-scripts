@@ -349,7 +349,10 @@ class Coordinator
 
   def run_idle_task
     DRCT.walk_to @settings.safe_room
-    start_script('afk') unless Script.running? 'afk'
+    # Upstream starts `afk` here. Under drbot the resident watchdog already
+    # owns anti-idle keepalive and contains automation before the game's final
+    # idle warning, so a second idle writer is duplicate game traffic from a
+    # script no profile policy reviews. Idling in the safe room is enough.
     pause 60
   end
 
@@ -629,8 +632,8 @@ end
 before_dying do
   # Every child this script starts, including the town task in flight. A task
   # started with DRC.wait_for_script_to_complete keeps running when the
-  # coordinator is killed, and `afk` is started by the idle task.
-  ['hunting-buddy', 'crossing-training', 'afk', $COORDINATOR&.child_script].compact.uniq.each do |script_name|
+  # coordinator is killed.
+  ['hunting-buddy', 'crossing-training', $COORDINATOR&.child_script].compact.uniq.each do |script_name|
     stop_script(script_name) if Script.running?(script_name)
   end
   # run_town_task and run_hunting_task pause this on :pause_sanowret and only
