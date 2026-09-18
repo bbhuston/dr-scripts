@@ -11,6 +11,7 @@
 class Coordinator
   def initialize(debug)
     UserVars.coordinator_timers ||= {}
+    $COORDINATOR = self
 
     @debug = debug
     @settings = get_settings
@@ -178,6 +179,19 @@ class Coordinator
     Array(tasks).each { |task| task[:type] = type }
   end
 
+  # A child started through DRC.wait_for_script_to_complete outlives this
+  # script when the coordinator is killed mid-task, so record which one is in
+  # flight for before_dying to stop. Town tasks may name any script, so the
+  # name cannot be known from a fixed list.
+  attr_reader :child_script
+
+  def wait_for_child(script, args = [])
+    @child_script = script
+    DRC.wait_for_script_to_complete(script, args)
+  ensure
+    @child_script = nil
+  end
+
   def terminal_predicates(task)
     predicates = []
     (predicates << task[:start_on]) if task[:start_on]
@@ -275,9 +289,9 @@ class Coordinator
         DRCT.walk_to(task[:walk_to])
       end
     end
-    DRC.wait_for_script_to_complete('buff', [task[:buff]]) if task[:buff]
+    wait_for_child('buff', [task[:buff]]) if task[:buff]
     if task[:town] && DRStats.necromancer?
-      DRC.wait_for_script_to_complete('release-necro')
+      wait_for_child('release-necro')
     end
     if (action = task[:action])
       unless all_actions.include? action
@@ -287,7 +301,7 @@ class Coordinator
       send(action, task)
     elsif (script = task[:script])
       play_song?(false) if task[:play_song]
-      DRC.wait_for_script_to_complete(script, task[:args])
+      wait_for_child(script, task[:args])
       stop_play if task[:play_song]
     else
       raise ArgumentError, "Expected action or script: #{task}"
@@ -356,9 +370,9 @@ class Coordinator
   def pick_boxes(_task)
     DRCT.walk_to(@settings.lockpick_room_id) if @settings.lockpick_room_id
     if @settings.waggle_sets['locksmithing']
-      DRC.wait_for_script_to_complete('buff', ['locksmithing'])
+      wait_for_child('buff', ['locksmithing'])
     end
-    DRC.wait_for_script_to_complete('pick')
+    wait_for_child('pick')
     update_box_count
   end
 
@@ -379,14 +393,14 @@ class Coordinator
     return if favor_count >= @settings.favor_goal
 
     if /could not/ =~ DRC.bput("tap my #{@settings.favor_god} orb", 'The orb is delicate', 'I could not find')
-      DRC.wait_for_script_to_complete('favor')
+      wait_for_child('favor')
       fput('stow my orb')
     elsif rub_orb?
       DRCT.walk_to(5865)
       fput("get my #{@settings.favor_god} orb")
       fput('put my orb on altar')
       if favor_count + 1 < @settings.favor_goal
-        DRC.wait_for_script_to_complete('favor')
+        wait_for_child('favor')
         fput('stow my orb')
       end
     end
@@ -411,23 +425,23 @@ class Coordinator
   end
 
   def train_outfitting(_task)
-    DRC.wait_for_script_to_complete('workorders', ['Tailoring'])
-    DRC.wait_for_script_to_complete('sell-loot')
+    wait_for_child('workorders', ['Tailoring'])
+    wait_for_child('sell-loot')
   end
 
   def train_alchemy(_task)
-    DRC.wait_for_script_to_complete('workorders', ['Remedies'])
-    DRC.wait_for_script_to_complete('sell-loot')
+    wait_for_child('workorders', ['Remedies'])
+    wait_for_child('sell-loot')
   end
 
   def train_engineering(_task)
-    DRC.wait_for_script_to_complete('workorders', ['Shaping'])
-    DRC.wait_for_script_to_complete('sell-loot')
+    wait_for_child('workorders', ['Shaping'])
+    wait_for_child('sell-loot')
   end
 
   def train_forging(_task)
-    DRC.wait_for_script_to_complete('workorders', ['Blacksmithing'])
-    DRC.wait_for_script_to_complete('sell-loot')
+    wait_for_child('workorders', ['Blacksmithing'])
+    wait_for_child('sell-loot')
   end
 
   def crossing_training(_task)
@@ -466,7 +480,7 @@ class Coordinator
          'Perhaps you should find somewhere drier before trying to play'
       return true
     when 'You cannot play'
-      DRC.wait_for_script_to_complete('safe-room')
+      wait_for_child('safe-room')
     when 'dirtiness may affect your performance'
       if DRSkill.getrank('Performance') < 20
         echo "Skipping cleaning of zills due to low rank of Performance: #{DRSkill.getrank('Performance')}"
@@ -537,9 +551,18 @@ class Coordinator
 end
 
 before_dying do
-  ['hunting-buddy', 'crossing-training'].each do |script_name|
+  # Every child this script starts, including the town task in flight. A task
+  # started with DRC.wait_for_script_to_complete keeps running when the
+  # coordinator is killed, and `afk` is started by the idle task.
+  ['hunting-buddy', 'crossing-training', 'afk', $COORDINATOR&.child_script].compact.uniq.each do |script_name|
     stop_script(script_name) if Script.running?(script_name)
   end
+  # run_town_task and run_hunting_task pause this on :pause_sanowret and only
+  # unpause on the success path, so any crash left it paused indefinitely.
+  unpause_script('sanowret-crystal')
+  # The matcher registered in the constructor otherwise outlives the script.
+  Flags.delete('coord-song')
+  $COORDINATOR = nil
 end
 
 Coordinator.new(true)
