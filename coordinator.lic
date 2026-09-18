@@ -13,8 +13,21 @@ class Coordinator
     UserVars.coordinator_timers ||= {}
     $COORDINATOR = self
 
-    @debug = debug
-    @settings = get_settings
+    arg_definitions = [
+      [
+        { name: 'quiet', regex: /^quiet$/i, optional: true,
+          description: 'Suppress the per-tick predicate echoes' }
+      ]
+    ]
+    @args = parse_args(arg_definitions, true)
+
+    # A long-running scheduler echoes a predicate line per tick; `quiet`
+    # silences that without losing the task and error output.
+    @debug = debug && !@args.quiet
+    # Accept flex-file suffixes the way t2 does. Upstream called get_settings
+    # with no arguments, so every coordinator_* key had to live in the setup
+    # file and `;coordinator lifecycle` could not select an overlay.
+    @settings = get_settings(@args.flex)
     @hunting_tasks = task_list('coordinator_hunting_tasks', :hunting)
     @town_tasks = task_list('coordinator_town_tasks', :town)
     @cleanup_tasks = task_list('coordinator_hunting_cleanup', :cleanup)
