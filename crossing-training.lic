@@ -800,11 +800,19 @@ class CrossingTraining
 
   # https://elanthipedia.play.net/Blacksmithing_Products
   def train_forging
-    eligible = @settings.train_workorders & %w[Blacksmithing Weaponsmithing]
+    # drf: every Forging discipline in train_workorders is eligible, and the
+    # trainer rotates through them -- one work order per call, the next
+    # discipline on the next call -- instead of always running the first.
+    # Upstream limited the set to Blacksmithing/Weaponsmithing and took
+    # `eligible.first`, so a Trader with three smithing disciplines only ever
+    # trained one. The cursor is a UserVar so the rotation survives restarts.
+    eligible = @settings.train_workorders & %w[Blacksmithing Weaponsmithing Armorsmithing]
     unless eligible.empty?
       return unless money_for_training?(5000, 'Forging')
 
-      DRC.wait_for_script_to_complete('workorders', [eligible.first])
+      index = UserVars.crossing_training_forging_next.to_i % eligible.length
+      UserVars.crossing_training_forging_next = index + 1
+      DRC.wait_for_script_to_complete('workorders', [eligible[index]])
       DRC.wait_for_script_to_complete('sell-loot')
       DRCT.walk_to(@training_room)
       return
