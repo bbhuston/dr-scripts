@@ -105,7 +105,7 @@ class WorkOrders
   def initialize
     arg_definitions = [
       [
-        { name: 'discipline', options: %w[blacksmithing weaponsmithing tailoring shaping carving remedies artificing tinkering], description: 'What type of workorder to do?' },
+        { name: 'discipline', options: %w[blacksmithing weaponsmithing armorsmithing tailoring shaping carving remedies artificing tinkering], description: 'What type of workorder to do?' },
         { name: 'repair', regex: /repair/i, optional: true, description: 'repair tools instead of crafting' },
         { name: 'turnin', regex: /turnin/i, optional: true, description: 'get work order and turn it in immediately with items already on hand' }
       ]
@@ -146,7 +146,10 @@ class WorkOrders
     DRC.wait_for_script_to_complete('safe-room', ['force']) if @settings.workorders_force_heal
 
     info = crafting_data[discipline][@hometown]
-    info = crafting_data['blacksmithing'][@hometown] if discipline == 'weaponsmithing'
+    # drf: armorsmithing is the third Forging discipline the society issues
+    # orders for; it shares blacksmithing's rooms, NPC and stock exactly as
+    # weaponsmithing does.
+    info = crafting_data['blacksmithing'][@hometown] if %w[weaponsmithing armorsmithing].include?(discipline)
     # Tinkering uses the Engineering guild (shaping) NPC and logbook
     info = crafting_data['shaping'][@hometown] if discipline == 'tinkering'
 
@@ -163,8 +166,11 @@ class WorkOrders
       exit
     end
 
-    if @resume_or_request && (discipline != 'blacksmithing' || repair || turnin || @use_own_ingot_type)
-      Lich::Messaging.msg('bold', 'WorkOrders: Safe resume-or-request mode only admits purchased-stock blacksmithing work orders')
+    # drf: the safe path admits every purchased-stock Forging discipline, so a
+    # Trader can rotate blacksmithing, weaponsmithing and armorsmithing orders
+    # on one toolkit; the guard against repair, turnin and own-ingot runs stays.
+    if @resume_or_request && (!%w[blacksmithing weaponsmithing armorsmithing].include?(discipline) || repair || turnin || @use_own_ingot_type)
+      Lich::Messaging.msg('bold', 'WorkOrders: Safe resume-or-request mode only admits purchased-stock forging (blacksmithing, weaponsmithing, armorsmithing) work orders')
       exit
     end
 
