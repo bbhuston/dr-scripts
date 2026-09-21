@@ -98,13 +98,13 @@ class Remedy
     end
 
     # buy ingredients if missing
-    if @water == 'water' && !DRCI.exists?(@water)
+    if @water == 'water' && !ingredient_exists?(@water)
       buy_item('water')
     end
-    if @alcohol == 'alcohol' && !DRCI.exists?(@alcohol)
+    if @alcohol == 'alcohol' && !ingredient_exists?(@alcohol)
       buy_item('alcohol')
     end
-    if ['coal nugget', 'nugget'].include?(@catalyst) && !DRCI.exists?(@catalyst)
+    if ['coal nugget', 'nugget'].include?(@catalyst) && !ingredient_exists?(@catalyst)
       buy_item('coal')
     end
     DRC.wait_for_script_to_complete('buff', ['remedy'])
@@ -136,6 +136,16 @@ class Remedy
     DRC.message("*** #{@recipe_name} needs a #{requested}, and your alchemy_tools setting lists none. ***")
     DRC.message("*** Add your #{requested} to alchemy_tools, then run this again. ***")
     exit
+  end
+
+  # A generic TAP cannot see supplies inside a nested crafting container.
+  # Preserve held/top-level discovery, then use the same exact container list
+  # as get_crafting_item. Missing supplies still follow the normal buy path.
+  def ingredient_exists?(name)
+    return true if DRCI.exists?(name)
+    return false unless @bag && @bag_items.to_a.include?(name)
+
+    DRCI.exists?(name, @bag)
   end
 
   def get_item(name, at_feet = false)
