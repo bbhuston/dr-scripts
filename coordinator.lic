@@ -33,6 +33,7 @@ class Coordinator
     @hunting_tasks = task_list('coordinator_hunting_tasks', :hunting)
     @town_tasks = task_list('coordinator_town_tasks', :town)
     @cleanup_tasks = task_list('coordinator_hunting_cleanup', :cleanup)
+    run_box_handoff_test if box_handoff_test_profile?
     @safe_idle = safe_idle_profile?
     # This explicit caretaker retirement role does not prepare inventory,
     # release spells, start children or travel. The operator returns Grimdur
@@ -86,10 +87,73 @@ class Coordinator
   def safe_idle_profile?
     return false unless @settings.drbot_lifecycle_role == 'safe_idle'
 
-    unless DRStats.name.to_s.casecmp?('Grimdur') && @settings.safe_room == 5929 && all_tasks.empty?
-      raise ArgumentError, 'safe_idle requires Grimdur, safe_room 5929, and no coordinator tasks'
+    unless DRStats.name.to_s.casecmp?('Grimdur') && @settings.safe_room.is_a?(Integer) && @settings.safe_room.positive? && all_tasks.empty?
+      raise ArgumentError, 'safe_idle requires Grimdur, a positive configured safe_room, and no coordinator tasks'
     end
     true
+  end
+
+  def box_handoff_test_profile?
+    return false unless @settings.drbot_lifecycle_role == 'box_handoff_test'
+
+    expected = case DRStats.name.to_s.downcase
+               when 'lanjefast'
+                 { script: 'lanjefast-collect-boxes', type: :town }
+               when 'thargrund'
+                 { script: 'drbot-gbox', args: ['backpack'], type: :town }
+               end
+    unless expected && Array(@args.flex) == ['box-handoff-test'] && !@args.quiet &&
+           @settings.safe_room == 52300 && @settings.crossing_training == [] &&
+           @settings.coordinator_hunting_tasks == [] && @settings.coordinator_hunting_cleanup == [] &&
+           @town_tasks == [expected]
+      raise ArgumentError, 'box_handoff_test requires its exact character profile and sole bounded handoff task'
+    end
+    raise ArgumentError, 'box_handoff_test requires observed Carousel room 8285' unless Room.current && Room.current.id == 8285
+
+    true
+  end
+
+  def run_box_handoff_test
+    if (reason = schedule_hold_reason)
+      hold_box_handoff_test(reason)
+    end
+    task = @town_tasks.first
+    @child_script = task[:script]
+    if Script.running?(@child_script)
+      hold_box_handoff_test('handoff child already running; operator reconciliation required')
+    end
+    child = start_script(@child_script, Array(task[:args]))
+    hold_box_handoff_test('handoff child start unconfirmed; operator reconciliation required') unless child
+
+    deadline = Time.now + 180
+    while Script.list.any? { |candidate| candidate.equal?(child) }
+      if Time.now >= deadline
+        hold_box_handoff_test('handoff child did not settle within 180 seconds; operator reconciliation required')
+      end
+      pause 0.25
+    end
+    control = $DRBOT_DIRECT_CONTROL
+    settled = control.is_a?(Hash) && control['pending_result'] == false &&
+              checkrt.zero? && checkcastrt.zero? && Room.current && Room.current.id == 8285
+    unless settled && child.respond_to?(:drbot_box_handoff_result)
+      hold_box_handoff_test('handoff result or final command unconfirmed; operator reconciliation required')
+    end
+    result = child.drbot_box_handoff_result
+    unless result.is_a?(Hash) && result['count'].is_a?(Integer) &&
+           ((result['status'] == 'complete' && result['count'] == 1) ||
+            (result['status'] == 'skipped' && result['count'] == 0))
+      hold_box_handoff_test('handoff child did not report verified completion or a clean skip; operator reconciliation required')
+    end
+    @child_script = nil
+    echo("***COORDINATOR BOX HANDOFF*** #{result['status']}; count=#{result['count']}; #{result['reason'].to_s[0, 160]}")
+    hold_box_handoff_test("one-shot handoff #{result['status']}; explicit operator stop required")
+  end
+
+  def hold_box_handoff_test(reason)
+    @task_hold = reason
+    UserVars.coordinator_safety_hold = { 'reason' => reason, 'since' => Time.now.to_f }
+    echo("***COORDINATOR HOLD*** #{reason}")
+    loop { pause 60 }
   end
 
   # The same completion line t2 emits, so a long-running schedule leaves the
@@ -397,7 +461,7 @@ class Coordinator
 
   def run_idle_task
     if @safe_idle
-      raise 'safe_idle requires the observed safe room 5929' unless Room.current && Room.current.id == 5929
+      raise "safe_idle requires the observed configured safe room #{@settings.safe_room}" unless Room.current && Room.current.id == @settings.safe_room
     else
       DRCT.walk_to @settings.safe_room
     end
