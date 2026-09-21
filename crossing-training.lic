@@ -5,6 +5,12 @@
 class CrossingTraining
   attr_reader :running, :idling
 
+  # The trainer removes unavailable/unfunded skills from its own settings.
+  # Expose a copy so the coordinator does not wait on its stale original list.
+  def training_skills
+    @settings.crossing_training.dup
+  end
+
   def stop
     echo 'Received stop signal' if UserVars.crossing_trainer_debug
     @stop = true
