@@ -128,7 +128,15 @@ class Coordinator
     deadline = Time.now + 180
     while Script.list.any? { |candidate| candidate.equal?(child) }
       if Time.now >= deadline
-        hold_box_handoff_test('handoff child did not settle within 180 seconds; operator reconciliation required')
+        # Stop only the captured instance: a later same-named child is not
+        # ours. Kill is not custody proof or settled game-result evidence;
+        # preserve both the child identity and the final-write pending flag.
+        begin
+          child.kill if Script.list.any? { |candidate| candidate.equal?(child) }
+        rescue StandardError
+          hold_box_handoff_test('handoff exact-child stop unconfirmed; operator reconciliation required')
+        end
+        hold_box_handoff_test('handoff child exceeded 180 seconds; custody remains unconfirmed, operator reconciliation required')
       end
       pause 0.25
     end
