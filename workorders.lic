@@ -121,6 +121,7 @@ class WorkOrders
     @worn_trashcan_verb = @settings.worn_trashcan_verb
     crafting_data = get_data('crafting')
     @recipe_parts = crafting_data['recipe_parts']
+    @crafting_stock = crafting_data['stock']
     @bag = @settings.crafting_container
     @bag_items = @settings.crafting_items_in_container
     @hometown = @settings.force_crafting_town || @settings.hometown
@@ -398,6 +399,9 @@ class WorkOrders
 
     if result && (LOGBOOK_NO_ORDER_PATTERN.match?(result) || result.include?("has expired"))
       stow_tool('logbook')
+      # Do not reroll into an uncraftable/unaffordable admitted recipe. Keep
+      # the operator's list intact and stop before the first new request.
+      exit unless safe_forging_stock_preflight(recipes)
       requested = request_work_order(
         recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff,
         max_requests: @settings.workorders_max_requests || 50, allow_bundled_cleanup: false
@@ -434,8 +438,52 @@ class WorkOrders
       return [nil, 0]
     end
 
+    exit unless safe_forging_stock_preflight([recipe])
+
     Lich::Messaging.msg('plain', "WorkOrders: Resuming active order for #{remaining} #{recipe['name']}")
     [recipe['name'], remaining]
+  end
+
+  # Purchased-stock mode has no reviewed smelting/owned-ingot selection path.
+  # A single purchased ingot must fit each admitted recipe, and its catalog
+  # price plus that recipe's purchased parts must fit the unchanged float.
+  # This is an admission ceiling, not a promise of bank balance or shop price.
+  def safe_forging_stock_preflight(recipes, stock = nil)
+    stock ||= @crafting_stock[@workorders_materials['metal_type']] if @crafting_stock.is_a?(Hash) && @workorders_materials.is_a?(Hash)
+    float = @cash_on_hand.nil? ? 5000 : @cash_on_hand
+    valid_stock = stock.is_a?(Hash) && stock['stock-volume'].is_a?(Integer) && stock['stock-volume'].positive? &&
+                  stock['stock-value'].is_a?(Integer) && stock['stock-value'].positive?
+    unless valid_stock && float.is_a?(Integer) && float.positive? && recipes.is_a?(Array) && !recipes.empty?
+      Lich::Messaging.msg('bold', 'WorkOrders: BLOCKED stock preflight: missing or invalid stock volume, price, float or recipes; no request or purchase')
+      return false
+    end
+
+    blocked = recipes.filter_map do |recipe|
+      unless recipe.is_a?(Hash) && recipe['volume'].is_a?(Integer) && recipe['volume'].positive?
+        next 'invalid recipe volume'
+      end
+      name = recipe['name'].to_s
+      if recipe['volume'] > stock['stock-volume']
+        next "#{name} needs #{recipe['volume']} volume; configured stock supplies #{stock['stock-volume']}"
+      end
+
+      parts = recipe['part'].nil? ? [] : recipe['part']
+      valid_parts = parts.is_a?(Array) && parts.all? do |part|
+        next false unless part.is_a?(String) && @crafting_stock.is_a?(Hash) && @crafting_stock[part].is_a?(Hash)
+
+        price = @crafting_stock[part]['stock-value']
+        price.is_a?(Integer) && price >= 0
+      end
+      unless valid_parts
+        next "#{name} has unverified part prices"
+      end
+      price = stock['stock-value'] + parts.sum { |part| @crafting_stock.dig(part, 'stock-value') }
+      next "#{name} stock and parts cost #{price}; fixed workorder float is #{float}" if price > float
+    end
+    return true if blocked.empty?
+
+    Lich::Messaging.msg('bold', "WorkOrders: BLOCKED stock preflight: #{blocked.join('; ')}; recipe choices and materials preserved, no request or purchase")
+    false
   end
 
   def read_active_work_order(recipes, logbook)
@@ -969,6 +1017,8 @@ class WorkOrders
   end
 
   def forge_items_safely(info, materials_info, item, quantity)
+    return false unless safe_forging_stock_preflight([item], materials_info)
+
     recipe = find_recipe(materials_info, item, quantity).first
     remaining_volume = 0
 

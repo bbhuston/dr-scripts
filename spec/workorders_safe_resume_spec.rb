@@ -27,12 +27,16 @@ RSpec.describe 'WorkOrders safe resume-or-request' do
   before do
     $right_hand = nil
     $left_hand = nil
-    workorders.instance_variable_set(:@settings, OpenStruct.new(default_container: 'backpack'))
+    workorders.instance_variable_set(:@settings, OpenStruct.new(default_container: 'backpack', workorders_max_requests: 1))
     workorders.instance_variable_set(:@resume_or_request, true)
     workorders.instance_variable_set(:@bag, 'backpack')
     workorders.instance_variable_set(:@belt, nil)
     workorders.instance_variable_set(:@hometown, 'Crossing')
     workorders.instance_variable_set(:@cash_on_hand, 5000)
+    workorders.instance_variable_set(:@workorders_materials, { 'metal_type' => 'steel' })
+    workorders.instance_variable_set(:@crafting_stock, {
+                                      'steel' => { 'stock-volume' => 5, 'stock-value' => 2000 }
+                                    })
     workorders.instance_variable_set(:@worn_trashcan, nil)
     workorders.instance_variable_set(:@worn_trashcan_verb, nil)
     workorders.instance_variable_set(:@min_items, 1)
@@ -55,6 +59,53 @@ RSpec.describe 'WorkOrders safe resume-or-request' do
     expect(DRCT).not_to receive(:order_item)
 
     expect(workorders.send(:resume_or_request_work_order, *resume_args)).to eq(['a metal rod', 2])
+  end
+
+  it 'blocks a new order before ASK when an admitted recipe exceeds purchased stock' do
+    recipes << { 'name' => 'a diagonal-peen mallet', 'volume' => 12 }
+    $left_hand = 'a forging logbook'
+    allow(DRCI).to receive(:get_item?).and_return(true)
+    allow(DRC).to receive(:bput).and_return('This logbook is not currently tracking a work order.')
+    expect(workorders).not_to receive(:request_work_order)
+    expect(DRCM).not_to receive(:ensure_copper_on_hand)
+    expect(DRCT).not_to receive(:order_item)
+    expect(workorders).to receive(:exit).and_raise(SystemExit)
+
+    expect { workorders.send(:resume_or_request_work_order, *resume_args) }.to raise_error(SystemExit)
+  end
+
+  it 'resumes a valid active recipe despite a different oversized admitted recipe' do
+    recipes << { 'name' => 'a diagonal-peen mallet', 'volume' => 12 }
+    $left_hand = 'a forging logbook'
+    allow(DRCI).to receive(:get_item?).and_return(true)
+    allow(DRC).to receive(:bput)
+      .and_return('This logbook is tracking a work order requiring you to craft a metal rod from any')
+    allow(workorders).to receive(:logbook_remaining).and_return(2)
+    expect(workorders).not_to receive(:request_work_order)
+
+    expect(workorders.send(:resume_or_request_work_order, *resume_args)).to eq(['a metal rod', 2])
+  end
+
+  it 'blocks over-float stock or part prices without lowering the float' do
+    stock = { 'stock-volume' => 50, 'stock-value' => 11875 }
+    expect(workorders.send(:safe_forging_stock_preflight, recipes, stock)).to be false
+    workorders.instance_variable_get(:@crafting_stock)['short pole'] = { 'stock-value' => 101 }
+    item = recipes.first.merge('part' => ['short pole'])
+    stock['stock-value'] = 4900
+    expect(workorders.send(:safe_forging_stock_preflight, [item], stock)).to be false
+    expect(workorders.instance_variable_get(:@cash_on_hand)).to eq(5000)
+  end
+
+  it 'blocks invalid material before recipe calculation, funding or a smith child' do
+    item = recipes.first.merge('volume' => 12)
+    stock = { 'stock-volume' => 10, 'stock-value' => 2000 }
+    expect(workorders).not_to receive(:find_recipe)
+    expect(DRCM).not_to receive(:ensure_copper_on_hand)
+    expect(DRCT).not_to receive(:order_item)
+    expect(DRC).not_to receive(:wait_for_script_to_complete)
+    expect(DRCT).not_to receive(:dispose)
+
+    expect(workorders.send(:forge_items_safely, {}, stock, item, 1)).to be false
   end
 
   it 'asks once only for exact no-order state and confirms the resulting logbook' do
@@ -162,7 +213,7 @@ RSpec.describe 'WorkOrders safe resume-or-request' do
     expect(DRCT).not_to receive(:dispose)
 
     info = { 'stock-room' => 8775, 'trash-room' => nil, 'logbook' => 'forging' }
-    stock = { 'stock-name' => 'steel', 'stock-number' => 1, 'stock-volume' => 5 }
+    stock = { 'stock-name' => 'steel', 'stock-number' => 1, 'stock-volume' => 5, 'stock-value' => 2000 }
     expect(workorders.send(:forge_items_safely, info, stock, recipes.first, 1)).to be false
   end
 
@@ -178,7 +229,7 @@ RSpec.describe 'WorkOrders safe resume-or-request' do
     expect(workorders).not_to receive(:complete_work_order)
 
     info = { 'stock-room' => 8775, 'trash-room' => nil, 'logbook' => 'forging' }
-    stock = { 'stock-name' => 'steel', 'stock-number' => 1, 'stock-volume' => 5 }
+    stock = { 'stock-name' => 'steel', 'stock-number' => 1, 'stock-volume' => 5, 'stock-value' => 2000 }
     expect(workorders.send(:forge_items_safely, info, stock, recipes.first, 1)).to be false
   end
 
@@ -190,7 +241,7 @@ RSpec.describe 'WorkOrders safe resume-or-request' do
     expect(DRC).not_to receive(:wait_for_script_to_complete)
 
     info = { 'stock-room' => 8775, 'trash-room' => nil, 'logbook' => 'forging' }
-    stock = { 'stock-name' => 'steel', 'stock-number' => 1, 'stock-volume' => 5 }
+    stock = { 'stock-name' => 'steel', 'stock-number' => 1, 'stock-volume' => 5, 'stock-value' => 2000 }
     expect(workorders.send(:forge_items_safely, info, stock, recipes.first, 1)).to be false
   end
 
@@ -205,7 +256,7 @@ RSpec.describe 'WorkOrders safe resume-or-request' do
     expect(DRCT).not_to receive(:dispose)
 
     info = { 'stock-room' => 8775, 'trash-room' => nil, 'logbook' => 'forging' }
-    stock = { 'stock-name' => 'steel', 'stock-number' => 1, 'stock-volume' => 5 }
+    stock = { 'stock-name' => 'steel', 'stock-number' => 1, 'stock-volume' => 5, 'stock-value' => 2000 }
     expect(workorders.send(:forge_items_safely, info, stock, recipes.first, 1)).to be false
   end
 
