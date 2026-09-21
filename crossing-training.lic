@@ -643,7 +643,16 @@ class CrossingTraining
     DRC.wait_for_script_to_complete('burgle', ['start']) if @settings.train_with_burgle
     return if DRSkill.getxp('Athletics') >= 30
 
-    DRC.wait_for_script_to_complete('athletics')
+    child = DRC.wait_for_script_to_complete('athletics')
+    reason = child&.instance_variable_get(:@drbot_athletics_unavailable)
+    return unless reason.is_a?(String) && !reason.empty?
+
+    # Without this removal the lowest-XP selector immediately starts the same
+    # explicitly impossible climb again. This copy lasts only for this
+    # trainer pass; coordinator observes it through training_skills and gives
+    # other work a turn before a later bounded retry.
+    @settings.crossing_training.delete('Athletics')
+    echo "***STATUS*** Athletics unavailable for this crossing-training pass: #{reason}"
   end
 
   def train_empathy

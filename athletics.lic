@@ -346,8 +346,7 @@ class Athletics
     practice_deadline = Time.now + 300
     until done_training?
       if Time.now >= practice_deadline
-        @practice_unavailable = true
-        echo "***ATHLETICS SKIPPED*** #{target}: practice session exceeded 300 seconds"
+        skip_practice("#{target}: practice session exceeded 300 seconds")
         break
       end
       DRC.retreat
@@ -370,8 +369,7 @@ class Athletics
       return if Flags['ct-climbing-combat']
 
       if Flags['ct-climbing-unavailable'] || result =~ /This climb is (too difficult|no challenge at all)/i
-        @practice_unavailable = true
-        echo "***ATHLETICS SKIPPED*** #{target}: climb is unavailable at current ranks"
+        skip_practice("#{target}: climb is unavailable at current ranks")
         break
       end
       # An unconfirmed start must not be followed by another climb or a walk.
@@ -382,14 +380,12 @@ class Athletics
         break if Flags['ct-climbing-finished']
         return if Flags['ct-climbing-combat']
         if Flags['ct-climbing-unavailable']
-          @practice_unavailable = true
-          echo "***ATHLETICS SKIPPED*** #{target}: climb is unavailable at current ranks"
+          skip_practice("#{target}: climb is unavailable at current ranks")
           break
         end
         break if done_training?
         if Time.now >= deadline
-          @practice_unavailable = true
-          echo "***ATHLETICS SKIPPED*** #{target}: practice exceeded 180 seconds"
+          skip_practice("#{target}: practice exceeded 180 seconds")
           break
         end
       end
@@ -398,6 +394,15 @@ class Athletics
     end
 
     DRC.bput('unhide', 'You come out of hiding', 'You slip out of hiding', 'But you are not') if to_hide
+  end
+
+  def skip_practice(reason)
+    @practice_unavailable = true
+    # The caller receives this exact Script handle from DRC's synchronous
+    # child join. Do not leak results through a global or persisted UserVar:
+    # an older or unrelated athletics attempt must not disable this pass.
+    Script.current.instance_variable_set(:@drbot_athletics_unavailable, reason)
+    echo "***ATHLETICS SKIPPED*** #{reason}"
   end
 
   # No retries, cleanup writes or successor task after an uncertain command.
