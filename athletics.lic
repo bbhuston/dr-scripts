@@ -100,7 +100,7 @@ class Athletics
   end
 
   def done_training?
-    DRSkill.getxp('Athletics') >= @end_exp
+    @practice_unavailable || DRSkill.getxp('Athletics') >= @end_exp
   end
 
   def offset_climbing_song(direction)
@@ -343,7 +343,13 @@ class Athletics
     return unless target
 
     DRCT.walk_to(room)
+    practice_deadline = Time.now + 300
     until done_training?
+      if Time.now >= practice_deadline
+        @practice_unavailable = true
+        echo "***ATHLETICS SKIPPED*** #{target}: practice session exceeded 300 seconds"
+        break
+      end
       DRC.retreat
       if to_hide
         remaining_attempts = 5
@@ -359,17 +365,48 @@ class Athletics
       end
       Flags.add('ct-climbing-finished', 'You finish practicing your climbing')
       Flags.add('ct-climbing-combat', 'You are engaged in combat')
-      DRC.bput("climb practice #{target}", 'You begin to practice ')
+      Flags.add('ct-climbing-unavailable', 'This climb is too difficult', 'This climb is no challenge at all')
+      result = DRC.bput("climb practice #{target}", 'You begin to practice ', 'This climb is too difficult', 'This climb is no challenge at all', 'You are engaged in combat')
+      return if Flags['ct-climbing-combat']
+
+      if Flags['ct-climbing-unavailable'] || result =~ /This climb is (too difficult|no challenge at all)/i
+        @practice_unavailable = true
+        echo "***ATHLETICS SKIPPED*** #{target}: climb is unavailable at current ranks"
+        break
+      end
+      # An unconfirmed start must not be followed by another climb or a walk.
+      hold_practice('climb start was not confirmed') unless result =~ /You begin to practice /i
+      deadline = [Time.now + 180, practice_deadline].min
       loop do
         pause
         break if Flags['ct-climbing-finished']
         return if Flags['ct-climbing-combat']
+        if Flags['ct-climbing-unavailable']
+          @practice_unavailable = true
+          echo "***ATHLETICS SKIPPED*** #{target}: climb is unavailable at current ranks"
+          break
+        end
         break if done_training?
+        if Time.now >= deadline
+          @practice_unavailable = true
+          echo "***ATHLETICS SKIPPED*** #{target}: practice exceeded 180 seconds"
+          break
+        end
       end
-      DRC.bput('stop climb', 'You stop practicing your climbing skills.', "You weren't practicing your climbing skills anyway.")
+      result = DRC.bput('stop climb', 'You stop practicing your climbing skills.', "You weren't practicing your climbing skills anyway.")
+      hold_practice('climb stop was not confirmed') unless result =~ /You stop practicing your climbing skills|You weren't practicing your climbing skills anyway/i
     end
 
     DRC.bput('unhide', 'You come out of hiding', 'You slip out of hiding', 'But you are not') if to_hide
+  end
+
+  # No retries, cleanup writes or successor task after an uncertain command.
+  # The current producer remains observable for guardian/operator containment.
+  def hold_practice(reason)
+    loop do
+      echo "***ATHLETICS HOLD*** #{reason}; operator reconciliation required"
+      pause 60
+    end
   end
 
   def climb?(room, targets)
