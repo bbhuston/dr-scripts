@@ -5382,6 +5382,8 @@ class GameState
     echo("  @dance_threshold: #{@dance_threshold}") if $debug_mode_ct
 
     @drbot_supervised_group = settings.drbot_supervised_group
+    # Individual target identity is independent of buddy travel/admission.
+    @drbot_server_id_targeting = settings.drbot_server_id_targeting == true
     # Fleet roster for peer attribution: this character plus hunting_buddies.
     if defined?(CombatTrainerGroupThreats)
       CombatTrainerGroupThreats.members = [XMLData.name.to_s] + Array(settings.hunting_buddies)
@@ -6192,7 +6194,7 @@ class GameState
 
   # Identity-bound operations are enabled only where the census is validated.
   def drbot_identity_targets?
-    @drbot_supervised_group == 'lvt-goblins'
+    @drbot_server_id_targeting == true || @drbot_supervised_group == 'lvt-goblins'
   end
 
   def drbot_capture_living_target(excluded = [])
@@ -6217,7 +6219,7 @@ class GameState
   end
 
   def drbot_target_context
-    return nil unless @drbot_supervised_group == 'lvt-goblins'
+    return nil unless drbot_identity_targets?
     return nil unless defined?(CombatTrainerGroupThreats) && defined?(Lich::DragonRealms::Creature)
     room = Room.current&.id
     return nil unless room
@@ -6242,6 +6244,7 @@ class GameState
 
   # Shared exclusions and harvesting still require the buddy's full proof.
   def drbot_group_threat_context
+    return nil unless @drbot_supervised_group == 'lvt-goblins'
     context = drbot_target_context
     return nil unless context && $HUNTING_BUDDY&.respond_to?(:supervised_group_observation)
 
@@ -6347,7 +6350,7 @@ class GameState
 
 
   def drbot_personal_melee_target_selector
-    return nil unless @drbot_supervised_group == 'lvt-goblins'
+    return nil unless drbot_identity_targets?
     now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     return nil if @drbot_target_retry_at && now < @drbot_target_retry_at
     context = drbot_target_context
@@ -6366,7 +6369,7 @@ class GameState
 
   # ID targeting is required where the complete server census is supported.
   def drbot_attack_ids_required?
-    @drbot_supervised_group == 'lvt-goblins'
+    drbot_identity_targets?
   end
 
   def drbot_attack_target_id(expected_id = nil)
@@ -6383,6 +6386,20 @@ class GameState
   end
 
   def fresh_target_selector
+    # crtrStatus supplies current-room hostile/live IDs even when ASSESS omits
+    # idle creatures. The individual path uses the same census proof as aim;
+    # group mode retains its existing personal-melee/complete-ASSESS policy.
+    if @drbot_server_id_targeting == true && @drbot_supervised_group != 'lvt-goblins'
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      return nil if @drbot_target_retry_at && now < @drbot_target_retry_at
+      context = drbot_target_context
+      return nil unless context && context[:npcs].all? { |name| name.is_a?(String) && name.match?(/\A[a-zA-Z][a-zA-Z '-]*\z/) }
+      target = drbot_capture_living_target
+      return nil unless target && drbot_living_target_current?(target) && context == drbot_target_context
+
+      return [context[:room], context, target[:id], "##{target[:id]}"]
+    end
+
     personal = drbot_personal_melee_target_selector
     return personal if personal
 
@@ -6391,7 +6408,7 @@ class GameState
     return unless target && target.match?(/\A[a-zA-Z][a-zA-Z '-]*\z/)
 
     dead = DRRoom.respond_to?(:dead_npcs) ? DRRoom.dead_npcs : []
-    if @drbot_supervised_group == 'lvt-goblins'
+    if drbot_identity_targets?
       return drbot_corpse_target_selector(target)
     end
 
