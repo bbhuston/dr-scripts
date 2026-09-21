@@ -33,6 +33,12 @@ class Coordinator
     @hunting_tasks = task_list('coordinator_hunting_tasks', :hunting)
     @town_tasks = task_list('coordinator_town_tasks', :town)
     @cleanup_tasks = task_list('coordinator_hunting_cleanup', :cleanup)
+    @safe_idle = safe_idle_profile?
+    # This explicit caretaker retirement role does not prepare inventory,
+    # release spells, start children or travel. The operator returns Grimdur
+    # to the safe room before opening the lifecycle producer.
+    loop { run_idle_task } if @safe_idle
+
     if all_tasks.empty?
       raise ArgumentError, 'coordinator requires at least one of coordinator_hunting_tasks, ' \
                            'coordinator_town_tasks or coordinator_hunting_cleanup'
@@ -70,8 +76,19 @@ class Coordinator
     when :idle
       run_idle_task
     end
+    return true if @task_hold
+
     report_completed_task(task, Time.now - started)
     update_predicates_for_completed_task(task)
+    true
+  end
+
+  def safe_idle_profile?
+    return false unless @settings.drbot_lifecycle_role == 'safe_idle'
+
+    unless DRStats.name.to_s.casecmp?('Grimdur') && @settings.safe_room == 5929 && all_tasks.empty?
+      raise ArgumentError, 'safe_idle requires Grimdur, safe_room 5929, and no coordinator tasks'
+    end
     true
   end
 
@@ -106,6 +123,7 @@ class Coordinator
   # the hold is exactly that, so the schedule resumes on its own once health
   # is back above the profile's threshold.
   def schedule_hold_reason
+    return @task_hold if @task_hold
     return @bleeding_hold if @bleeding_hold
     if @settings.stop_hunting_if_bleeding && bleeding?
       @bleeding_hold = 'bleeding observed; schedule held'
@@ -131,7 +149,7 @@ class Coordinator
     # held schedule is distinguishable from a hung script without scrolling
     # the transcript. It is cleared at startup, when the hold clears, and in
     # before_dying, because UserVars survives a Lich restart.
-    UserVars.coordinator_safety_hold ||= {'reason' => reason, 'since' => Time.now.to_f}
+    UserVars.coordinator_safety_hold ||= { 'reason' => reason, 'since' => Time.now.to_f }
     echo("***COORDINATOR HOLD*** #{reason}")
     pause 60
   end
@@ -164,6 +182,8 @@ class Coordinator
   end
 
   def predicate_met?(task)
+    return false if task[:retry_after] && Time.now < task[:retry_after]
+
     echo("Checking predicates for task: #{task}") if @debug
     start = evaluate_predicate?(task[:start_on])
     if start && !(task[:stop_on].nil? || task[:stop_on].empty?)
@@ -376,12 +396,19 @@ class Coordinator
   end
 
   def run_idle_task
-    DRCT.walk_to @settings.safe_room
+    if @safe_idle
+      raise 'safe_idle requires the observed safe room 5929' unless Room.current && Room.current.id == 5929
+    else
+      DRCT.walk_to @settings.safe_room
+    end
     # Upstream starts `afk` here. Under drbot the resident watchdog already
     # owns anti-idle keepalive and contains automation before the game's final
     # idle warning, so a second idle writer is duplicate game traffic from a
     # script no profile policy reviews. Idling in the safe room is enough.
+    $DRBOT_COORDINATOR_IDLE = Script.current
     pause 60
+  ensure
+    $DRBOT_COORDINATOR_IDLE = nil
   end
 
   def run_town_task(task)
@@ -551,16 +578,56 @@ class Coordinator
     wait_for_child('sell-loot')
   end
 
-  def crossing_training(_task)
-    start_script('crossing-training')
+  def crossing_training(task)
+    @child_script = 'crossing-training'
+    unless start_script('crossing-training')
+      @task_hold = 'crossing-training did not start; operator reconciliation required'
+      return
+    end
     pause 5
 
     target_skills = @settings.crossing_training.dup
-    while $CROSSING_TRAINER.running
+    deadline = Time.now + 900
+    stop_requested_at = nil
+    while Script.running?('crossing-training')
+      trainer = $CROSSING_TRAINER
+      unless trainer && trainer.respond_to?(:training_skills)
+        @task_hold = 'crossing-training has no compatible status; operator reconciliation required'
+        return
+      end
+      unavailable = target_skills - trainer.training_skills
+      target_skills -= unavailable
       target_skills.reject! { |skill| DRSkill.getxp(skill) >= 28 }
-      $CROSSING_TRAINER.stop if target_skills.empty?
+      unless unavailable.empty?
+        task[:retry_after] = Time.now + 600
+        echo "***STATUS*** Crossing training unavailable: #{unavailable.join(', ')}; retry delayed 600 seconds"
+      end
+      unless stop_requested_at
+        reason = if target_skills.empty?
+                   'available target skills complete'
+                 elsif task[:stop_on] && evaluate_predicate?(task[:stop_on])
+                   'task stop_on predicate met'
+                 elsif Time.now >= deadline
+                   task[:retry_after] = Time.now + 600
+                   '900-second task limit reached'
+                 end
+        if reason
+          trainer.stop
+          stop_requested_at = Time.now
+          echo "***STATUS*** Crossing training stop requested: #{reason}"
+        end
+      end
+      if stop_requested_at && Time.now - stop_requested_at >= 120
+        # Do not kill a child and advance past an unknown game write. Latch the
+        # scheduler, preserve the active child for fenced containment, and do
+        # not report this task completed or reset its predicates.
+        @task_hold = 'crossing-training did not settle after stop request; operator reconciliation required'
+        return
+      end
       pause 5
     end
+  ensure
+    @child_script = nil unless Script.running?('crossing-training')
   end
 
   # Harvested wholesale from crossing-training
