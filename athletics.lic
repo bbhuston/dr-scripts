@@ -401,7 +401,9 @@ class Athletics
     # The caller receives this exact Script handle from DRC's synchronous
     # child join. Do not leak results through a global or persisted UserVar:
     # an older or unrelated athletics attempt must not disable this pass.
-    Script.current.instance_variable_set(:@drbot_athletics_unavailable, reason)
+    # Lich deliberately seals Script#instance_variable_get. Publish an
+    # explicit result reader instead of relying on private-state reflection.
+    Script.current.define_singleton_method(:drbot_athletics_unavailable) { reason }
     echo "***ATHLETICS SKIPPED*** #{reason}"
   end
 

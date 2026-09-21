@@ -644,7 +644,7 @@ class CrossingTraining
     return if DRSkill.getxp('Athletics') >= 30
 
     child = DRC.wait_for_script_to_complete('athletics')
-    reason = child&.instance_variable_get(:@drbot_athletics_unavailable)
+    reason = child.drbot_athletics_unavailable if child.respond_to?(:drbot_athletics_unavailable)
     return unless reason.is_a?(String) && !reason.empty?
 
     # Without this removal the lowest-XP selector immediately starts the same
