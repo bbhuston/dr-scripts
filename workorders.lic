@@ -135,6 +135,7 @@ class WorkOrders
     @max_items = @settings.workorder_max_items
     @recipe_overrides = @settings.workorder_recipes || {}
     @cash_on_hand = @settings.workorder_cash_on_hand
+    @material_budget = @settings.workorder_material_budget
     @craft_max_mindstate = @settings.craft_max_mindstate
     @retain_crafting_materials = @settings.retain_crafting_materials
     @workorders_repair = @settings.workorders_repair
@@ -151,6 +152,7 @@ class WorkOrders
     # orders for; it shares blacksmithing's rooms, NPC and stock exactly as
     # weaponsmithing does.
     info = crafting_data['blacksmithing'][@hometown] if %w[weaponsmithing armorsmithing].include?(discipline)
+    @forging_info = info
     # Tinkering uses the Engineering guild (shaping) NPC and logbook
     info = crafting_data['shaping'][@hometown] if discipline == 'tinkering'
 
@@ -381,6 +383,7 @@ class WorkOrders
   end
 
   def resume_or_request_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
+    exit if forging_purchase_pending?
     unless DRCI.get_item?("#{logbook} logbook")
       Lich::Messaging.msg('bold', "WorkOrders: Failed to get #{logbook} logbook before resume")
       exit
@@ -399,18 +402,22 @@ class WorkOrders
 
     if result && (LOGBOOK_NO_ORDER_PATTERN.match?(result) || result.include?("has expired"))
       stow_tool('logbook')
-      # Do not reroll into an uncraftable/unaffordable admitted recipe. Keep
-      # the operator's list intact and stop before the first new request.
-      exit unless safe_forging_stock_preflight(recipes)
+      # The generic discipline catalog includes high-tier recipes the server
+      # may never offer at this difficulty. Keep the operator's list intact,
+      # require at least one feasible candidate, and request exactly once.
+      exit unless safe_forging_stock_preflight(recipes, any_recipe: true)
       requested = request_work_order(
         recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff,
-        max_requests: @settings.workorders_max_requests || 50, allow_bundled_cleanup: false
+        max_requests: 1, allow_bundled_cleanup: false
       )
       confirmed = read_active_work_order(recipes, logbook)
       unless confirmed && confirmed == requested
         Lich::Messaging.msg('bold', 'WorkOrders: Requested order did not match the confirmed logbook state; stopping before purchase')
         exit
       end
+      selected = recipes.find { |candidate| candidate['name'] == confirmed.first }
+      exit unless safe_forging_stock_preflight([selected], quantity: confirmed.last)
+
       return confirmed
     end
 
@@ -438,7 +445,7 @@ class WorkOrders
       return [nil, 0]
     end
 
-    exit unless safe_forging_stock_preflight([recipe])
+    exit unless safe_forging_stock_preflight([recipe], quantity: remaining)
 
     Lich::Messaging.msg('plain', "WorkOrders: Resuming active order for #{remaining} #{recipe['name']}")
     [recipe['name'], remaining]
@@ -446,17 +453,22 @@ class WorkOrders
 
   # Purchased-stock mode has no reviewed smelting/owned-ingot selection path.
   # A single purchased ingot must fit each admitted recipe, and its catalog
-  # price plus that recipe's purchased parts must fit the unchanged float.
-  # This is an admission ceiling, not a promise of bank balance or shop price.
-  def safe_forging_stock_preflight(recipes, stock = nil)
+  # whole-order stock and part cost must fit a separate material budget.
+  # The cash-on-hand setting remains a withdrawal minimum, not a spend cap.
+  def safe_forging_stock_preflight(recipes, stock = nil, quantity: 1, any_recipe: false, info: @forging_info)
     stock ||= @crafting_stock[@workorders_materials['metal_type']] if @crafting_stock.is_a?(Hash) && @workorders_materials.is_a?(Hash)
     float = @cash_on_hand.nil? ? 5000 : @cash_on_hand
+    budget = @material_budget.nil? ? 5000 : @material_budget
     valid_stock = stock.is_a?(Hash) && stock['stock-volume'].is_a?(Integer) && stock['stock-volume'].positive? &&
-                  stock['stock-value'].is_a?(Integer) && stock['stock-value'].positive?
-    unless valid_stock && float.is_a?(Integer) && float.positive? && recipes.is_a?(Array) && !recipes.empty?
-      Lich::Messaging.msg('bold', 'WorkOrders: BLOCKED stock preflight: missing or invalid stock volume, price, float or recipes; no request or purchase')
+                  stock['stock-value'].is_a?(Integer) && stock['stock-value'].positive? &&
+                  stock['stock-number'].is_a?(Integer) && stock['stock-number'].positive? &&
+                  stock['stock-name'].is_a?(String) && stock['stock-name'].match?(/\A[a-z]+\z/)
+    unless valid_stock && float.is_a?(Integer) && float.positive? && budget.is_a?(Integer) && budget.positive? &&
+           quantity.is_a?(Integer) && quantity.positive? && recipes.is_a?(Array) && !recipes.empty?
+      Lich::Messaging.msg('bold', 'WorkOrders: BLOCKED stock preflight: invalid stock, cash floor, material budget, quantity or recipes; no purchase')
       return false
     end
+    return false unless forging_stock_room(info, stock)
 
     blocked = recipes.filter_map do |recipe|
       unless recipe.is_a?(Hash) && recipe['volume'].is_a?(Integer) && recipe['volume'].positive?
@@ -477,13 +489,35 @@ class WorkOrders
       unless valid_parts
         next "#{name} has unverified part prices"
       end
-      price = stock['stock-value'] + parts.sum { |part| @crafting_stock.dig(part, 'stock-value') }
-      next "#{name} stock and parts cost #{price}; fixed workorder float is #{float}" if price > float
+      price = forging_material_cost(recipe, stock, quantity)
+      next "#{quantity} #{name} stock and parts cost #{price}; material budget is #{budget}" if price > budget
     end
     return true if blocked.empty?
+    if any_recipe && blocked.length < recipes.length
+      Lich::Messaging.msg('plain', "WorkOrders: Stock permits #{recipes.length - blocked.length}/#{recipes.length} admitted candidates; one request only, unsupported offers will be preserved without spending")
+      return true
+    end
 
     Lich::Messaging.msg('bold', "WorkOrders: BLOCKED stock preflight: #{blocked.join('; ')}; recipe choices and materials preserved, no request or purchase")
     false
+  end
+
+  # Scraps cannot be pooled between ingots: three 18-volume items need two
+  # 50-volume ingots, and five 17-volume items need three, not two.
+  def forging_material_cost(recipe, stock, quantity)
+    per_ingot = stock['stock-volume'] / recipe['volume']
+    ingots = (quantity + per_ingot - 1) / per_ingot
+    parts = (recipe['part'] || []).sum { |part| @crafting_stock.dig(part, 'stock-value') }
+    ingots * stock['stock-value'] + quantity * parts
+  end
+
+  def forging_stock_room(info, stock)
+    key = stock.fetch('stock-room-key', 'stock-room') if stock.is_a?(Hash)
+    room = info[key] if info.is_a?(Hash) && %w[stock-room bingots-room].include?(key)
+    return room if room.is_a?(Integer) && room.positive?
+
+    Lich::Messaging.msg('bold', 'WorkOrders: BLOCKED stock preflight: configured stock room is missing or invalid; no request or purchase')
+    nil
   end
 
   def read_active_work_order(recipes, logbook)
@@ -993,6 +1027,9 @@ class WorkOrders
   def forge_items(info, materials_info, item, quantity)
     return forge_items_safely(info, materials_info, item, quantity) if @resume_or_request
 
+    stock_room = forging_stock_room(info, materials_info)
+    exit unless stock_room
+
     recipe = find_recipe(materials_info, item, quantity).first
     remaining_volume = 0
 
@@ -1003,7 +1040,7 @@ class WorkOrders
     quantity.times do
       if remaining_volume < recipe['volume']
         DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive?
-        DRCT.order_item(info['stock-room'], materials_info['stock-number'])
+        DRCT.order_item(stock_room, materials_info['stock-number'])
         DRCC.stow_crafting_item("#{materials_info['stock-name']} ingot", @bag, @belt)
         remaining_volume = materials_info['stock-volume']
       end
@@ -1017,7 +1054,10 @@ class WorkOrders
   end
 
   def forge_items_safely(info, materials_info, item, quantity)
-    return false unless safe_forging_stock_preflight([item], materials_info)
+    return false if forging_purchase_pending?
+    return false unless safe_forging_stock_preflight([item], materials_info, quantity: quantity, info: info)
+
+    stock_room = forging_stock_room(info, materials_info)
 
     recipe = find_recipe(materials_info, item, quantity).first
     remaining_volume = 0
@@ -1035,14 +1075,31 @@ class WorkOrders
 
       if remaining_volume < recipe['volume']
         DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive?
-        funded = DRCM.ensure_copper_on_hand(@cash_on_hand || 5000, @settings, @hometown)
-        if funded == false
+        # Smith checks a 3,000-copper minimum before every piece. Fund the
+        # remaining order plus that reserve now, without counting its payout.
+        required_cash = [@cash_on_hand || 5000, forging_material_cost(recipe, materials_info, remaining) + 3000].max
+        funded = DRCM.ensure_copper_on_hand(required_cash, @settings, @hometown)
+        unless funded == true
           Lich::Messaging.msg('bold', 'WorkOrders: Could not verify workorder funds; stopping before material purchase')
           return false
         end
-        DRCT.order_item(info['stock-room'], materials_info['stock-number'])
-        DRCC.stow_crafting_item("#{materials_info['stock-name']} ingot", @bag, @belt)
+        unless DRCT.walk_to(stock_room) && Room.current&.id == stock_room
+          Lich::Messaging.msg('bold', 'WorkOrders: Stock room was not reached; stopping before purchase')
+          return false
+        end
+        ingot = "#{materials_info['stock-name']} ingot"
+        return false unless purchase_forging_stock(stock_room, materials_info)
+        unless DRCI.put_away_item?(ingot, @bag) && !DRCI.in_hands?(ingot)
+          Lich::Messaging.msg('bold', 'WorkOrders: Material stow was not confirmed; preserving custody before smith')
+          return false
+        end
+        return false unless save_forging_purchase(nil)
         remaining_volume = materials_info['stock-volume']
+      end
+
+      unless DRCM.ensure_copper_on_hand(3000, @settings, @hometown) == true
+        Lich::Messaging.msg('bold', 'WorkOrders: Smith cash reserve was not verified; stopping before child')
+        return false
       end
 
       crafted = DRC.wait_for_script_to_complete('smith', [materials_info['stock-name'], item['name']])
@@ -1063,6 +1120,97 @@ class WorkOrders
 
     DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive?
     true
+  end
+
+  # Do not use DRCT.order_item here: it confirms even an unknown first quote.
+  # Keep the catalog estimate a hard upper bound, and require the same exact
+  # item in quote/receipt before trusting the observed hand and stowing it.
+  def purchase_forging_stock(room, stock)
+    return false if forging_purchase_pending?
+    if DRC.left_hand || DRC.right_hand
+      Lich::Messaging.msg('bold', 'WorkOrders: Hands are not empty before stock purchase; preserving custody')
+      return false
+    end
+    command = "order #{stock['stock-number']}"
+    return false unless save_forging_purchase({ 'room' => room, 'order' => stock['stock-number'],
+                                              'material' => stock['stock-name'], 'price' => stock['stock-value'],
+                                              'since' => Time.now.to_i })
+    quote = forging_purchase_write(command, room)
+    match = quote&.match(/\AThe attendant says, "You can purchase (?<item>(?:a|an) [a-z -]+ ingot) for (?<price>[1-9]\d*) Kronars\.  Just order it again and we'll see it done!"\z/)
+    expected = stock['stock-description']
+    item_matches = match && (expected ? match[:item] == expected : match[:item].end_with?(" #{stock['stock-name']} ingot"))
+    unless item_matches && match[:price].to_i == stock['stock-value']
+      Lich::Messaging.msg('bold', 'WorkOrders: Stock quote identity or price is unknown/changed; no confirmation or retry')
+      return false
+    end
+    receipt = forging_purchase_write(command, room)
+    unless receipt == "The attendant takes some coins from you and hands you #{match[:item]}." &&
+           DRCI.in_hands?("#{stock['stock-name']} ingot")
+      Lich::Messaging.msg('bold', 'WorkOrders: Material purchase or held ingot was not confirmed; preserving custody without retry')
+      return false
+    end
+    true
+  end
+
+  PURCHASE_PENDING_KEY = 'workorders_pending_purchase'.freeze
+
+  def forging_purchase_pending?
+    return false if UserVars[PURCHASE_PENDING_KEY].nil?
+
+    Lich::Messaging.msg('bold', 'WorkOrders: Unreconciled stock purchase remains; operator must verify quote, funds and material custody before clearing workorders_pending_purchase. No request or purchase')
+    true
+  end
+
+  def save_forging_purchase(record)
+    previous = UserVars[PURCHASE_PENDING_KEY]
+    UserVars[PURCHASE_PENDING_KEY] = record
+    Vars.save
+    # Vars.save caches its digest before SQL succeeds. Verify durable data,
+    # not the in-memory readback or its nil return, before allowing an ORDER.
+    persisted = Lich.db_mutex.synchronize do
+      blob = Lich.db.get_first_value('SELECT hash FROM uservars WHERE scope=?;',
+                                     ["#{XMLData.game}:#{XMLData.name}".encode('UTF-8')])
+      blob && Marshal.load(blob)[PURCHASE_PENDING_KEY]
+    end
+    raise 'pending purchase was not durably saved' unless persisted == record
+
+    true
+  rescue StandardError => error
+    UserVars[PURCHASE_PENDING_KEY] = record || previous
+    Lich::Messaging.msg('bold', "WorkOrders: Could not persist stock custody guard (#{error.class}); no further purchase or child")
+    false
+  end
+
+  # DRC.bput can replay ORDER after WAIT/type-ahead and emit recovery commands.
+  # This path admits one write through the existing fence and waits at most
+  # twelve seconds, never repeating a quote or an uncertain purchase.
+  def forging_purchase_write(command, room)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 12
+    control = $DRBOT_DIRECT_CONTROL
+    return nil unless control.is_a?(Hash) && control['lock']
+
+    written = false
+    while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      unless written
+        control['lock'].synchronize do
+          return nil unless control['mode'] == 'B' && !control['closed'] && Room.current&.id == room
+          if !control['pending_result'] && !control['confirm_by'] && !checkrt.positive? && !checkcastrt.positive?
+            clear
+            written = Game._puts("#{$cmd_prefix}#{command}")
+            return nil unless written
+          end
+        end
+      end
+      if written
+        line = get?
+        if line
+          return nil if line.match?(/(?:\A\[?Wait \d|Sorry, you may only type ahead|world somehow seems frozen|while you are asleep|too busy performing|stop playing before|give away your hiding place|still stunned)/i)
+          return line if line.include?('The attendant') || line.include?("don't have enough coins")
+        end
+      end
+      pause 0.1
+    end
+    nil
   end
 
   def ingot_volume

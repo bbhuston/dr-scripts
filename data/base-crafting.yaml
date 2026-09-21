@@ -5,6 +5,13 @@ stock:
     stock-number: 11
     stock-name: bronze
     stock-value: 562
+  oravir50:
+    stock-volume: 50
+    stock-number: 11
+    stock-name: oravir
+    stock-description: an immense oravir ingot
+    stock-value: 3750
+    stock-room-key: bingots-room
   bronze50:
     stock-volume: 50
     stock-number: 1
