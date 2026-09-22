@@ -2,7 +2,31 @@
   Documentation: https://elanthipedia.play.net/Lich_script_repository#trade
 =end
 
+def shift_hometown(town_name)
+  $HOMETOWN = town_name
+end
+
+def clear_hometown
+  $HOMETOWN = nil
+end
+
+def self.shift_hometown(town_name)
+  $HOMETOWN = town_name
+end
+
+def self.clear_hometown
+  $HOMETOWN = nil
+end
+
 class Trade
+  def shift_hometown(town_name)
+    $HOMETOWN = town_name
+  end
+
+  def clear_hometown
+    $HOMETOWN = nil
+  end
+
   def initialize
     arg_definitions = [
       [
@@ -193,13 +217,13 @@ class Trade
     end
     @settings.storage_containers.each { |container| fput("open my #{container}") }
     @box = nil unless DRCI.exists?(@box)
-    if @caravan_training_skills.include?('Performance') && !DRCI.exists?(@worn_instrument)
+    if @caravan_training_skills.include?('Performance') && !DRCI.exists?(@worn_instrument || @settings.instrument)
       echo 'NO WORN_INSTRUMENT FOUND.  REMOVING PERFORMANCE FROM TRAINING LIST.'
       wipe_skill('Performance', @walk_training_skills)
       wipe_skill('Performance', @lead_training_skills)
     end
     if @caravan_training_skills.include?('First Aid')
-      unless DRCI.exists?(@settings.textbook_type) || DRCI.exists?(@settings.compendium_type)
+      unless DRCI.exists?(@settings.textbook_type) || DRCI.exists?(@settings.compendium_type) || DRCI.exists?('chart')
         echo 'NO COMPENDIUM OR TEXTBOOK FOUND.  CHECK YOUR ;FIRST-AID SETTINGS'
         wipe_skill('First Aid', @lead_training_skills)
       end
@@ -691,10 +715,37 @@ class Trade
     pause 1
   end
 
+  def recover_caravan_room_id
+    pause 0.5
+    recent = reget(12).map { |line| line.to_s.strip }
+    title_line = recent.reverse.find { |line| line =~ /\[[^\]]+\]/ }
+    title_match = title_line[/\[[^\]]+\]/] if title_line
+    desc_idx = recent.rindex(title_line) if title_line
+    desc_line = recent[desc_idx + 1] if desc_idx && recent[desc_idx + 1]
+    room_list = if defined?(Map) && Map.respond_to?(:list)
+                  Map.list
+                elsif defined?(Room) && Room.respond_to?(:list)
+                  Room.list
+                end
+    if title_match && room_list
+      matched = room_list.find do |r|
+        r && Array(r.title).include?(title_match) &&
+          (desc_line.nil? || desc_line.empty? || Array(r.description).any? { |d| d.include?(desc_line[0, 30]) })
+      end
+      return matched.id if matched
+    end
+    find_closest_id('trader_outpost')
+  rescue StandardError
+    find_closest_id('trader_outpost')
+  end
+
   def track_caravan # requires caravan to be in-room with you.
     return false unless caravan_exists?
 
     unless caravan_check?
+      if (target_room = recover_caravan_room_id) && target_room != Room.current.id
+        DRCT.walk_to(target_room)
+      end
       pause 2
       find_timer = Time.now
       echo 'CARAVAN NOT PRESENT IN THE ROOM.  SCRIPT WILL EXIT IN 2 MINUTES UNLESS YOU FIND THE CARAVAN' unless caravan_check?
@@ -707,11 +758,12 @@ class Trade
     return true if @last_seen_caravan[0] == Room.current.id && Time.now - @last_seen_caravan[1] < 3
 
     recall_messages = [
-      /^You seem to recall that you left your (?<description>.*) (?<name>.*) right behind you/,
+      /^You seem to recall that you left your (?<description>.*) (?<name>\S+) right behind you/,
       /^You don't recall where you left your caravan\./,
       /^You don't recall having a caravan\./,
       /^You are far too occupied/,
-      /^You (?:seem to )?recall (?:that )?your (?<description>.*) (?<name>.*)/
+      /^You (?:seem to )?recall (?:that )?your (?<description>.*) (?<name>\S+) should be located in/,
+      /^You (?:seem to )?recall (?:that )?your (?<description>.*) (?<name>\S+)/
     ]
     response = DRC.bput('recall caravan', recall_messages)
     echo("Response: #{response}") if debugging?
@@ -719,16 +771,17 @@ class Trade
     when /You don't recall where you left your caravan/, /You don't recall having a caravan/
       echo('No caravan found') if debugging?
       false
-    when /You seem to recall that you left your (?<description>.*) (?<name>.*) right behind you/
-      /You seem to recall that you left your (?<description>.*) (?<name>.*) right behind you/ =~ response
-      @caravan.noun ||= name
-      @caravan.adjective ||= description.split.first
+    when /You seem to recall that you left your (?<description>.*) (?<name>\S+) right behind you/
+      m = response.match(/You seem to recall that you left your (?<description>.*) (?<name>\S+) right behind you/)
+      @caravan.noun ||= m[:name].sub(/\.\z/, '') if m
+      @caravan.adjective ||= m[:description].split.first if m
       @last_seen_caravan = [Room.current.id, Time.now]
       true
-    when /You (?:seem to )?recall that your (?<description>.*) (?<name>.*)/
-      /You recall that your (?<description>.*) (?<name>.*)/ =~ response
-      @caravan.noun ||= name
-      @caravan.adjective ||= description.split.first
+    when /You (?:seem to )?recall (?:that )?your /
+      m = response.match(/You (?:seem to )?recall (?:that )?your (?<description>.*) (?<name>\S+) should be located in/) ||
+          response.match(/You (?:seem to )?recall (?:that )?your (?<description>.*) (?<name>\S+)/)
+      @caravan.noun ||= m[:name].sub(/\.\z/, '') if m
+      @caravan.adjective ||= m[:description].split.first if m
       false
     when /You are far too occupied/
       DRC.retreat
@@ -1241,7 +1294,7 @@ class Trade
   def get_caravan
     clerk_id = find_closest_id('shipment_clerk')
     DRCT.walk_to(clerk_id)
-    if DRC.bput('rent caravan', 'You want to upgrade from a', 'The clerk nods and says', 'The clerk looks at you and says,') == 'The clerk looks at you and says,'
+    if DRC.bput('rent caravan', 'You want to upgrade from a', 'The clerk nods and says', 'The clerk looks at you and says,', 'Our records show you already have a') == 'The clerk looks at you and says,'
       return get_caravan_stable
     end
 
@@ -1468,7 +1521,7 @@ class Trade
   end
 
   def assess_instrument?
-    if DRSkill.getrank('Appraisal') >= 250
+    if DRSkill.getrank('Appraisal') >= 250 || @worn_instrument.nil?
       @appraisal_queue -= ['instrument']
       return false
     end
@@ -2127,7 +2180,7 @@ class Trade
     return unless @training_token == 'Performance'
 
     wipe_token
-    DRC.bput("wear my #{@worn_instrument}", 'You slide', 'You attach') if DRC.left_hand.include?(@worn_instrument) || DRC.right_hand.include?(@worn_instrument)
+    DRC.bput("wear my #{@worn_instrument}", 'You slide', 'You attach') if @worn_instrument && (DRC.left_hand.include?(@worn_instrument) || DRC.right_hand.include?(@worn_instrument))
     DRCI.stow_hands
     stop_script('performance') if is_playing?
     pause 1 while Script.running?('performance')

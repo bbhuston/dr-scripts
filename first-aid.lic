@@ -45,7 +45,9 @@ class FirstAid
       pause @performance_pause # to give performance time to complete before_dying if stopped from the previous script
       start_script('performance', ['noclean']) unless Script.running?('performance')
     end
-    unless DRCI.get_item_if_not_held?(@booktype)
+    if @booktype =~ /\bchart\b/i || !DRCI.get_item_if_not_held?(@booktype)
+      return if study_loose_charts
+
       DRC.message("Could not get #{@booktype}, exiting.")
       exit
     end
@@ -54,6 +56,56 @@ class FirstAid
     compendium_charts = reget(40).grep(/^   .+$/).map(&:strip)
     charts_to_read = @chart_data.select { |name, _info| compendium_charts.include?(name) }
     study_charts(charts_to_read)
+  end
+
+  def discover_loose_charts
+    case DRC.bput('inv search chart', 'You rummage about your person', "You can't seem to find anything")
+    when "You can't seem to find anything"
+      waitrt?
+      return {}
+    end
+    waitrt?
+    pause 0.5
+    lines = reget(30).map(&:strip)
+    found_names = lines.filter_map do |line|
+      Regexp.last_match(1).strip if line =~ /^(?:An?|Some)\s+(.+?)\s+anatomy chart\b/i
+    end
+    @chart_data.select do |name, info|
+      found_names.any? { |found| found.casecmp(name).zero? || found.casecmp(info['index'].to_s).zero? }
+    end
+  end
+
+  def study_loose_charts
+    charts_to_read = discover_loose_charts
+    return false if charts_to_read.empty?
+
+    charts_to_read
+      .map { |_name, info| info }
+      .select { |info| info['scholarship'] <= effective_scholarship }
+      .sort_by { |info| info['scholarship'] }
+      .reverse
+      .take(@num_charts)
+      .each do |info|
+        chart_item = "#{info['index'].to_s.split.first} chart"
+        next unless DRCI.get_item_if_not_held?(chart_item)
+
+        case DRC.bput('study my chart', 'You attempt to study', 'find it almost impossible to do', 'gradually absorbing', 'difficult time comprehending the advanced text', 'suddenly makes sense to you', '^Why ', 'You need to be holding', 'discerned all you can')
+        when 'gradually absorbing'
+          3.times do
+            result = DRC.bput('study my chart', /Roundtime/, /makes sense/, /discerned all you can/)
+            break if result == 'makes sense' || result == 'discerned all you can'
+          end
+        end
+        waitrt?
+        DRCI.put_away_item?(chart_item)
+
+        if @skill_focus == 'both'
+          break if DRSkill.getxp('First Aid') >= 32 && DRSkill.getxp('Scholarship') >= 32
+        else
+          break if DRSkill.getxp(@skill_focus.split.map(&:capitalize).join(' ')) >= 32
+        end
+      end
+    true
   end
 
   def textbook_charts
