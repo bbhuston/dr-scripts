@@ -59,14 +59,22 @@ class FirstAid
   end
 
   def discover_loose_charts
-    case DRC.bput('inv search chart', 'You rummage about your person', "You can't seem to find anything")
-    when "You can't seem to find anything"
-      waitrt?
-      return {}
+    result = DRC.bput('inv search chart', 'You rummage about your person', "You can't seem to find anything")
+    return {} unless result == 'You rummage about your person'
+
+    # bput clears the script queue before sending inventory search. Consume only
+    # its fresh response, never reget history containing a previously owned chart.
+    lines = []
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
+    while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      line = get?
+      if line
+        lines << line.strip
+      else
+        pause 0.1
+      end
     end
     waitrt?
-    pause 0.5
-    lines = reget(30).map(&:strip)
     found_names = lines.filter_map do |line|
       Regexp.last_match(1).strip if line =~ /^(?:An?|Some)\s+(.+?)\s+anatomy chart\b/i
     end
@@ -79,6 +87,7 @@ class FirstAid
     charts_to_read = discover_loose_charts
     return false if charts_to_read.empty?
 
+    studied = false
     charts_to_read
       .map { |_name, info| info }
       .select { |info| info['scholarship'] <= effective_scholarship }
@@ -87,17 +96,27 @@ class FirstAid
       .take(@num_charts)
       .each do |info|
         chart_item = "#{info['index'].to_s.split.first} chart"
-        next unless DRCI.get_item_if_not_held?(chart_item)
+        unless DRCI.get_item_if_not_held?(chart_item)
+          DRC.message("Could not get #{chart_item}; stopping loose-chart study.")
+          exit
+        end
 
-        case DRC.bput('study my chart', 'You attempt to study', 'find it almost impossible to do', 'gradually absorbing', 'difficult time comprehending the advanced text', 'suddenly makes sense to you', '^Why ', 'You need to be holding', 'discerned all you can')
-        when 'gradually absorbing'
-          3.times do
-            result = DRC.bput('study my chart', /Roundtime/, /makes sense/, /discerned all you can/)
-            break if result == 'makes sense' || result == 'discerned all you can'
-          end
+        result = nil
+        4.times do
+          waitrt?
+          result = DRC.bput("study my #{chart_item}", 'You attempt to study', 'find it almost impossible to do', 'gradually absorbing', 'difficult time comprehending the advanced text', 'suddenly makes sense to you', '^Why ', 'You need to be holding', 'discerned all you can', /Roundtime/, /makes sense/)
+          break unless result && result.match?(/gradually absorbing|Roundtime/)
         end
         waitrt?
-        DRCI.put_away_item?(chart_item)
+        unless DRCI.put_away_item?(chart_item)
+          DRC.message("Could not stow #{chart_item}; stopping with custody unresolved.")
+          exit
+        end
+        unless result && result.match?(/You attempt to study|gradually absorbing|Roundtime|makes sense|discerned all you can/)
+          DRC.message("Study of #{chart_item} was not confirmed; stopping.")
+          exit
+        end
+        studied = true
 
         if @skill_focus == 'both'
           break if DRSkill.getxp('First Aid') >= 32 && DRSkill.getxp('Scholarship') >= 32
@@ -105,7 +124,7 @@ class FirstAid
           break if DRSkill.getxp(@skill_focus.split.map(&:capitalize).join(' ')) >= 32
         end
       end
-    true
+    studied
   end
 
   def textbook_charts

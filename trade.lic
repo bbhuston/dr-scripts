@@ -715,37 +715,10 @@ class Trade
     pause 1
   end
 
-  def recover_caravan_room_id
-    pause 0.5
-    recent = reget(12).map { |line| line.to_s.strip }
-    title_line = recent.reverse.find { |line| line =~ /\[[^\]]+\]/ }
-    title_match = title_line[/\[[^\]]+\]/] if title_line
-    desc_idx = recent.rindex(title_line) if title_line
-    desc_line = recent[desc_idx + 1] if desc_idx && recent[desc_idx + 1]
-    room_list = if defined?(Map) && Map.respond_to?(:list)
-                  Map.list
-                elsif defined?(Room) && Room.respond_to?(:list)
-                  Room.list
-                end
-    if title_match && room_list
-      matched = room_list.find do |r|
-        r && Array(r.title).include?(title_match) &&
-          (desc_line.nil? || desc_line.empty? || Array(r.description).any? { |d| d.include?(desc_line[0, 30]) })
-      end
-      return matched.id if matched
-    end
-    find_closest_id('trader_outpost')
-  rescue StandardError
-    find_closest_id('trader_outpost')
-  end
-
   def track_caravan # requires caravan to be in-room with you.
     return false unless caravan_exists?
 
     unless caravan_check?
-      if (target_room = recover_caravan_room_id) && target_room != Room.current.id
-        DRCT.walk_to(target_room)
-      end
       pause 2
       find_timer = Time.now
       echo 'CARAVAN NOT PRESENT IN THE ROOM.  SCRIPT WILL EXIT IN 2 MINUTES UNLESS YOU FIND THE CARAVAN' unless caravan_check?
