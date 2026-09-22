@@ -112,12 +112,20 @@ class CrossingTraining
     empty_trash
     @equipment_manager.empty_hands
 
-    # The next skill to train is the one with the lowest field experience
+    # The next skill to train is the one with the lowest field experience, with
+    # equal experience broken by least recently trained. The timer store is not
+    # guaranteed to exist yet on the first pass, so read it defensively: a
+    # missing store must order the tie, never raise out of the training loop.
+    timers = begin
+      UserVars.crossing_timers || {}
+    rescue NoMethodError
+      {}
+    end
     skill = @settings.crossing_training
                      .select { |s| ready_to_use?(s) }
                      .select { |s| not_research_blocked?(s) }
                      .reject { |s| @settings.crossing_training_stationary_skills_only && @skills_requiring_movement.include?(s) }
-                     .min_by { |s| [DRSkill.getxp(s), (UserVars.crossing_timers[s] || Time.at(0)).to_f] }
+                     .min_by { |s| [DRSkill.getxp(s), (timers[s] || Time.at(0)).to_f] }
 
     check_tithe
     check_chadatru
