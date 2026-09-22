@@ -183,7 +183,52 @@ class Remedy
     DRC.bput("turn my book to #{section}", 'You turn your', 'The book is already')
   end
 
+  def herb_count_in(herb, container)
+    return 0 unless container && DRCI.exists?(herb, container)
+
+    total = 0
+    $ORDINALS.each do |ordinal|
+      case DRC.bput("count #{ordinal} #{herb} in my #{container}",
+                    'I could not find what you were referring to.',
+                    'You count out \d+ pieces of material there',
+                    'tell you much of anything.')
+      when /You count out (\d+) pieces of material there/
+        total += Regexp.last_match(1).to_i
+      else
+        break
+      end
+      break if total >= 25
+    end
+    total
+  end
+
+  def required_herbs_available?
+    return true if @dont_buy
+
+    primary = herb_count_in(@herb1, @herb_container)
+    primary += herb_count_in(@herb1, @bag) if primary < 25 && @bag && @bag != @herb_container
+    if primary < 25
+      reason = "missing required 25 #{@herb1} (found #{primary})"
+      Script.current.define_singleton_method(:drbot_remedy_unavailable) { reason }
+      DRC.message("*** #{reason}; skipping #{@recipe_name}. ***")
+      return false
+    end
+    if @herb2 && @herb2 != 'na' && !['water', 'alcohol', 'coal nugget', 'nugget'].include?(@herb2)
+      unless (@herb_container && DRCI.exists?(@herb2, @herb_container)) || ingredient_exists?(@herb2)
+        reason = "missing secondary ingredient #{@herb2}"
+        Script.current.define_singleton_method(:drbot_remedy_unavailable) { reason }
+        DRC.message("*** #{reason}; skipping #{@recipe_name}. ***")
+        return false
+      end
+    end
+    true
+  end
+
   def create_item
+    unless required_herbs_available?
+      magic_cleanup
+      exit
+    end
     @count = 0
     DRCA.crafting_magic_routine(@settings)
     stow_item(DRC.left_hand)

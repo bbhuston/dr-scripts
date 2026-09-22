@@ -507,7 +507,11 @@ class Coordinator
       send(action, task)
     elsif (script = task[:script])
       play_song?(false) if task[:play_song]
-      wait_for_child(script, task[:args])
+      child = wait_for_child(script, task[:args])
+      if child.respond_to?(:drbot_remedy_unavailable) && child.drbot_remedy_unavailable.is_a?(String) && !child.drbot_remedy_unavailable.empty?
+        task[:retry_after] = Time.now + 600
+        echo "***STATUS*** Town task #{task_label(task)} unavailable (#{child.drbot_remedy_unavailable}); retry delayed 600 seconds"
+      end
       stop_play if task[:play_song]
     else
       raise ArgumentError, "Expected action or script: #{task}"

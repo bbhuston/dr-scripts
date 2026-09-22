@@ -88,6 +88,7 @@ class Alchemy
     # dry? crush?
     DRCI.stow_hands
     exit if @alchemy_prep_quantity <= count(ingredient['output'], @herb_container)
+    exit if count(ingredient['name'], @alchemy_herb_storage) <= 0
     DRCC.find_press_grinder_room(@press_location)
     while 0 < count(ingredient['name'], @alchemy_herb_storage)
       case DRC.bput("get my #{ingredient['name']} from my #{@alchemy_herb_storage}", 'You get', 'What were you referring to?')
