@@ -4,6 +4,7 @@
 
 class CreateRemedies
   def initialize
+    @settings = get_settings
     arg_definitions = [
       [
         { name: 'target', regex: /\w+/, description: 'Recipe.' },

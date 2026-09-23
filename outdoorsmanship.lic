@@ -98,6 +98,16 @@ class Outdoorsmanship
     end
   end
 
+  # The Crossing trainer runs this script as a child. Poll its stop flag so a
+  # coordinator stop request interrupts this script's own bounded loop instead
+  # of running to completion, which is what pushes the parent past the
+  # coordinator's settle window.
+  def crossing_trainer_stopping?
+    Script.running?('crossing-training') && defined?($CROSSING_TRAINER) &&
+      $CROSSING_TRAINER.respond_to?(:stopping?) &&
+      $CROSSING_TRAINER.stopping?
+  end
+
   # Loops forage or collect attempts, retreating from combat before
   # each try, until the XP target is reached or the attempt limit
   # is hit.
@@ -106,6 +116,8 @@ class Outdoorsmanship
   def train_outdoorsmanship
     attempt = 0
     while (DRSkill.getxp(@skill_name) < @end_exp) && (attempt < @targetxp)
+      break if crossing_trainer_stopping?
+
       DRC.retreat
       DRCA.crafting_magic_routine(@settings) unless @skip_magic
       if @train_method == 'forage'

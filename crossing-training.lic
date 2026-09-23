@@ -16,6 +16,13 @@ class CrossingTraining
     @stop = true
   end
 
+  # Child trainers started by this script poll this predicate so a stop
+  # request reaches their own loops. Without it the parent cannot settle
+  # until the child's independent attempt budget is exhausted.
+  def stopping?
+    @stop
+  end
+
   def initialize
     @stop = false
     @running = true

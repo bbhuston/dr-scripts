@@ -118,6 +118,11 @@ practice_options:
       id:  2245
       target: branch
       hide: true
+  # Crossing wall embrasure; stays inside the reviewed hometown radius.
+  crossing_embrasure:
+      id: 835
+      target: embrasure
+      hide: false
   #Segoltha Riverbank in Crossing (280 - 700+)
   segoltha_bank:
       id: 922

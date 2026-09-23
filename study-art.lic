@@ -28,9 +28,23 @@ class StudyArt
     end
   end
 
+  # The Crossing trainer runs this script as a child. Poll its stop flag so a
+  # coordinator stop request interrupts this script's own bounded loop instead
+  # of running to completion, which is what pushes the parent past the
+  # coordinator's settle window.
+  def crossing_trainer_stopping?
+    Script.running?('crossing-training') && defined?($CROSSING_TRAINER) &&
+      $CROSSING_TRAINER.respond_to?(:stopping?) &&
+      $CROSSING_TRAINER.stopping?
+  end
+
   def study?(room, targets)
+    return false if crossing_trainer_stopping?
+
     DRCT.walk_to(room)
     targets.each do |target|
+      return false if crossing_trainer_stopping?
+
       DRC.bput("study #{target}", 'Roundtime:')
       # wait to finish studying
       waitrt?
