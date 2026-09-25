@@ -187,6 +187,7 @@ class Pick
       setup_flags
       open_containers
       check_for_boxes
+      refill_ring
       remove_hindering_gear
       crack_boxes
       stop_buffs
@@ -944,9 +945,16 @@ class Pick
     return if DRC.left_hand
 
     unless DRCI.get_item?('lockpick', @lockpick_container)
-      DRC.message('Pick: Out of lockpicks. Exiting.')
-      DRCI.stow_hands
-      exit
+      if @use_lockpick_ring && !@settings.skip_lockpick_ring_refill
+        DRC.message('Pick: Out of lockpicks. Attempting lockpick ring refill.')
+        refill_ring
+        DRCT.walk_to(@picking_room_id) if Room.current.id != @picking_room_id
+      end
+      unless DRCI.get_item?('lockpick', @lockpick_container)
+        DRC.message('Pick: Out of lockpicks. Exiting.')
+        DRCI.stow_hands
+        exit
+      end
     end
   end
 

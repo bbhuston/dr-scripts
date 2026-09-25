@@ -624,7 +624,14 @@ class CrossingTraining
     if @settings.fa_skinning_trainer
       DRC.wait_for_script_to_complete('faskinner')
     end
-    DRC.wait_for_script_to_complete('first-aid') if DRSkill.getxp('First Aid') < 30
+    return unless DRSkill.getxp('First Aid') < 30
+
+    before_xp = defined?(DRSkill) ? DRSkill.getxp('First Aid').to_i : 0
+    DRC.wait_for_script_to_complete('first-aid')
+    if defined?(DRSkill) && DRSkill.getxp('First Aid').to_i <= before_xp
+      echo('First Aid trainer made no XP progress, removing First Aid from training')
+      @settings.crossing_training&.delete('First Aid')
+    end
   end
 
   def train_scholarship
@@ -838,11 +845,22 @@ class CrossingTraining
     # trained one. The cursor is a UserVar so the rotation survives restarts.
     eligible = @settings.train_workorders & %w[Blacksmithing Weaponsmithing Armorsmithing]
     unless eligible.empty?
-      return unless money_for_training?(5000, 'Forging')
+      materials = @settings.respond_to?(:workorders_materials) ? @settings.workorders_materials : nil
+      stock_name = materials.is_a?(Hash) ? materials['metal_type'] : nil
+      stock = stock_name && respond_to?(:get_data, true) ? get_data('crafting')&.dig('blacksmithing', @settings.hometown, stock_name) : nil
+      stock_cost = stock.is_a?(Hash) ? stock['stock-value'].to_i : 0
+      cash_floor = @settings.respond_to?(:workorders_cash_on_hand) ? @settings.workorders_cash_on_hand.to_i : 0
+      budget = [cash_floor, 5000, stock_cost.positive? ? stock_cost + 3000 : 0].max
+      return unless money_for_training?(budget, 'Forging')
 
+      before_xp = defined?(DRSkill) ? DRSkill.getxp('Forging').to_i : 0
       index = UserVars.crossing_training_forging_next.to_i % eligible.length
       UserVars.crossing_training_forging_next = index + 1
       DRC.wait_for_script_to_complete('workorders', [eligible[index]])
+      if defined?(DRSkill) && DRSkill.getxp('Forging').to_i <= before_xp
+        echo('Forging workorder made no XP progress, removing Forging from training')
+        @settings.crossing_training&.delete('Forging')
+      end
       DRC.wait_for_script_to_complete('sell-loot')
       DRCT.walk_to(@training_room)
       return
