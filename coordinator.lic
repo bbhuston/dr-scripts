@@ -577,13 +577,18 @@ class Coordinator
     ]
   end
 
-  def pick_boxes(_task)
+  def pick_boxes(task)
     DRCT.walk_to(@settings.lockpick_room_id) if @settings.lockpick_room_id
     if @settings.waggle_sets['locksmithing']
       wait_for_child('buff', ['locksmithing'])
     end
+    before_count = @num_boxes
     wait_for_child('pick')
     update_box_count
+    if before_count && @num_boxes && @num_boxes >= before_count && @num_boxes > 0
+      task[:retry_after] = Time.now + 600
+      echo "***STATUS*** Box picking made no progress (#{@num_boxes} remaining); retry delayed 600 seconds"
+    end
   end
 
   def infuse_osrel(task)
