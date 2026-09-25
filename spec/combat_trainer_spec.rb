@@ -74,7 +74,8 @@ RSpec.describe 'combat-trainer weapon custody' do
       'GameState',
       weapon_name: 'wide-bladed dagger', offhand?: offhand,
       thrown_attack_verb: 'lob', thrown_retrieve_verb: 'get my wide-bladed dagger',
-      action_taken: :acted, cleaning_up?: false, next_clean_up_step: nil
+      action_taken: :acted, cleaning_up?: false, next_clean_up_step: nil,
+      drbot_attack_ids_required?: false
     )
   end
 
@@ -187,7 +188,7 @@ RSpec.describe 'combat-trainer weapon custody' do
 
     expect(attack_process.send(:attack_thrown, state)).to eq(:acted)
 
-    expect(DRC).to have_received(:bput).with('lob', 'roundtime', 'What are you trying to')
+    expect(DRC).to have_received(:bput).with('lob', 'roundtime', 'What are you trying to', /already (?:quite )?dead/, /could not find/i)
     expect(state).to have_received(:action_taken)
     expect($COMBAT_TRAINER).not_to have_received(:stop)
   end
@@ -200,7 +201,7 @@ RSpec.describe 'combat-trainer weapon custody' do
 
     expect(attack_process.send(:attack_thrown, state)).to eq(:acted)
 
-    expect(DRC).to have_received(:bput).with('lob left', 'roundtime', 'What are you trying to')
+    expect(DRC).to have_received(:bput).with('lob left', 'roundtime', 'What are you trying to', /already (?:quite )?dead/, /could not find/i)
     expect(state).to have_received(:action_taken)
     expect($COMBAT_TRAINER).not_to have_received(:stop)
   end
@@ -968,6 +969,8 @@ RSpec.describe AttackProcess do
       attack_override: 'attack', melee_attack_verb: 'attack',
       engage: nil, set_dance_queue: nil, next_dance_action: 'bob',
       target_selector: 'rat',
+      drbot_attack_ids_required?: false,
+      dispatch_typed_combo: false, dispatch_enemy_combo: false,
       next_clean_up_step: nil
     }
     double('GameState', defaults.merge(attrs))
@@ -1234,6 +1237,12 @@ RSpec.describe LootProcess do
   end
 
   describe 'stored skinning knife custody' do
+    before(:each) do
+      allow(DRCI).to receive(:dispose_trash)
+      allow(DRCI).to receive(:get_item?)
+      allow(DRCI).to receive(:put_away_item?)
+    end
+
     let(:equipment_manager) do
       double('EquipmentManager', stow_weapon: true, wield_weapon?: true, is_listed_item?: false)
     end

@@ -37,8 +37,8 @@ RSpec.describe 'WorkOrders safe resume-or-request' do
     workorders.instance_variable_set(:@forging_info, { 'stock-room' => 8775 })
     workorders.instance_variable_set(:@workorders_materials, { 'metal_type' => 'steel' })
     workorders.instance_variable_set(:@crafting_stock, {
-                                      'steel' => { 'stock-name' => 'steel', 'stock-number' => 9, 'stock-volume' => 5, 'stock-value' => 2000 }
-                                    })
+      'steel' => { 'stock-name' => 'steel', 'stock-number' => 9, 'stock-volume' => 5, 'stock-value' => 2000 }
+    })
     workorders.instance_variable_set(:@worn_trashcan, nil)
     workorders.instance_variable_set(:@worn_trashcan_verb, nil)
     workorders.instance_variable_set(:@min_items, 1)
@@ -142,7 +142,21 @@ RSpec.describe 'WorkOrders safe resume-or-request' do
     expect { workorders.send(:resume_or_request_work_order, *resume_args) }.to raise_error(SystemExit)
   end
 
-  ['This work order has expired.', 'I could not find what you were referring to.', 'unknown logbook state'].each do |response|
+  it 'treats an expired order as no active order and confirms one replacement' do
+    $left_hand = 'a forging logbook'
+    allow(DRCI).to receive(:get_item?).and_return(true)
+    allow(DRC).to receive(:bput).and_return('This work order has expired.')
+    allow(workorders).to receive(:safe_forging_stock_preflight).and_return(true)
+    expect(workorders).to receive(:request_work_order)
+      .with(*resume_args, max_requests: 1, allow_bundled_cleanup: false)
+      .and_return(['a metal rod', 2])
+    expect(workorders).to receive(:read_active_work_order)
+      .with(recipes, 'forging').and_return(['a metal rod', 2])
+
+    expect(workorders.send(:resume_or_request_work_order, *resume_args)).to eq(['a metal rod', 2])
+  end
+
+  ['I could not find what you were referring to.', 'unknown logbook state'].each do |response|
     it "does not ask or spend from ambiguous state: #{response}" do
       $left_hand = 'a forging logbook'
       allow(DRCI).to receive(:get_item?).and_return(true)
