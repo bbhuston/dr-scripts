@@ -246,7 +246,20 @@ class Coordinator
   end
 
   def default_hunting_task
-    @hunting_tasks.find { |task| task[:default] }
+    task = @hunting_tasks.find { |candidate| candidate[:default] }
+    return task unless task && task[:retry_after] && Time.now < task[:retry_after]
+
+    # A box-blocked hunt deferred this one. Recount once after the cleanup
+    # chain: a completed box handoff lifts the deferral early.
+    if task[:box_recount_pending]
+      task[:box_recount_pending] = false
+      update_box_count
+      unless hunt_boxes_full?
+        task[:retry_after] = nil
+        return task
+      end
+    end
+    nil
   end
 
   def idle_task
@@ -523,6 +536,7 @@ class Coordinator
     file = task[:file]
     echo("Starting hunting-buddy with file #{file}") if @debug
     pause_script('sanowret-crystal') if task[:pause_sanowret]
+    hunt_started = Time.now
     start_script('hunting-buddy', [file])
     pause 5
     next_check = Time.now + 60
@@ -533,11 +547,44 @@ class Coordinator
       end
       pause 5
     end
+    hunt_seconds = (Time.now - hunt_started).to_i
     update_box_count
+    defer_box_blocked_hunt(task, hunt_seconds)
     safe_room = @settings.safe_room
     safe_room = task[:safe_room]['id'] if task[:safe_room]
     DRCT.walk_to(safe_room)
     unpause_script('sanowret-crystal') if task[:pause_sanowret]
+  end
+
+  # hunting-buddy skips a hunt while more boxes are held than
+  # box_hunt_minimum, and combat-trainer stops one at box_loot_limit. With the
+  # cleanup handoff declined ('DRBOT GBOX SKIPPED: keeper did not confirm
+  # readiness'), re-selecting the default hunt looped short hunts and handoff
+  # walks for hours: Vrakk 2026-09-26 00:30-02:40 and 09:17-09:54 logged 78
+  # 'Stopping hunt because have enough boxes' (15-60 second hunts), Thargrund
+  # 02:03:03 'Skipping hunt because have enough boxes' (5-10 second hunts).
+  # A short hunt that ends with those gates still full defers the next hunt
+  # so town tasks, then the safe-room idle, run instead; the cleanup chain
+  # still gets its one handoff attempt after every hunt.
+  BOX_BLOCKED_HUNT_SECONDS = 180
+  BOX_BLOCKED_RETRY_SECONDS = 600
+
+  def hunt_boxes_full?
+    return false unless @num_boxes.is_a?(Integer)
+
+    minimum = @settings.box_hunt_minimum
+    limit = @settings.box_loot_limit
+    (minimum.is_a?(Integer) && @num_boxes > minimum) || (limit.is_a?(Integer) && @num_boxes >= limit)
+  end
+
+  def defer_box_blocked_hunt(task, hunt_seconds)
+    return unless hunt_seconds < BOX_BLOCKED_HUNT_SECONDS && hunt_boxes_full?
+
+    task[:retry_after] = Time.now + BOX_BLOCKED_RETRY_SECONDS
+    task[:box_recount_pending] = true
+    echo "***STATUS*** Hunt #{task_label(task)} ended after #{hunt_seconds} seconds holding #{@num_boxes} boxes " \
+         "(box_hunt_minimum #{@settings.box_hunt_minimum.inspect}, box_loot_limit #{@settings.box_loot_limit.inspect}); " \
+         "next hunt delayed #{BOX_BLOCKED_RETRY_SECONDS} seconds"
   end
 
   #
