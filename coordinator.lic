@@ -670,6 +670,8 @@ class Coordinator
     target_skills = @settings.crossing_training.dup
     deadline = Time.now + 900
     stop_requested_at = nil
+    settle_hold = nil
+    next_hold_echo = nil
     while Script.running?('crossing-training')
       trainer = $CROSSING_TRAINER
       unless trainer && trainer.respond_to?(:training_skills)
@@ -698,14 +700,28 @@ class Coordinator
           echo "***STATUS*** Crossing training stop requested: #{reason}"
         end
       end
-      if stop_requested_at && Time.now - stop_requested_at >= 120
-        # Do not kill a child and advance past an unknown game write. Latch the
-        # scheduler, preserve the active child for fenced containment, and do
-        # not report this task completed or reset its predicates.
-        @task_hold = 'crossing-training did not settle after stop request; operator reconciliation required'
-        return
+      if stop_requested_at && !settle_hold && Time.now - stop_requested_at >= 120
+        # Stops have taken 13-171 seconds to settle (Agondar 2026-09-26: stop
+        # requested 03:03:41, child exited 03:06:32 after finishing its climb
+        # and walk). A slow settle is still the child's own stop path, so hold
+        # the schedule and keep observing it rather than latching. Nothing is
+        # killed, re-requested or started meanwhile, and no task is reported
+        # or reset; a child that never exits keeps this hold, and its fenced
+        # containment, for operator reconciliation.
+        settle_hold = 'crossing-training has not settled 120 seconds after stop request; schedule held until it exits'
+        UserVars.coordinator_safety_hold = { 'reason' => settle_hold, 'since' => Time.now.to_f }
+        next_hold_echo = Time.now
+      end
+      if settle_hold && Time.now >= next_hold_echo
+        echo("***COORDINATOR HOLD*** #{settle_hold}")
+        next_hold_echo = Time.now + 60
       end
       pause 5
+    end
+    if settle_hold
+      # The observed exit is the settle evidence; resume like any other stop.
+      UserVars.coordinator_safety_hold = nil
+      echo "***STATUS*** Crossing training settled #{(Time.now - stop_requested_at).to_i} seconds after stop request; schedule hold cleared"
     end
   ensure
     @child_script = nil unless Script.running?('crossing-training')
