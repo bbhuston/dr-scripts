@@ -58,6 +58,7 @@ RSpec.describe 'combat-trainer weapon custody' do
     allow(state).to receive(:currently_whirlwinding=)
     allow(state).to receive(:cleaning_up?).and_return(false)
     allow(state).to receive(:next_clean_up_step)
+    allow(state).to receive(:force_cleanup)
     state
   end
 
@@ -75,7 +76,7 @@ RSpec.describe 'combat-trainer weapon custody' do
       weapon_name: 'wide-bladed dagger', offhand?: offhand,
       thrown_attack_verb: 'lob', thrown_retrieve_verb: 'get my wide-bladed dagger',
       action_taken: :acted, cleaning_up?: false, next_clean_up_step: nil,
-      drbot_attack_ids_required?: false
+      force_cleanup: nil, drbot_attack_ids_required?: false
     )
   end
 
@@ -166,6 +167,72 @@ RSpec.describe 'combat-trainer weapon custody' do
     expect($COMBAT_TRAINER).not_to have_received(:stop)
   end
 
+  it 'treats an empty Brawling weapon name as nothing to stow while the shield is held' do
+    # Thargrund 2026-09-25 21:54:10: 'failed to stow "" before switching to
+    # "etched greathammer"' with the tower shield in his left hand.
+    $right_hand = nil
+    $left_hand = 'a metal tower shield'
+    equipment_manager = double('EquipmentManager', stow_weapon: nil)
+    state = weapon_switch_state
+    allow(state).to receive(:last_weapon_skill).and_return('Brawling')
+    allow(state).to receive(:last_weapon_name).and_return('')
+    allow(state).to receive(:weapon_skill).and_return('Large Blunt')
+    allow(state).to receive(:weapon_name).and_return('etched greathammer')
+    process = setup_process(equipment_manager)
+
+    result = process.send(:check_weapon, state)
+
+    expect(result).not_to eq(:weapon_custody_failure)
+    expect(equipment_manager).not_to have_received(:stow_weapon)
+    expect(state).to have_received(:wield_weapon)
+    expect(process.instance_variable_get(:@last_seen_weapon_skill)).to eq('Large Blunt')
+    expect(DRC).not_to have_received(:message)
+    expect($HUNTING_BUDDY).not_to have_received(:stop_hunting)
+  end
+
+  it 'does not stow a weapon before switching to that same weapon' do
+    # Thargrund 2026-09-25 23:24:56: 'put my greathammer in my backpack' ->
+    # 'What were you referring to?' for a greathammer that was never drawn.
+    $right_hand = nil
+    $left_hand = 'a metal tower shield'
+    equipment_manager = double('EquipmentManager', stow_weapon: false)
+    state = weapon_switch_state
+    allow(state).to receive(:last_weapon_skill).and_return('Large Blunt')
+    allow(state).to receive(:last_weapon_name).and_return('etched greathammer')
+    allow(state).to receive(:weapon_skill).and_return('Large Blunt')
+    allow(state).to receive(:weapon_name).and_return('etched greathammer')
+
+    result = setup_process(equipment_manager).send(:check_weapon, state)
+
+    expect(result).not_to eq(:weapon_custody_failure)
+    expect(equipment_manager).not_to have_received(:stow_weapon)
+    expect(state).to have_received(:wield_weapon)
+    expect(DRC).not_to have_received(:message)
+  end
+
+  it 'stops the hunt once and then lets cleanup run instead of re-entering the switch' do
+    $right_hand = 'a broadsword'
+    equipment_manager = double('EquipmentManager', stow_weapon: false)
+    state = weapon_switch_state
+    allow(state).to receive(:done_cleaning_up?).and_return(false)
+    allow(state).to receive(:stowing?).and_return(false)
+    allow(state).to receive(:safety_stopping?).and_return(false)
+    process = setup_process(equipment_manager)
+    allow(process).to receive(:waitrt?)
+
+    expect(process.send(:check_weapon, state)).to eq(:weapon_custody_failure)
+    3.times { expect(process.execute(state)).to be(false) }
+    expect(process.send(:stop_for_weapon_custody, 'again', state)).to eq(:weapon_custody_failure)
+
+    expect(equipment_manager).to have_received(:stow_weapon).once
+    expect(DRC).to have_received(:message).once
+    expect($HUNTING_BUDDY).to have_received(:stop_hunting).once
+    expect($COMBAT_TRAINER).to have_received(:stop).once
+    expect(state).to have_received(:next_clean_up_step).once
+    expect(state).to have_received(:force_cleanup).once
+    expect(state).not_to have_received(:safety_stopping?)
+  end
+
   it 'stops without lobbing when the configured weapon is in the wrong hand' do
     $right_hand = 'a broadsword'
     $left_hand = 'a wide-bladed dagger'
@@ -178,6 +245,7 @@ RSpec.describe 'combat-trainer weapon custody' do
     expect(DRC).to have_received(:message).with(/wide-bladed dagger.*right hand.*broadsword/i)
     expect($HUNTING_BUDDY).to have_received(:stop_hunting)
     expect($COMBAT_TRAINER).to have_received(:stop)
+    expect(state).to have_received(:force_cleanup)
   end
 
   it 'lobs a matching configured weapon from the right hand' do

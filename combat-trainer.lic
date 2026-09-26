@@ -76,6 +76,12 @@ class SetupProcess
       return true
     end
 
+    # A weapon custody failure has already stopped this hunt once. Re-entering
+    # the failed transition every tick blocked the cleanup processes behind it
+    # and sent no commands in melee (Thargrund 2026-09-25 21:54:10-22:00:18,
+    # 3,636 identical stop lines), so let the native cleanup steps run instead.
+    return false if @weapon_custody_failed
+
     return false if game_state.safety_stopping?
 
     was_retreating = game_state.retreating?
@@ -379,7 +385,7 @@ class SetupProcess
 
     # Clean up the previous weapon
     if !last_summoned
-      if game_state.last_weapon_name
+      if weapon_to_stow?(game_state)
         unless @equipment_manager.stow_weapon(game_state.last_weapon_name) || (!DRC.right_hand && !DRC.left_hand)
           return stop_for_weapon_custody(
             "failed to stow #{game_state.last_weapon_name.inspect} before switching to #{game_state.weapon_name.inspect}", game_state
@@ -436,16 +442,38 @@ class SetupProcess
     waitrt?
   end
 
+  # Only a named item that differs from the next weapon needs stowing first.
+  # Brawling's '' names no item: EquipmentManager#stow_weapon('') matches no
+  # gear and returns nil without a command, which is not a failed stow even
+  # with a shield held. Two skills naming the same item keep that item, so a
+  # stow before re-wielding it is at best redundant and fails outright when
+  # it was never drawn ('put my greathammer in my backpack' -> 'What were you
+  # referring to?', Thargrund 2026-09-25 23:24:56).
+  def weapon_to_stow?(game_state)
+    last_name = game_state.last_weapon_name.to_s.strip
+    return false if last_name.empty?
+
+    !last_name.casecmp?(game_state.weapon_name.to_s.strip)
+  end
+
   def held_weapon_matches?(held_item, expected_weapon)
     return false unless held_item && expected_weapon
 
     held_item.to_s.match?(/\b#{Regexp.escape(expected_weapon.to_s)}\b/i)
   end
 
+  # Stop the hunt once per trainer run. Later calls report the same failure
+  # without repeating the message or the stop requests. The last-kill phase
+  # is skipped because finishing it means attacking with an unverified weapon.
   def stop_for_weapon_custody(reason, game_state = nil)
+    return :weapon_custody_failure if @weapon_custody_failed
+
+    @weapon_custody_failed = true
     DRC.message("*** combat-trainer: Weapon custody failure: #{reason}. Stopping hunt.")
     $HUNTING_BUDDY&.stop_hunting
-    $COMBAT_TRAINER&.stop; game_state&.next_clean_up_step unless game_state&.cleaning_up?
+    $COMBAT_TRAINER&.stop
+    game_state&.next_clean_up_step unless game_state&.cleaning_up?
+    game_state&.force_cleanup
     :weapon_custody_failure
   end
 
@@ -4514,10 +4542,16 @@ class AttackProcess
     held_item.to_s.match?(/\b#{Regexp.escape(expected_weapon.to_s)}\b/i)
   end
 
+  # Same once-per-run stop as SetupProcess#stop_for_weapon_custody.
   def stop_for_weapon_custody(reason, game_state = nil)
+    return :weapon_custody_failure if @weapon_custody_failed
+
+    @weapon_custody_failed = true
     DRC.message("*** combat-trainer: Weapon custody failure: #{reason}. Stopping hunt.")
     $HUNTING_BUDDY&.stop_hunting
-    $COMBAT_TRAINER&.stop; game_state&.next_clean_up_step unless game_state&.cleaning_up?
+    $COMBAT_TRAINER&.stop
+    game_state&.next_clean_up_step unless game_state&.cleaning_up?
+    game_state&.force_cleanup
     :weapon_custody_failure
   end
 
