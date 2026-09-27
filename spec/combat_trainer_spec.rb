@@ -1176,6 +1176,60 @@ RSpec.describe AttackProcess do
       expect(gs).to have_received(:engage).once
       expect(DRC).to have_received(:bput).with('gouge', any_args).once
     end
+
+    # From hiding, ASSESS cannot prove an ANALYZE target; the enemy-combo
+    # refresh must not run, or its failed census vetoes the ID-bound backstab.
+    it 'backstabs from hiding without selecting or dispatching an enemy combo' do
+      gs = gs_double(backstab?: true, engage: true)
+      allow(gs).to receive(:loaded=)
+      allow(DRC).to receive(:hide?).and_return(true)
+      allow(DRC).to receive(:bput).and_return('Roundtime')
+      attack = build_attack
+      allow(attack).to receive(:hiding?).and_return(true)
+
+      expect(attack.execute(gs)).to be false
+      expect(gs).to have_received(:melee_attack_verb).with(allow_enemy_combo: false)
+      expect(gs).to have_received(:dispatch_enemy_combo).with('backstab rat', from_hiding: true)
+      expect(DRC).to have_received(:bput).with('backstab rat', any_args).once
+    end
+
+    it 'keeps enemy combos for an attack made in the open' do
+      gs = gs_double(engage: true)
+      allow(gs).to receive(:loaded=)
+      allow(DRC).to receive(:bput).and_return('Roundtime')
+      attack = build_attack
+      allow(attack).to receive(:hiding?).and_return(false)
+
+      expect(attack.execute(gs)).to be false
+      expect(gs).to have_received(:melee_attack_verb).with(allow_enemy_combo: true)
+      expect(gs).to have_received(:dispatch_enemy_combo).with('attack', from_hiding: false)
+    end
+  end
+
+  describe '#aim' do
+    # A creature that hides keeps its crtrStatus ID; AIM #id then answers
+    # "I could not find". The next AIM picks another live ID instead of
+    # repeating the refusal.
+    it 'skips a server ID the game could not find' do
+      targets = [{ id: '11' }, { id: '22' }]
+      gs = gs_double(drbot_identity_targets?: true, clear_aim_queue: nil)
+      allow(gs).to receive(:loaded=)
+      allow(gs).to receive(:drbot_living_target_current?) { |target| !target.nil? }
+      allow(gs).to receive(:drbot_capture_living_target) do |excluded|
+        targets.find { |target| !excluded.include?(target[:id]) }
+      end
+      allow(DRC).to receive(:bput).with('aim #11', any_args).and_return('I could not find')
+      allow(DRC).to receive(:bput).with('aim #22', any_args).and_return('You begin to target')
+      attack = build_attack
+      allow(attack).to receive(:check_firing_time)
+
+      attack.send(:aim, gs)
+      attack.send(:aim, gs)
+
+      expect(DRC).to have_received(:bput).with('aim #11', any_args).once
+      expect(DRC).to have_received(:bput).with('aim #22', any_args).once
+      expect(gs).to have_received(:loaded=).with(true)
+    end
   end
 end
 

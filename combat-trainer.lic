@@ -4454,11 +4454,19 @@ class AttackProcess
         DRC.hide?(@hide_type)
       end
 
-      verb = game_state.melee_attack_verb
+      # From hiding, ASSESS lists only this character's own row: opponents that
+      # have lost track of it are omitted. The enemy-combo refresh can then
+      # never prove its ANALYZE target, and its failed census armed the target
+      # retry window that the ID-bound selectors below read, so every hidden
+      # BACKSTAB and stealth attack returned without sending a command. From
+      # hiding, attack with the ordinary verb and no recipe step; the server-ID
+      # selector still binds the target or sends nothing.
+      from_hiding = hiding?
+      verb = game_state.melee_attack_verb(allow_enemy_combo: !from_hiding)
 
       command = game_state.offhand? ? "#{verb} left" : verb
 
-      if (game_state.backstab? || game_state.ambush? || game_state.ambush_stun_training?) && hiding?
+      if (game_state.backstab? || game_state.ambush? || game_state.ambush_stun_training?) && from_hiding
         if (game_state.backstab? && game_state.no_stab_current_mob) || (game_state.ambush? && !game_state.backstab?)
           command += " #{@ambush_location}"
         elsif (game_state.ambush_stun_training?)
@@ -4472,7 +4480,7 @@ class AttackProcess
         end
       end
 
-      unless game_state.dispatch_typed_combo(command) || game_state.dispatch_enemy_combo(command)
+      unless game_state.dispatch_typed_combo(command) || game_state.dispatch_enemy_combo(command, from_hiding: from_hiding)
         if game_state.drbot_attack_ids_required?
           waitrt?
           expected_id = command[/#([1-9]\d*)\z/, 1]
@@ -4619,6 +4627,7 @@ class AttackProcess
     case result
     when /I could not find|already dead|is dead|It's dead|Face what/i
       if game_state.drbot_identity_targets?
+        drbot_mark_aim_unfound(@drbot_aim_target) if result =~ /I could not find/i
         drbot_cancel_identity_aim(game_state)
         return :target_lost
       end
@@ -4660,6 +4669,24 @@ class AttackProcess
     @firing_check = 0
     game_state.clear_aim_queue
     # Keep the loaded weapon: losing a target does not consume ammunition.
+  end
+
+  # A creature that hides keeps its crtrStatus ID, yet AIM or POACH #id can
+  # answer "I could not find what you were referring to." Re-aiming that same
+  # first ID repeated the refusal about three times a second until the weapon
+  # rotated. Skip an ID the server could not find for a bounded window, then
+  # allow it again.
+  def drbot_unfound_aim_ids
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    @drbot_unfound_aim = (@drbot_unfound_aim || {}).reject { |_id, until_at| until_at <= now }
+    @drbot_unfound_aim.keys
+  end
+
+  def drbot_mark_aim_unfound(target)
+    return unless target.is_a?(Hash) && target[:id]
+
+    drbot_unfound_aim_ids
+    @drbot_unfound_aim[target[:id]] = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15.0
   end
 
   def attack_aimed(charged_maneuver, game_state)
@@ -4903,7 +4930,7 @@ class AttackProcess
     if game_state.drbot_identity_targets?
       unless game_state.drbot_living_target_current?(@drbot_aim_target)
         drbot_cancel_identity_aim(game_state)
-        @drbot_aim_target = game_state.drbot_capture_living_target
+        @drbot_aim_target = game_state.drbot_capture_living_target(drbot_unfound_aim_ids)
       end
       return unless game_state.drbot_living_target_current?(@drbot_aim_target)
       command = "aim ##{@drbot_aim_target[:id]}"
@@ -4932,7 +4959,8 @@ class AttackProcess
       /You don't seem to be able to move to do that/
     ]
 
-    case DRC.bput(command, *aim_success_messages, *unloaded_messages, *no_enemy_messages, *wait_and_retry_messages)
+    result = DRC.bput(command, *aim_success_messages, *unloaded_messages, *no_enemy_messages, *wait_and_retry_messages)
+    case result
     when *aim_success_messages
       if game_state.drbot_identity_targets? && !game_state.drbot_living_target_current?(@drbot_aim_target)
         drbot_cancel_identity_aim(game_state)
@@ -4944,6 +4972,10 @@ class AttackProcess
       game_state.loaded = false
       @firing_check = 0
     when *no_enemy_messages
+      if game_state.drbot_identity_targets? && result =~ /I could not find/i
+        drbot_mark_aim_unfound(@drbot_aim_target)
+        @drbot_aim_target = nil
+      end
       game_state.clear_aim_queue
     when *wait_and_retry_messages
       pause 1
@@ -7573,9 +7605,17 @@ class GameState
 
   # Return true once a combo command was sent, even when its response is unknown:
   # falling through would issue a second ordinary attack in the same action.
-  def dispatch_enemy_combo(command)
+  def dispatch_enemy_combo(command, from_hiding: false)
     sequence = enemy_analyze_sequence
     return false unless sequence && @use_analyze_combos && sequence.active?
+
+    # An attack from hiding is not a recipe step and ASSESS cannot re-prove the
+    # recipe's target from hiding (see AttackProcess#attack_melee). End the
+    # recipe without a command; the caller sends the attack ordinarily.
+    if from_hiding
+      sequence.abandon!
+      return false
+    end
 
     # ANALYZE may have introduced RT after attack selection. Recheck the
     # window after that wait, then send without a second intervening wait.
