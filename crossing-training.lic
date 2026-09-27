@@ -69,7 +69,11 @@ class CrossingTraining
     DRCA.release_cyclics
 
     Flags.add('ct-song', 'you finish playing')
-    Flags.add('ct-no-instrument', 'Play on what instrument')
+    # A damaged instrument fails every play exactly like a missing one, and
+    # only this flag stops play_song? retrying it. Khazdar's logs hold 126
+    # "The bones is much too damaged to play." replies from 2026-09-26 18:39
+    # until a repair kit fixed them 2026-09-27 06:14 (drg-8lm).
+    Flags.add('ct-no-instrument', 'Play on what instrument', 'too damaged to play')
     Flags.add('research-partial', 'there is still more to learn before you arrive at a breakthrough', 'distracted by combat', 'distracted by your spellcasting', 'You lose your focus on your research project', 'you forget what you were')
     Flags.add('research-complete', '^Breakthrough!')
   end
