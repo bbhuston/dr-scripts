@@ -254,7 +254,7 @@ class Coordinator
     if task[:box_recount_pending]
       task[:box_recount_pending] = false
       update_box_count
-      unless hunt_boxes_full?
+      unless hunt_boxes_full?(task)
         task[:retry_after] = nil
         return task
       end
@@ -569,16 +569,25 @@ class Coordinator
   BOX_BLOCKED_HUNT_SECONDS = 180
   BOX_BLOCKED_RETRY_SECONDS = 600
 
-  def hunt_boxes_full?
+  def hunt_boxes_full?(task = nil)
     return false unless @num_boxes.is_a?(Integer)
 
     minimum = @settings.box_hunt_minimum
     limit = @settings.box_loot_limit
+    if limit == 0
+      # Zero disables box looting, but only a hunt with `boxes: true` can
+      # actually stop on that limit. `boxes: false` hunts must not back off,
+      # even when the picker carries boxes from the keeper's backlog.
+      file = task && task[:file]
+      hunt_settings = file && file != 'setup' ? get_settings([file]) : @settings
+      infos = Array(hunt_settings.hunting_info)
+      return false unless infos.any? { |info| info['boxes'] || info['stop_on_boxes'] }
+    end
     (minimum.is_a?(Integer) && @num_boxes > minimum) || (limit.is_a?(Integer) && @num_boxes >= limit)
   end
 
   def defer_box_blocked_hunt(task, hunt_seconds)
-    return unless hunt_seconds < BOX_BLOCKED_HUNT_SECONDS && hunt_boxes_full?
+    return unless hunt_seconds < BOX_BLOCKED_HUNT_SECONDS && hunt_boxes_full?(task)
 
     task[:retry_after] = Time.now + BOX_BLOCKED_RETRY_SECONDS
     task[:box_recount_pending] = true
