@@ -196,6 +196,10 @@ class Coordinator
   # is back above the profile's threshold.
   def schedule_hold_reason
     return @task_hold if @task_hold
+    if (custody_hold = UserVars.drbot_weapon_custody_hold).is_a?(Hash)
+      UserVars.coordinator_safety_hold = custody_hold
+      return custody_hold['reason'] || 'weapon custody unresolved; operator reconciliation required'
+    end
     return @bleeding_hold if @bleeding_hold
     if @settings.stop_hunting_if_bleeding && bleeding?
       @bleeding_hold = 'bleeding observed; schedule held'
@@ -554,6 +558,14 @@ class Coordinator
     safe_room = task[:safe_room]['id'] if task[:safe_room]
     DRCT.walk_to(safe_room)
     unpause_script('sanowret-crystal') if task[:pause_sanowret]
+    # SetupProcess records a single unresolved result if its cleanup stow was
+    # refused. Return to the safe room, then suppress task completion and all
+    # later tasks until an operator reconciles, clears the hold, and restarts
+    # this coordinator (which retains @task_hold for its current run).
+    if (custody_hold = UserVars.drbot_weapon_custody_hold).is_a?(Hash)
+      @task_hold = custody_hold['reason'] || 'weapon custody unresolved; operator reconciliation required'
+      UserVars.coordinator_safety_hold = custody_hold
+    end
   end
 
   # hunting-buddy skips a hunt while more boxes are held than
@@ -732,6 +744,9 @@ class Coordinator
       trainer = $CROSSING_TRAINER
       unless trainer && trainer.respond_to?(:training_skills)
         @task_hold = 'crossing-training has no compatible status; operator reconciliation required'
+        # A prior settle hold is no longer the reason for this hold. The child
+        # is still running, so keep the readable state accurate for operators.
+        UserVars.coordinator_safety_hold = { 'reason' => @task_hold, 'since' => Time.now.to_f } if settle_hold
         return
       end
       unavailable = target_skills - trainer.training_skills

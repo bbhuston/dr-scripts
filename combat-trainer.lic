@@ -62,7 +62,18 @@ class SetupProcess
     if game_state.stowing?
       echo('SetupProcess::clean_up') if $debug_mode_ct
       DRC.retreat
-      if game_state.summoned_info(game_state.weapon_skill)
+      if @weapon_custody_failed
+        # The failed transition never wielded the next weapon. Only the item
+        # that failed its prior stow can still be in hand during cleanup.
+        if @weapon_custody_held_name
+          stowed = @equipment_manager.stow_weapon(@weapon_custody_held_name)
+          if !stowed || held_weapon_matches?(DRC.right_hand, @weapon_custody_held_name) ||
+             held_weapon_matches?(DRC.left_hand, @weapon_custody_held_name)
+            hold_unresolved_weapon_custody(@weapon_custody_held_name)
+          end
+        end
+        game_state.sheath_whirlwind_offhand
+      elsif game_state.summoned_info(game_state.weapon_skill)
         if DRStats.moon_mage?
           DRCMM.wear_moon_weapon?
         else
@@ -388,13 +399,15 @@ class SetupProcess
       if weapon_to_stow?(game_state)
         unless @equipment_manager.stow_weapon(game_state.last_weapon_name) || (!DRC.right_hand && !DRC.left_hand)
           return stop_for_weapon_custody(
-            "failed to stow #{game_state.last_weapon_name.inspect} before switching to #{game_state.weapon_name.inspect}", game_state
+            "failed to stow #{game_state.last_weapon_name.inspect} before switching to #{game_state.weapon_name.inspect}",
+            game_state, game_state.last_weapon_name
           )
         end
         if held_weapon_matches?(DRC.right_hand, game_state.last_weapon_name) ||
            held_weapon_matches?(DRC.left_hand, game_state.last_weapon_name)
           return stop_for_weapon_custody(
-            "#{game_state.last_weapon_name.inspect} remains in hand after stow before switching to #{game_state.weapon_name.inspect}", game_state
+            "#{game_state.last_weapon_name.inspect} remains in hand after stow before switching to #{game_state.weapon_name.inspect}",
+            game_state, game_state.last_weapon_name
           )
         end
       end
@@ -462,13 +475,39 @@ class SetupProcess
     held_item.to_s.match?(/\b#{Regexp.escape(expected_weapon.to_s)}\b/i)
   end
 
+  def hold_unresolved_weapon_custody(held_name)
+    reason = "weapon custody unresolved after cleanup stow of #{held_name.inspect}; operator reconciliation required"
+    record = { 'reason' => reason, 'since' => Time.now.to_f }
+    UserVars.drbot_weapon_custody_hold = record
+    begin
+      Vars.save
+      # Vars.save can cache its digest before SQL succeeds. Verify the stored
+      # character-scoped record, not the in-memory UserVars getter.
+      persisted = Lich.db_mutex.synchronize do
+        blob = Lich.db.get_first_value('SELECT hash FROM uservars WHERE scope=?;',
+                                       ["#{XMLData.game}:#{XMLData.name}".encode('UTF-8')])
+        blob && Marshal.load(blob)['drbot_weapon_custody_hold']
+      end
+      raise 'weapon custody hold was not durably saved' unless persisted == record
+    rescue StandardError => error
+      # Changing the in-memory record also makes a later Vars auto-save retry
+      # after a failed SQL write cached the old digest. Current play stays held.
+      record['persistence_unconfirmed'] = true
+      UserVars.drbot_weapon_custody_hold = record
+      DRC.message("*** combat-trainer: Weapon custody hold persistence unconfirmed (#{error.class}); operator reconciliation required")
+    end
+    DRC.message("*** combat-trainer: #{reason}")
+  end
+
   # Stop the hunt once per trainer run. Later calls report the same failure
   # without repeating the message or the stop requests. The last-kill phase
   # is skipped because finishing it means attacking with an unverified weapon.
-  def stop_for_weapon_custody(reason, game_state = nil)
+  def stop_for_weapon_custody(reason, game_state = nil, held_name = nil)
     return :weapon_custody_failure if @weapon_custody_failed
 
     @weapon_custody_failed = true
+    @weapon_custody_held_name = held_name.to_s.strip
+    @weapon_custody_held_name = nil if @weapon_custody_held_name.empty?
     DRC.message("*** combat-trainer: Weapon custody failure: #{reason}. Stopping hunt.")
     $HUNTING_BUDDY&.stop_hunting
     $COMBAT_TRAINER&.stop
