@@ -529,11 +529,37 @@ class Coordinator
         task[:retry_after] = Time.now + 600
         echo "***STATUS*** Town task #{task_label(task)} unavailable (#{child.drbot_remedy_unavailable}); retry delayed 600 seconds"
       end
+      note_box_handoff_result(child.drbot_box_handoff_result) if child.respond_to?(:drbot_box_handoff_result)
       stop_play if task[:play_song]
     else
       raise ArgumentError, "Expected action or script: #{task}"
     end
     unpause_script('sanowret-crystal') if task[:pause_sanowret]
+  end
+
+  # A box handoff child (drbot-gbox, lanjefast-collect-boxes) publishes its
+  # verified result. The box count is otherwise refreshed only at start, after
+  # a hunt and after pick_boxes, so a boxes_over/boxes_under gate never saw a
+  # collection. While Grimdur drains his vault (~90 boxes, 2026-09-26) he says
+  # "vault draining for Lanjefast" before each vault box, and the collector
+  # reports it as keeper_draining. That latches vault_draining? for 30 minutes
+  # so the collect/pick town tasks run ahead of the default hunt; any other
+  # handoff result (a skip, a failure, a collection without the line) clears
+  # it and the hunt resumes.
+  VAULT_DRAIN_LATCH_SECONDS = 1800
+
+  def note_box_handoff_result(result)
+    result = {} unless result.is_a?(Hash)
+    count = result['count']
+    collected = count.is_a?(Integer) && count.positive?
+    update_box_count if collected
+    if collected && result['keeper_draining'] == true
+      @drain_until = Time.now + VAULT_DRAIN_LATCH_SECONDS
+      echo '***STATUS*** vault drain latched'
+    elsif @drain_until
+      @drain_until = nil
+      echo '***STATUS*** vault drain cleared'
+    end
   end
 
   def run_hunting_task(task)
@@ -615,7 +641,8 @@ class Coordinator
   def all_predicates
     [
       'hunt_done?',
-      'run_crossing_training?'
+      'run_crossing_training?',
+      'vault_draining?'
     ]
   end
 
@@ -626,6 +653,11 @@ class Coordinator
 
   def run_crossing_training?
     @settings.crossing_training.any? { |skill| DRSkill.getxp(skill) < 28 }
+  end
+
+  # Latched by note_box_handoff_result; lapses on its own after 30 minutes.
+  def vault_draining?
+    !@drain_until.nil? && Time.now < @drain_until
   end
 
   #
