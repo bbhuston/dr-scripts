@@ -216,8 +216,15 @@ class Athletics
       swim_loop(get_data('athletics').swimming_options['arthe_dale']['rooms'])
     elsif DRSkill.getmodrank('Athletics') < 290
       waitrt?
-      pause @performance_pause # to give performance time to complete before_dying if stopped from the previous script
-      start_script('performance') unless Script.running?('performance')
+      # With a held `instrument`, performance.lic removes and stows hand_armor
+      # to hold it and wears it again only after a finished song. This script's
+      # before_dying kills performance first, so a climb could end with the
+      # gauntlets still stowed (drg-8lm, 2026-09-27). Skip it, as first-aid.lic
+      # and crossing-repair.lic already do for a held instrument.
+      unless @settings.instrument
+        pause @performance_pause # to give performance time to complete before_dying if stopped from the previous script
+        start_script('performance') unless Script.running?('performance')
+      end
       until done_training?
         @athletics_options['crossing']
           .reject { |data| @settings.avoid_athletics_in_justice && data['justice'] }
@@ -358,7 +365,7 @@ class Athletics
           remaining_attempts -= 1
         end
         return if remaining_attempts.zero?
-      else
+      elsif !@settings.instrument # held instrument: see crossing_athletics
         start_script('performance', ['noclean']) unless Script.running?('performance')
         pause @performance_pause # make sure you are playing before starting climb practice
       end

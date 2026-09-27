@@ -14,11 +14,17 @@ class StudyArt
     args = parse_args(arg_definitions)
 
     @stop_skill = args.skill || 'scholarship'
-    performance_pause = get_settings.performance_pause
+    settings = get_settings
+    performance_pause = settings.performance_pause
 
     art_options = get_data('art').art_options
-    pause performance_pause unless Script.running?('crossing-training') # to give performance time to complete before_dying if stopped from the previous script
-    start_script('performance', ['noclean']) unless Script.running?('performance') || Script.running?('crossing-training')
+    # A held `instrument` makes performance.lic stow hand_armor until a song
+    # finishes, and before_dying below kills it first (drg-8lm, 2026-09-27).
+    # Skip it, as first-aid.lic and crossing-repair.lic already do.
+    unless settings.instrument
+      pause performance_pause unless Script.running?('crossing-training') # to give performance time to complete before_dying if stopped from the previous script
+      start_script('performance', ['noclean']) unless Script.running?('performance') || Script.running?('crossing-training')
+    end
     study_art(art_options)
   end
 
