@@ -7,6 +7,33 @@
 class WorkOrders
   VERSION = '1.0.0'.freeze
 
+  # Plugin system -- plugins are loaded from scripts/custom/workorders-plugin-*.rb
+  # and register via WorkOrders.register_plugin(instance). A decision hook such
+  # as :find_npc returns the first non-nil plugin answer; nil keeps the default.
+  @registered_plugins = []
+
+  class << self
+    attr_reader :registered_plugins
+
+    def register_plugin(plugin)
+      @registered_plugins << plugin
+    end
+
+    def fire_hook(hook_name, *args, **kwargs)
+      registered_plugins.each do |plugin|
+        next unless plugin.respond_to?(hook_name)
+
+        begin
+          result = plugin.send(hook_name, *args, **kwargs)
+          return result unless result.nil?
+        rescue StandardError => e
+          Lich::Messaging.msg('bold', "WorkOrders: plugin #{plugin.class.name} error in #{hook_name}: #{e.message}")
+        end
+      end
+      nil
+    end
+  end
+
   # Pattern constants for game responses
   GIVE_LOGBOOK_SUCCESS_PATTERNS = [
     'You hand',
@@ -71,6 +98,11 @@ class WorkOrders
     'You realize you have items bundled with the logbook',
     'You want to ask about shadowlings'
   ].freeze
+
+  # "To whom are you speaking?" means the society master walked away between
+  # the search and the request, so nothing was asked. Search again this many
+  # times without spending one of the caller's request attempts.
+  MASTER_LEFT_RESEARCHES = 3
 
   WORK_ORDER_ITEM_PATTERN = /order for (?<item>.*)\. I need (?<quantity>\d+) /.freeze
   WORK_ORDER_STACKS_PATTERN = /order for (?<item>.*)\. I need (?<quantity>\d+) stacks \(5 uses each\) of .* quality/.freeze
@@ -297,7 +329,7 @@ class WorkOrders
 
     DRCI.stow_hands
     loop do
-      unless find_npc(info['npc-rooms'], info['npc_last_name'])
+      unless find_npc(info['npc-rooms'], info['npc_last_name'], purpose: :turn_in)
         Lich::Messaging.msg('bold', "WorkOrders: Could not find NPC #{info['npc_last_name']} in any of the expected rooms")
         return
       end
@@ -322,7 +354,7 @@ class WorkOrders
     end
 
     DRCI.stow_hands
-    unless find_npc(info['npc-rooms'], info['npc_last_name'])
+    unless find_npc(info['npc-rooms'], info['npc_last_name'], purpose: :turn_in)
       Lich::Messaging.msg('bold', "WorkOrders: Could not find NPC #{info['npc_last_name']} in any of the expected rooms")
       return false
     end
@@ -1593,8 +1625,11 @@ class WorkOrders
     match_names = recipes.map { |x| x['name'] }
     diff ||= 'challenging'
     DRCI.stow_hands
-    max_requests.times do
-      unless find_npc(npc_rooms, npc_last_name)
+    attempts = 0
+    master_left = 0
+    while attempts < max_requests
+      attempts += 1
+      unless find_npc(npc_rooms, npc_last_name, purpose: master_left.positive? ? :re_search : :request)
         Lich::Messaging.msg('bold', "WorkOrders: Could not find NPC #{npc_last_name} - will retry")
         next
       end
@@ -1617,6 +1652,12 @@ class WorkOrders
       end
       result = DRC.bput("ask #{npc} for #{diff} #{discipline} work", *WORK_ORDER_REQUEST_PATTERNS)
       case result
+      when /^To whom/
+        if master_left < MASTER_LEFT_RESEARCHES
+          master_left += 1
+          attempts -= 1
+          Lich::Messaging.msg('bold', "WorkOrders: #{npc_last_name} walked away before the request - searching again")
+        end
       when 'You want to ask about shadowlings'
         pause 10
         fput('say Hmm.')
@@ -1656,7 +1697,13 @@ class WorkOrders
     exit
   end
 
-  def find_npc(room_list, npc)
+  # purpose tells a plugin why the master is wanted: :request (a new order),
+  # :re_search (the master walked away from a request) or :turn_in (a finished
+  # logbook), so it can bound its search and honour a stop request per phase.
+  def find_npc(room_list, npc, purpose: :request)
+    answer = self.class.fire_hook(:find_npc, self, room_list, npc, hometown: @hometown, purpose: purpose)
+    return answer unless answer.nil?
+
     room_list.each do |room_id|
       return true if DRRoom.npcs.include?(npc)
 
@@ -1669,6 +1716,15 @@ end
 
 before_dying do
   Flags.delete('proper-repair')
+end
+
+# Load plugins from custom directory
+Dir.glob(File.join(SCRIPT_DIR, 'custom', 'workorders-plugin-*.rb')).sort.each do |plugin_file|
+  begin
+    load plugin_file
+  rescue ScriptError, StandardError => e
+    echo "Failed to load workorders plugin #{File.basename(plugin_file)}: #{e.message}"
+  end
 end
 
 WorkOrders.new
