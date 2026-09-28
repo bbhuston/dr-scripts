@@ -1584,6 +1584,15 @@ class LootProcess
       return false
     end
 
+    # DISSECT also needs a free hand beside the knife. With a held shield both
+    # hands are full ("You need at least one free hand for that!"): lower the
+    # other item as the SKIN path does, and pick it up before the knife goes.
+    lowered = free_hand_for_dissect
+    if lowered == false
+      restore_skinning_weapon(game_state)
+      return disable_dissect('DISSECT needs a free hand and the other held item could not be lowered')
+    end
+
     # Judged from the LOOK just taken: a corpse can decay during the knife swap.
     sole_corpse = Array(DRRoom.dead_npcs).length == 1
     result = DRC.bput("dissect #{target}",
@@ -1606,7 +1615,8 @@ class LootProcess
                       "With less concern than you'd give a fresh corpse",
                       'Rituals do not work upon constructs',
                       /Your .+ isn't suitable for this type of delicate work/,
-                      /(?:You cannot do the delicate work necessary because you )?lack a suitably small, bladed weapon/)
+                      /(?:You cannot do the delicate work necessary because you )?lack a suitably small, bladed weapon/,
+                      'You need at least one free hand')
     if result =~ /You'll gain no insights from this attempt/
       waitrt?
       if harvest_corpse_present?(mob_noun, game_state)
@@ -1614,7 +1624,9 @@ class LootProcess
         fput("dissect #{confirm}".strip) if confirm
       end
     end
-    return false unless restore_skinning_weapon(game_state)
+    recovered = recover_lowered_item(lowered)
+    restored = restore_skinning_weapon(game_state)
+    return false unless recovered && restored
 
     # Each unanswered DISSECT costs the full 15 second bput timeout. Two in a
     # row mean a reply this matcher does not know; stop paying for it.
@@ -1625,6 +1637,7 @@ class LootProcess
       return disable_dissect('DISSECT got no recognised reply twice in a row')
     end
     @dissect_unanswered = 0
+    @dissect_no_free_hand = 0 unless result == 'You need at least one free hand'
 
     case result
     when /You succeed in dissecting the corpse/, /You learn something/i, "With less concern than you'd give a fresh corpse"
@@ -1641,6 +1654,13 @@ class LootProcess
       return false
     when /isn't suitable for this type of delicate work/, /lack a suitably small, bladed weapon/
       return disable_dissect("DISSECT refused the held weapon (#{result})")
+    when 'You need at least one free hand'
+      # Not performed; the corpse keeps its arrange and skin, whose own path
+      # frees a hand. Twice in a row means the hands cannot be read here.
+      @dissect_no_free_hand = (@dissect_no_free_hand || 0) + 1
+      return false if @dissect_no_free_hand < 2
+
+      return disable_dissect('DISSECT found no free hand twice in a row')
     when 'This ritual may only be performed on a corpse', 'A failed or completed ritual has rendered', 'You realize after a few seconds', 'prevents a meaningful dissection'
       return false
     when 'Rituals do not work upon constructs'
@@ -1795,6 +1815,35 @@ class LootProcess
     @skin = false
     DRC.message("*** combat-trainer: Missing configured skinning knife #{@skinning_knife}; disabling skinning for this run.")
     false
+  end
+
+  # Returns the item lowered to free a hand, nil when a hand is already free,
+  # or false when the other item could not be lowered.
+  def free_hand_for_dissect
+    left = DRC.left_hand
+    right = DRC.right_hand
+    return nil unless left && right
+
+    knife = /\b#{Regexp.escape(@skinning_knife.to_s.split.last)}\b/
+    other = if right =~ knife then left
+            elsif left =~ knife then right
+            end
+    return false unless other
+    return other if DRCI.lower_item?(other)
+
+    # An unrecognised LOWER reply can still have put the item down: pick it
+    # up (or stop the hunt) rather than leave it on the ground.
+    recover_lowered_item(other) unless [DRC.left_hand, DRC.right_hand].include?(other)
+    false
+  rescue StandardError
+    false
+  end
+
+  def recover_lowered_item(lowered)
+    return true unless lowered
+    return true if DRCI.get_item?(lowered)
+
+    stop_for_skinning_knife("failed to pick up #{lowered} after DISSECT")
   end
 
   def dissect_target(mob_noun)

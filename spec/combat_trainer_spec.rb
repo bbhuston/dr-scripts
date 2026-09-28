@@ -1970,6 +1970,97 @@ RSpec.describe LootProcess do
       end
     end
 
+    context 'DISSECT with a shield held in the other hand' do
+      # Thargrund 2026-09-28 02:42:46: knife in the right hand, tower shield in
+      # the left, and DISSECT answered "You need at least one free hand for that!".
+      let(:dissecting) { build_harvester(dissect: true, dissect_cycle_skills: ['First Aid', 'Skinning']) }
+
+      before(:each) do
+        allow(DRCI).to receive(:get_item?).with('skinning knife', 'backpack') do
+          $right_hand = 'skinning knife'
+          true
+        end
+        allow(DRCI).to receive(:lower_item?).with('tower shield') do
+          $left_hand = nil
+          true
+        end
+        allow(DRCI).to receive(:get_item?).with('tower shield') do
+          $left_hand = 'tower shield'
+          true
+        end
+        allow(DRC).to receive(:bput).with('dissect hog', any_args).and_return('You succeed in dissecting the corpse')
+        $right_hand = 'stout broadsword'
+        $left_hand = 'tower shield'
+      end
+
+      it 'lowers the shield for DISSECT and picks it up before the knife goes away' do
+        expect(dissecting.dissected?('hog', game_state)).to be(true)
+        expect(DRCI).to have_received(:get_item?).with('skinning knife', 'backpack').ordered
+        expect(DRCI).to have_received(:lower_item?).with('tower shield').ordered
+        expect(DRC).to have_received(:bput).with('dissect hog', any_args).ordered
+        expect(DRCI).to have_received(:get_item?).with('tower shield').ordered
+        expect(DRCI).to have_received(:put_away_item?).with('skinning knife', 'backpack').ordered
+        expect(equipment_manager).to have_received(:wield_weapon?).with('stout broadsword', 'Large Edged').ordered
+      end
+
+      it 'switches DISSECT off and returns the knife when the shield cannot be lowered' do
+        allow(DRCI).to receive(:lower_item?).with('tower shield').and_return(false)
+
+        expect(dissecting.dissected?('hog', game_state)).to be(false)
+        expect(DRC).not_to have_received(:bput).with('dissect hog', any_args)
+        expect(DRCI).to have_received(:put_away_item?).with('skinning knife', 'backpack')
+        expect(dissecting.instance_variable_get(:@dissect)).to be(false)
+        expect(DRC).to have_received(:message).with(/free hand.*could not be lowered.*disabling dissect/)
+      end
+
+      it 'picks the shield up when LOWER put it down without a recognised reply' do
+        allow(DRCI).to receive(:lower_item?).with('tower shield') do
+          $left_hand = nil
+          false
+        end
+
+        expect(dissecting.dissected?('hog', game_state)).to be(false)
+        expect(DRCI).to have_received(:get_item?).with('tower shield')
+        expect($left_hand).to eq('tower shield')
+        expect(DRC).not_to have_received(:bput).with('dissect hog', any_args)
+        expect(dissecting.instance_variable_get(:@dissect)).to be(false)
+        expect($COMBAT_TRAINER).not_to have_received(:stop)
+      end
+
+      it 'stops the hunt, still returning the knife, when the shield cannot be picked up' do
+        allow(DRCI).to receive(:get_item?).with('tower shield').and_return(false)
+
+        expect(dissecting.dissected?('hog', game_state)).to be(false)
+        expect(DRCI).to have_received(:put_away_item?).with('skinning knife', 'backpack')
+        expect($COMBAT_TRAINER).to have_received(:stop)
+        expect(DRC).to have_received(:message).with(/failed to pick up tower shield after DISSECT/)
+      end
+
+      it 'answers "no free hand" at once, skins the corpse, and gives up on the second in a row' do
+        $left_hand = nil
+        allow(DRC).to receive(:bput).with('dissect hog', any_args).and_return('You need at least one free hand')
+        allow(game_state).to receive(:sort_by_rate_then_rank).and_return(['First Aid', 'Skinning'])
+        allow(DRC).to receive(:bput).with(/\Aarrange/, any_args).and_return('You complete arranging')
+        allow(dissecting).to receive(:check_skinning)
+
+        dissecting.skin_or_dissect('hog', game_state)
+        expect(dissecting.instance_variable_get(:@dissect)).to be(true)
+        expect(dissecting.instance_variable_get(:@dissect_unanswered)).to eq(0)
+        dissecting.skin_or_dissect('hog', game_state)
+
+        expect(dissecting).to have_received(:check_skinning).with('hog', game_state).twice
+        expect(dissecting.instance_variable_get(:@dissect)).to be(false)
+        expect(DRC).to have_received(:message).with(/no free hand twice in a row; disabling dissect/)
+      end
+
+      it 'lowers nothing when a hand is already free' do
+        $left_hand = nil
+
+        expect(dissecting.dissected?('hog', game_state)).to be(true)
+        expect(DRCI).not_to have_received(:lower_item?)
+      end
+    end
+
     context 'after a skinning knife custody failure' do
       it 'sends no ARRANGE or LOOT for the rest of the pass' do
         instance = build_harvester(dissect: true, dissect_cycle_skills: ['First Aid', 'Skinning'])
