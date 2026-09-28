@@ -1417,6 +1417,146 @@ RSpec.describe LootProcess do
     end
   end
 
+  describe 'dissect with the stored skinning knife' do
+    let(:equipment_manager) do
+      double('EquipmentManager', stow_weapon: true, wield_weapon?: true, is_listed_item?: false)
+    end
+    let(:game_state) do
+      gs_double(need_bundle: false, weapon_name: 'stout broadsword', weapon_skill: 'Large Edged', dissectable?: true)
+    end
+    let(:refused) { "Your stout broadsword isn't suitable for this type of delicate work" }
+
+    before(:each) do
+      allow(DRC).to receive(:message)
+      allow(DRC).to receive(:bput).and_return('Roundtime')
+      allow(DRCI).to receive(:dispose_trash)
+      allow(DRCI).to receive(:get_item?).with('skinning knife', 'backpack').and_return(true)
+      allow(DRCI).to receive(:put_away_item?).with('skinning knife', 'backpack').and_return(true)
+    end
+
+    def build_dissector(**overrides)
+      instance = build_loot(
+        skin: true, dissect: true, dissect_for_thanatology: false,
+        dissect_cycle_skills: ['First Aid', 'Skinning'],
+        skinning_knife: 'skinning knife', skinning_knife_container: 'backpack',
+        equipment_manager: equipment_manager, **overrides
+      )
+      allow(instance).to receive(:harvest_corpse_present?).and_return(true)
+      instance
+    end
+
+    def dissect_reply(reply)
+      allow(DRC).to receive(:bput).with('dissect hog', any_args).and_return(reply)
+    end
+
+    it 'dissects with the knife, puts it back and re-wields the weapon' do
+      instance = build_dissector
+      dissect_reply('You succeed in dissecting the corpse')
+
+      expect(instance.dissected?('hog', game_state)).to be(true)
+      expect(equipment_manager).to have_received(:stow_weapon).with('stout broadsword').ordered
+      expect(DRCI).to have_received(:get_item?).with('skinning knife', 'backpack').ordered
+      expect(DRC).to have_received(:bput).with('dissect hog', any_args).ordered
+      expect(DRCI).to have_received(:put_away_item?).with('skinning knife', 'backpack').ordered
+      expect(equipment_manager).to have_received(:wield_weapon?).with('stout broadsword', 'Large Edged').ordered
+      expect(instance.instance_variable_get(:@dissect)).to be(true)
+      expect(DRCI).not_to have_received(:dispose_trash)
+    end
+
+    it 'treats a refused weapon as an immediate failure and stops dissecting for the run' do
+      instance = build_dissector
+      dissect_reply(refused)
+
+      expect(instance.dissected?('hog', game_state)).to be(false)
+      expect(instance.instance_variable_get(:@dissect)).to be(false)
+      expect(instance.instance_variable_get(:@dissect_cycle_skills)).to eq(['Skinning'])
+      expect(instance.instance_variable_get(:@skin)).to be(true)
+      expect(DRC).to have_received(:message).with(/stout broadsword isn't suitable.*disabling dissect for this run/)
+      expect(DRCI).to have_received(:put_away_item?).with('skinning knife', 'backpack')
+      expect(equipment_manager).to have_received(:wield_weapon?).with('stout broadsword', 'Large Edged')
+    end
+
+    it 'treats the missing small blade reply as an immediate failure' do
+      instance = build_dissector
+      dissect_reply('You cannot do the delicate work necessary because you lack a suitably small, bladed weapon')
+
+      expect(instance.dissected?('hog', game_state)).to be(false)
+      expect(instance.instance_variable_get(:@dissect)).to be(false)
+      expect(DRC).to have_received(:message).with(/lack a suitably small, bladed weapon.*disabling dissect/)
+    end
+
+    it 'does not dissect with the held weapon when no knife is configured' do
+      instance = build_dissector(skinning_knife: nil, skinning_knife_container: nil)
+
+      expect(instance.dissected?('hog', game_state)).to be(false)
+      expect(DRC).not_to have_received(:bput).with('dissect hog', any_args)
+      expect(equipment_manager).not_to have_received(:stow_weapon)
+      expect(instance.instance_variable_get(:@dissect)).to be(false)
+      expect(instance.instance_variable_get(:@skin)).to be(true)
+      expect(DRC).to have_received(:message).with(/no skinning knife is configured.*disabling dissect/)
+    end
+
+    it 're-wields the weapon and stops dissecting, but keeps skinning, when the knife is missing' do
+      instance = build_dissector
+      allow(DRCI).to receive(:get_item?).with('skinning knife', 'backpack').and_return(false)
+
+      expect(instance.dissected?('hog', game_state)).to be(false)
+      expect(DRC).not_to have_received(:bput).with('dissect hog', any_args)
+      expect(equipment_manager).to have_received(:wield_weapon?).with('stout broadsword', 'Large Edged')
+      expect(instance.instance_variable_get(:@dissect)).to be(false)
+      expect(instance.instance_variable_get(:@skin)).to be(true)
+    end
+
+    it 'keeps the knife in hand for the confirming DISSECT after a no-insights warning' do
+      instance = build_dissector
+      dissect_reply("You'll gain no insights from this attempt")
+      allow(instance).to receive(:fput)
+
+      expect(instance.dissected?('hog', game_state)).to be(false)
+      expect(DRCI).to have_received(:get_item?).with('skinning knife', 'backpack').ordered
+      expect(instance).to have_received(:fput).with('dissect').ordered
+      expect(DRCI).to have_received(:put_away_item?).with('skinning knife', 'backpack').ordered
+      expect(equipment_manager).to have_received(:wield_weapon?).with('stout broadsword', 'Large Edged').ordered
+      expect(instance.instance_variable_get(:@dissect)).to be(true)
+    end
+
+    it 'stops dissecting after two unanswered DISSECTs, returning the knife each time' do
+      instance = build_dissector
+      dissect_reply('')
+
+      expect(instance.dissected?('hog', game_state)).to be(false)
+      expect(instance.instance_variable_get(:@dissect)).to be(true)
+      expect(instance.dissected?('hog', game_state)).to be(false)
+      expect(instance.instance_variable_get(:@dissect)).to be(false)
+      expect(DRCI).to have_received(:put_away_item?).with('skinning knife', 'backpack').twice
+    end
+
+    it 'falls back to arrange and skin for the refused corpse and skips DISSECT afterwards' do
+      instance = build_dissector
+      dissect_reply(refused)
+      allow(game_state).to receive(:sort_by_rate_then_rank).and_return(['First Aid', 'Skinning'])
+      allow(instance).to receive(:arrange_mob)
+      allow(instance).to receive(:check_skinning)
+
+      instance.skin_or_dissect('hog', game_state)
+      instance.skin_or_dissect('hog', game_state)
+
+      expect(DRC).to have_received(:bput).with('dissect hog', any_args).once
+      expect(instance).to have_received(:check_skinning).with('hog', game_state).twice
+    end
+
+    it 'stops the hunt without dissecting when the weapon cannot be stowed' do
+      instance = build_dissector
+      allow(equipment_manager).to receive(:stow_weapon).and_return(false)
+
+      expect(instance.dissected?('hog', game_state)).to be(false)
+      expect(DRC).not_to have_received(:bput).with('dissect hog', any_args)
+      expect(DRCI).not_to have_received(:get_item?)
+      expect(instance.instance_variable_get(:@dissect)).to be(false)
+      expect($COMBAT_TRAINER).to have_received(:stop)
+    end
+  end
+
   describe '#execute' do
     before(:each) do
       allow(DRC).to receive(:bput).and_return('Roundtime')

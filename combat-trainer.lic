@@ -1412,33 +1412,60 @@ class LootProcess
       return false if DRSkill.getxp('First Aid') == 34
     end
 
-    case DRC.bput("dissect #{mob_noun}",
-                  /You'll gain no insights from this attempt/,
-                  /You succeed in dissecting the corpse/,
-                  'What exactly are you trying to dissect',
-                  "You'll learn nothing",
-                  'While likely a fascinating study',
-                  'You cannot dissect',
-                  'would probably object',
-                  "should be left alone.",
-                  "That'd be a waste of time.",
-                  'A skinned creature is worthless',
-                  'You do not yet possess the knowledge',
-                  'This ritual may only be performed on a corpse',
-                  /You learn something/i,
-                  'A failed or completed ritual has rendered',
-                  'You realize after a few seconds',
-                  'prevents a meaningful dissection',
-                  "With less concern than you'd give a fresh corpse",
-                  'Rituals do not work upon constructs')
+    # DISSECT, like SKIN, needs a small bladed weapon in hand; a sword or axe
+    # is refused ("Your stout broadsword isn't suitable for this type of
+    # delicate work."). Borrow the configured skinning knife through the
+    # skinning custody path and put it back before acting on the reply.
+    return false unless prepare_dissect_knife(game_state)
+    unless harvest_corpse_present?(mob_noun, game_state)
+      restore_skinning_weapon(game_state)
+      return false
+    end
+
+    result = DRC.bput("dissect #{mob_noun}",
+                      /You'll gain no insights from this attempt/,
+                      /You succeed in dissecting the corpse/,
+                      'What exactly are you trying to dissect',
+                      "You'll learn nothing",
+                      'While likely a fascinating study',
+                      'You cannot dissect',
+                      'would probably object',
+                      "should be left alone.",
+                      "That'd be a waste of time.",
+                      'A skinned creature is worthless',
+                      'You do not yet possess the knowledge',
+                      'This ritual may only be performed on a corpse',
+                      /You learn something/i,
+                      'A failed or completed ritual has rendered',
+                      'You realize after a few seconds',
+                      'prevents a meaningful dissection',
+                      "With less concern than you'd give a fresh corpse",
+                      'Rituals do not work upon constructs',
+                      /Your .+ isn't suitable for this type of delicate work/,
+                      /(?:You cannot do the delicate work necessary because you )?lack a suitably small, bladed weapon/)
+    if result =~ /You'll gain no insights from this attempt/
+      waitrt?
+      fput("dissect") if harvest_corpse_present?(mob_noun, game_state)
+    end
+    return false unless restore_skinning_weapon(game_state)
+
+    # Each unanswered DISSECT costs the full 15 second bput timeout. Two in a
+    # row mean a reply this matcher does not know; stop paying for it.
+    if result.to_s.empty?
+      @dissect_unanswered = (@dissect_unanswered || 0) + 1
+      return false if @dissect_unanswered < 2
+
+      return disable_dissect('DISSECT got no recognised reply twice in a row')
+    end
+    @dissect_unanswered = 0
+
+    case result
     when /You succeed in dissecting the corpse/, /You learn something/i, "With less concern than you'd give a fresh corpse"
       return true
     when /You'll gain no insights from this attempt/
-      waitrt?
-      return false unless harvest_corpse_present?(mob_noun, game_state)
-
-      fput("dissect")
       return false
+    when /isn't suitable for this type of delicate work/, /lack a suitably small, bladed weapon/
+      return disable_dissect("DISSECT refused the held weapon (#{result})")
     when 'This ritual may only be performed on a corpse', 'A failed or completed ritual has rendered', 'You realize after a few seconds', 'prevents a meaningful dissection'
       return false
     when 'Rituals do not work upon constructs'
@@ -1571,7 +1598,7 @@ class LootProcess
     DRCI.dispose_trash(DRC.right_hand) if snap.last != DRC.right_hand && !@equipment_manager.is_listed_item?(DRC.right_hand)
   end
 
-  def prepare_skinning_knife(game_state)
+  def prepare_skinning_knife(game_state, purpose = :skin)
     return true unless @skinning_knife
 
     @pre_skinning_weapon = game_state.weapon_name
@@ -1584,8 +1611,27 @@ class LootProcess
     return true if DRCI.get_item?(@skinning_knife, @skinning_knife_container)
 
     @equipment_manager.wield_weapon?(@pre_skinning_weapon, game_state.weapon_skill) if @pre_skinning_weapon && !@pre_skinning_weapon.empty?
+    return disable_dissect("Missing configured skinning knife #{@skinning_knife}") if purpose == :dissect
+
     @skin = false
     DRC.message("*** combat-trainer: Missing configured skinning knife #{@skinning_knife}; disabling skinning for this run.")
+    false
+  end
+
+  # Without a configured knife DISSECT uses whatever is held, and a sword or
+  # axe is refused on every corpse. Switch dissection off once instead; the
+  # corpse still gets the arrange/skin path.
+  def prepare_dissect_knife(game_state)
+    return disable_dissect('DISSECT needs a small bladed weapon and no skinning knife is configured (skinning: knife)') unless @skinning_knife
+
+    prepare_skinning_knife(game_state, :dissect)
+  end
+
+  def disable_dissect(reason)
+    @dissect = false
+    @dissect_cycle_skills.delete('First Aid')
+    @dissect_cycle_skills.delete('Thanatology') if @dissect_for_thanatology
+    DRC.message("*** combat-trainer: #{reason}; disabling dissect for this run.")
     false
   end
 
@@ -1603,6 +1649,7 @@ class LootProcess
 
   def stop_for_skinning_knife(reason)
     @skin = false
+    @dissect = false
     DRC.message("*** combat-trainer: Skinning knife custody failure: #{reason}. Stopping hunt.")
     $HUNTING_BUDDY&.stop_hunting
     $COMBAT_TRAINER&.stop
