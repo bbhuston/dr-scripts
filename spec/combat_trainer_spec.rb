@@ -329,6 +329,7 @@ load_lic_class('combat-trainer.lic', 'SpellProcess')
 load_lic_class('combat-trainer.lic', 'PetProcess')
 load_lic_class('combat-trainer.lic', 'TrainerProcess')
 load_lic_class('combat-trainer.lic', 'CombatTrainer')
+load_lic_class('combat-trainer.lic', 'CombatTrainerOwnKills')
 
 # Shared setup for combat-trainer tests that need game state stubs.
 # Include in each describe block via: before(:each) { ct_setup }
@@ -389,6 +390,41 @@ end
 # ===================================================================
 RSpec.describe GameState do
   before(:each) { ct_setup }
+
+  describe 'own-kill harvesting settings' do
+    def id_state(own_kill: nil, server_ids: nil, group: nil)
+      gs = GameState.allocate
+      gs.instance_variable_set(:@drbot_own_kill_harvest, own_kill)
+      gs.instance_variable_set(:@drbot_server_id_targeting, server_ids)
+      gs.instance_variable_set(:@drbot_supervised_group, group)
+      gs
+    end
+
+    it 'turns corpse IDs and own-kill harvesting on together with server-ID targeting' do
+      state = id_state(own_kill: true, server_ids: true)
+      expect(state.drbot_own_kills_only?).to be(true)
+      expect(state.drbot_corpse_ids?).to be(true)
+    end
+
+    it 'needs server-ID targeting as well as the opt-in' do
+      expect(id_state(own_kill: true).drbot_own_kills_only?).to be(false)
+      expect(id_state(own_kill: true).drbot_corpse_ids?).to be(false)
+      expect(id_state(server_ids: true).drbot_corpse_ids?).to be(false)
+    end
+
+    it 'keeps lvt-goblins corpse IDs without own-kill filtering' do
+      state = id_state(group: 'lvt-goblins')
+      expect(state.drbot_corpse_ids?).to be(true)
+      expect(state.drbot_own_kills_only?).to be(false)
+    end
+
+    it 'answers not harvestable and not tracking without a tracker' do
+      state = id_state(own_kill: true, server_ids: true)
+      expect(state.drbot_own_kill_tracking?).to be(false)
+      expect(state.drbot_own_kill_harvestable?('3240264')).to be(false)
+      expect(state.drbot_own_kill('3240264')).to be_nil
+    end
+  end
 
   # Focused builder: only the fields that matter for offense/defense.
   def build_offense_state(empath: false, permashocked: false, construct: false, undead: false, innocence: false)
@@ -2061,6 +2097,275 @@ RSpec.describe LootProcess do
       end
     end
 
+    context 'harvesting only this hunter\'s own kills (drbot_own_kill_harvest)' do
+      # Vrakk and Thargrund shared room 1473 on 2026-09-28 and each searched
+      # the other's kills. A pass names only a corpse the tracker attributed
+      # to this character and sends nothing, not even a LOOK, for the others.
+      let(:records) { {} }
+      let(:corpses) { [] }
+      let(:own_state) do
+        state = game_state
+        allow(state).to receive(:drbot_corpse_ids?).and_return(true)
+        allow(state).to receive(:drbot_own_kills_only?).and_return(true)
+        allow(state).to receive(:drbot_own_kill_tracking?).and_return(true)
+        allow(state).to receive(:drbot_own_kill) { |id| records[id] }
+        allow(state).to receive(:drbot_own_kill_harvestable?) do |id|
+          rec = records[id]
+          rec && (rec[:kind] == :own || (rec[:kind] == :none && rec[:alone] && rec[:engaged])) ? true : false
+        end
+        state
+      end
+
+      before(:each) do
+        registry = double('Creature')
+        allow(registry).to receive(:in_room) { corpses }
+        stub_const('Lich::DragonRealms::Creature', registry)
+        allow(Room).to receive(:current).and_return(OpenStruct.new(id: 1473))
+        allow(XMLData).to receive(:room_id).and_return(62_001)
+      end
+
+      # A dead Lich::DragonRealms::Creature registry entry.
+      def own_kill_corpse(id, noun)
+        entry = OpenStruct.new(id: id.to_i, noun: noun, name: "forager #{noun}")
+        entry.define_singleton_method(:crtr_flag?) { |flag| flag == :dead }
+        entry
+      end
+
+      def corpse(id, noun, kind, at: 1.0, peer: nil, alone: false, engaged: true)
+        corpses << own_kill_corpse(id, noun)
+        records[id] = { kind: kind, peer: peer, alone: alone, engaged: engaged, at: at }
+      end
+
+      it 'names the oldest own kill and leaves another hunter\'s kill with one line' do
+        corpse('3240317', 'goblin', :peer, peer: 'Thargrund', at: 1.0)
+        corpse('3240264', 'goblin', :own, at: 2.0)
+        corpse('3240377', 'hog', :own, at: 3.0)
+        instance = build_harvester
+
+        expect(instance.harvest_corpse_candidate(own_state)).to eq('goblin')
+        expect(instance.instance_variable_get(:@own_kill_candidate_id)).to eq('3240264')
+        instance.harvest_corpse_candidate(own_state)
+        expect(DRC).to have_received(:message).with("*** combat-trainer: leaving #3240317 goblin (Thargrund's kill).").once
+      end
+
+      it 'sends nothing, not even a LOOK, when every corpse is someone else\'s' do
+        corpse('3240317', 'goblin', :peer, peer: 'Thargrund')
+        corpse('3237810', 'hog', :foreign)
+        instance = build_harvester
+        allow(instance).to receive(:harvest_corpse_present?).and_call_original
+        allow(instance).to receive(:searched_corpses_only?).and_return(false)
+        allow(DRC).to receive(:bput)
+
+        instance.dispose_body(own_state)
+
+        expect(DRC).not_to have_received(:bput)
+        expect(DRC).to have_received(:message).with(/leaving #3237810 hog \(not seen killed in this visit\)/)
+      end
+
+      it 'binds only an own corpse even when a peer\'s corpse of the same noun is listed first' do
+        corpse('3240317', 'goblin', :peer, peer: 'Thargrund')
+        corpse('3240264', 'goblin', :own)
+        instance = build_harvester
+        instance.instance_variable_set(:@drbot_harvest_ids, true)
+        instance.instance_variable_set(:@drbot_own_kill_state, own_state)
+
+        expect(instance.harvest_corpse_identity?('goblin')).to be(true)
+        expect(instance.instance_variable_get(:@drbot_harvest_corpse)[:id]).to eq('3240264')
+        expect(instance.harvest_corpse_selector).to eq('#3240264')
+      end
+
+      it 'refuses to bind when the only corpse of the noun is a peer\'s kill' do
+        corpse('3240317', 'goblin', :peer, peer: 'Thargrund')
+        instance = build_harvester
+        instance.instance_variable_set(:@drbot_harvest_ids, true)
+        instance.instance_variable_set(:@drbot_own_kill_state, own_state)
+
+        expect(instance.harvest_corpse_identity?('goblin')).to be(false)
+      end
+
+      it 'takes the arrange type from the bound corpse, not a lingering searched one' do
+        # Vrakk 17:47:57: a searched goblin still listed beside a fresh hog kill
+        # drew 'arrange for bone' on the hog.
+        corpse('3239001', 'goblin', :own, at: 1.0)
+        corpse('3239008', 'hog', :own, at: 2.0)
+        instance = build_harvester(arrange_types: { 'goblin' => 'bone', 'hog' => 'skin' })
+        instance.instance_variable_set(:@searched_corpse_ids, { '3239001' => Time.now })
+
+        expect(instance.harvest_corpse_candidate(own_state)).to eq('hog')
+      end
+
+      it 'harvests a lone hunter\'s bleed-out kill that was engaged with it' do
+        corpse('2840088', 'lout', :none, alone: true, engaged: true)
+        instance = build_harvester
+
+        expect(instance.harvest_corpse_candidate(own_state)).to eq('lout')
+      end
+
+      it 'leaves a killer-less corpse when another player was present' do
+        corpse('2840088', 'lout', :none, alone: false, engaged: true)
+        instance = build_harvester
+
+        expect(instance.harvest_corpse_candidate(own_state)).to be_nil
+        expect(DRC).to have_received(:message).with(/leaving #2840088 lout \(killer not seen with another player here\)/)
+      end
+
+      it 'says nothing about a corpse whose death is not recorded yet' do
+        corpses << own_kill_corpse('3241999', 'goblin')
+        instance = build_harvester
+
+        expect(instance.harvest_corpse_candidate(own_state)).to be_nil
+        expect(DRC).not_to have_received(:message)
+      end
+
+      it 'leaves every corpse, once said, when tracking is unavailable' do
+        corpse('3240264', 'goblin', :own)
+        allow(own_state).to receive(:drbot_own_kill_tracking?).and_return(false)
+        instance = build_harvester
+
+        2.times { expect(instance.harvest_corpse_candidate(own_state)).to be_nil }
+        expect(DRC).to have_received(:message).with(/own-kill tracking is unavailable; leaving every corpse/).once
+      end
+
+      it 'stops re-looking an own corpse whose identity failed three times' do
+        corpse('3240264', 'goblin', :own)
+        instance = build_harvester
+        allow(instance).to receive(:harvest_corpse_present?).and_call_original
+        allow(instance).to receive(:harvest_corpse_identity?).and_return(false)
+        allow(DRC).to receive(:bput).with('look', any_args).and_return('Obvious paths: east, south.')
+
+        3.times do
+          instance.harvest_corpse_candidate(own_state)
+          instance.harvest_corpse_present?('goblin', own_state)
+        end
+
+        expect(instance.harvest_corpse_candidate(own_state)).to be_nil
+        expect(DRC).to have_received(:message).with(/leaving #3240264 \(its corpse ID did not confirm 3 times\)/).once
+      end
+
+      it 'keeps upstream corpse naming when the setting is off' do
+        instance = build_harvester
+        plain = gs_double(need_bundle: false)
+
+        expect(instance.harvest_corpse_candidate(plain)).to eq('hog')
+      end
+    end
+
+    context 'First Aid that learns nothing from DISSECT' do
+      # Vrakk and Thargrund at First Aid 41: no First Aid gain across 93 and 77
+      # successful DISSECTs; Lanjefast at 32-33 gained on all 33 of his.
+      let(:dissecting) { build_harvester(dissect: true, dissect_cycle_skills: ['First Aid', 'Skinning']) }
+      let(:mindstate) { [0] }
+
+      before(:each) do
+        allow(DRSkill).to receive(:getxp).with('First Aid') { mindstate.first }
+        allow(DRSkill).to receive(:getrank).with('First Aid').and_return(41)
+        allow(DRC).to receive(:bput).with('dissect hog', any_args) do
+          mindstate[0] += @gain.to_i
+          'You succeed in dissecting the corpse'
+        end
+      end
+
+      it 'stops dissecting for the run after three barren successes, saying so once' do
+        3.times { expect(dissecting.dissected?('hog', game_state)).to be(true) }
+
+        expect(dissecting.instance_variable_get(:@dissect)).to be(false)
+        expect(dissecting.instance_variable_get(:@dissect_cycle_skills)).to eq(['Skinning'])
+        expect(DRC).to have_received(:message)
+          .with('*** combat-trainer: First Aid 41 learned nothing from 3 successful DISSECTs in a row; disabling dissect for this run.').once
+      end
+
+      it 'skins the next corpse after the switch' do
+        allow(game_state).to receive(:sort_by_rate_then_rank).and_return(['First Aid', 'Skinning'])
+        allow(dissecting).to receive(:arrange_mob)
+        allow(dissecting).to receive(:check_skinning)
+        4.times { dissecting.skin_or_dissect('hog', game_state) }
+
+        expect(DRC).to have_received(:bput).with('dissect hog', any_args).exactly(3).times
+        expect(dissecting).to have_received(:check_skinning).with('hog', game_state).once
+      end
+
+      it 'keeps dissecting while First Aid learns' do
+        @gain = 1
+        5.times { expect(dissecting.dissected?('hog', game_state)).to be(true) }
+
+        expect(dissecting.instance_variable_get(:@dissect)).to be(true)
+      end
+
+      it 'restarts the count after a learning DISSECT' do
+        replies = [0, 0, 1, 0, 0]
+        allow(DRC).to receive(:bput).with('dissect hog', any_args) do
+          mindstate[0] += replies.shift
+          'You succeed in dissecting the corpse'
+        end
+        5.times { dissecting.dissected?('hog', game_state) }
+
+        expect(dissecting.instance_variable_get(:@dissect)).to be(true)
+      end
+
+      it 'honours skinning: dissect_barren_limit' do
+        dissecting.instance_variable_set(:@dissect_barren_limit, 5)
+        4.times { dissecting.dissected?('hog', game_state) }
+        expect(dissecting.instance_variable_get(:@dissect)).to be(true)
+        dissecting.dissected?('hog', game_state)
+        expect(dissecting.instance_variable_get(:@dissect)).to be(false)
+      end
+
+      it 'skips DISSECT while mind-locked without counting it, saying so once per lock' do
+        mindstate[0] = 34
+        3.times { expect(dissecting.dissected?('hog', game_state)).to be(false) }
+
+        expect(DRC).not_to have_received(:bput).with('dissect hog', any_args)
+        expect(dissecting.instance_variable_get(:@dissect)).to be(true)
+        expect(DRC).to have_received(:message).with(/First Aid is mind-locked; skipping DISSECT/).once
+      end
+
+      it 'does not count a DISSECT that was not a success' do
+        allow(DRC).to receive(:bput).with('dissect hog', any_args).and_return("You'll learn nothing")
+        4.times { dissecting.dissected?('hog', game_state) }
+
+        expect(dissecting.instance_variable_get(:@dissect)).to be(true)
+      end
+    end
+
+    context 'DISSECT while concealed' do
+      # Lanjefast 2026-09-28 17:44:00 under Khri Silence: "That's going to be
+      # hard to accomplish while concealed." and a 15 second stall.
+      let(:dissecting) { build_harvester(dissect: true, dissect_cycle_skills: ['First Aid', 'Skinning']) }
+
+      after(:each) do
+        $invisible = false
+        $hidden = false
+      end
+
+      it 'skips DISSECT with no knife swap and no UNHIDE while invisible' do
+        $invisible = true
+
+        expect(dissecting.dissected?('hog', game_state)).to be(false)
+        expect(DRC).not_to have_received(:bput).with(/\Adissect|\Aunhide/, any_args)
+        expect(DRCI).not_to have_received(:get_item?)
+        expect(equipment_manager).not_to have_received(:stow_weapon)
+        expect(dissecting.instance_variable_get(:@dissect)).to be(true)
+      end
+
+      it 'skips DISSECT while hidden and says so once per run' do
+        $hidden = true
+        2.times { dissecting.dissected?('hog', game_state) }
+
+        expect(DRC).to have_received(:message).with(/DISSECT is refused while concealed/).once
+      end
+
+      it 'knows the refusal, returns the knife and counts it as neither unanswered nor barren' do
+        allow(DRC).to receive(:bput).with('dissect hog', any_args).and_return('hard to accomplish while concealed')
+
+        3.times { expect(dissecting.dissected?('hog', game_state)).to be(false) }
+
+        expect(DRCI).to have_received(:put_away_item?).with('skinning knife', 'backpack').exactly(3).times
+        expect(dissecting.instance_variable_get(:@dissect)).to be(true)
+        expect(dissecting.instance_variable_get(:@dissect_unanswered)).to eq(0)
+        expect(dissecting.instance_variable_get(:@dissect_barren)).to be_nil
+      end
+    end
+
     context 'after a skinning knife custody failure' do
       it 'sends no ARRANGE or LOOT for the rest of the pass' do
         instance = build_harvester(dissect: true, dissect_cycle_skills: ['First Aid', 'Skinning'])
@@ -2155,6 +2460,251 @@ RSpec.describe LootProcess do
 
       it('does not tie') { expect(DRC).not_to have_received(:bput).with('tie my bundle', anything, anything) }
     end
+  end
+end
+
+# ===================================================================
+# CombatTrainerOwnKills -- who killed each corpse (drbot_own_kill_harvest)
+# Fragments are verbatim server lines from runtime bundles
+# vrakk-cv3-aa6bf1f5 and thargrund-cv3-aa6bf1f5 (room 1473, 2026-09-28) and
+# the 2026-09-26 Lanjefast archive; unrelated vitals/exp lines are omitted
+# and trailing padding is trimmed.
+# ===================================================================
+RSpec.describe CombatTrainerOwnKills do
+  def tracker(me, pcs: [])
+    @pcs = pcs
+    described_class.new(%w[Vrakk Thargrund Lanjefast], clock: -> { 1_790_618_339.0 }, pcs: -> { @pcs }, self_name: -> { me })
+  end
+
+  def feed(tracker, text)
+    text.each_line { |line| expect(tracker.feed(line.chomp)).to eq(line.chomp) }
+  end
+
+  before(:each) do
+    allow(DownstreamHook).to receive(:list).and_return([described_class::HOOK])
+  end
+
+  # 17:58:59, #3240264: Vrakk's punch kills a goblin engaged with both of them.
+  let(:vrakk_kill_vrakk_view) do
+    <<~'RAW'
+      <crtrStatus exist="3240317" hostile="1" disengaged="1"/><crtrStatus exist="3240264" hostile="1"/><crtrStatus exist="3240377" hostile="1"/><crtrStatus exist="3240463" hostile="1" disengaged="1"/><crtrStatus exist="3240504" hostile="1" disengaged="1"/><prompt time="1790618331">&gt;</prompt>
+      <roundTime value='1790618341'/><component id='exp Brawling'><preset id='whisper'>        Brawling:   41 28% dabbling     </preset></component>
+      <pushStream id="combat" />&lt; With the precision and elegance of a plunging goshawk, you punch your plate-clad fist at a spotted forager goblin.  A spotted forager goblin barely fails to block with a mace.  <pushBold/>The fist lands an awesome strike that slams the sternum into the heart with a sickening *Crack!*.<popBold/>
+      A spotted forager goblin collapses to the ground, shuddering and moaning until it ceases all movement.
+      [You're nimbly balanced]
+      [Roundtime 2 sec.]
+      <popStream id="combat" /><component id='room objs'>You also see <pushBold/>a tall forager goblin<popBold/>, <pushBold/>a spotted forager goblin<popBold/> which appears dead, a broadsword, <pushBold/>a hostile forager goblin<popBold/>, <pushBold/>a beady-eyed forager goblin<popBold/>, <pushBold/>a drooling forager goblin<popBold/> and some junk.</component>
+      <crtrStatus exist="3240317" hostile="1" disengaged="1"/><crtrStatus exist="3240264" hostile="1" disengaged="1" dead="1" sleeping="1"/><crtrStatus exist="3240377" hostile="1"/><crtrStatus exist="3240463" hostile="1" disengaged="1"/><crtrStatus exist="3240504" hostile="1"/><prompt time="1790618339">&gt;</prompt>
+    RAW
+  end
+
+  let(:vrakk_kill_thargrund_view) do
+    <<~'RAW'
+      <crtrStatus exist="3240317" hostile="1"/><crtrStatus exist="3240264" hostile="1"/><crtrStatus exist="3240377" hostile="1" disengaged="1"/><crtrStatus exist="3240463" hostile="1"/><crtrStatus exist="3240504" hostile="1" disengaged="1"/><prompt time="1790618331">&gt;</prompt>
+      <pushStream id="combat" />With the precision and elegance of a plunging goshawk, Vrakk punches his plate-clad fist at a spotted forager goblin.  A spotted forager goblin barely fails to block with a mace.  The fist lands an awesome strike that slams the sternum into the heart with a sickening *Crack!*!
+      A spotted forager goblin collapses to the ground, shuddering and moaning until it ceases all movement.
+      <popStream id="combat" /><component id='room objs'>You also see <pushBold/>a tall forager goblin<popBold/>, <pushBold/>a spotted forager goblin<popBold/> which appears dead, a broadsword, <pushBold/>a hostile forager goblin<popBold/>, <pushBold/>a beady-eyed forager goblin<popBold/>, <pushBold/>a drooling forager goblin<popBold/> and some junk.</component>
+      <crtrStatus exist="3240317" hostile="1"/><crtrStatus exist="3240264" hostile="1" disengaged="1" dead="1" sleeping="1"/><crtrStatus exist="3240377" hostile="1" disengaged="1"/><crtrStatus exist="3240463" hostile="1"/><crtrStatus exist="3240504" hostile="1" disengaged="1"/><prompt time="1790618339">&gt;</prompt>
+    RAW
+  end
+
+  # 17:59:56, #3240317: Thargrund's rush kills a goblin disengaged from Vrakk.
+  let(:thargrund_rush_thargrund_view) do
+    <<~'RAW'
+      <crtrStatus exist="3240317" hostile="1"/><crtrStatus exist="3240377" hostile="1" disengaged="1"/><crtrStatus exist="3240463" hostile="1"/><crtrStatus exist="3240504" hostile="1" disengaged="1"/><crtrStatus exist="3240560" hostile="1" disengaged="1"/><crtrStatus exist="3240518" hostile="1" disengaged="1"/><prompt time="1790618395">&gt;</prompt>
+      You angle your tower shield towards a tall forager goblin and charge forwards!
+
+      Your tower shield lands<pushBold/> an extremely heavy hit<popBold/> to a tall forager goblin's left arm!
+      A tall forager goblin collapses to the ground, shuddering and moaning until it ceases all movement.
+      With expert skill you end the attack and maneuver into a better position.
+
+      [You're nimbly balanced]
+      Roundtime: 9 sec.
+      <component id='room objs'>You also see <pushBold/>a tall forager goblin<popBold/> which appears dead, a broadsword, <pushBold/>a hostile forager goblin<popBold/>, <pushBold/>a beady-eyed forager goblin<popBold/>, <pushBold/>a drooling forager goblin<popBold/>, <pushBold/>a drooling forager goblin<popBold/>, <pushBold/>a large musk hog<popBold/> and some junk.</component>
+      <crtrStatus exist="3240317" hostile="1" disengaged="1" dead="1" sleeping="1"/><crtrStatus exist="3240377" hostile="1" disengaged="1"/><crtrStatus exist="3240463" hostile="1"/><crtrStatus exist="3240504" hostile="1" disengaged="1"/><crtrStatus exist="3240560" hostile="1" disengaged="1"/><crtrStatus exist="3240518" hostile="1" disengaged="1"/><prompt time="1790618396">&gt;</prompt>
+    RAW
+  end
+
+  let(:thargrund_rush_vrakk_view) do
+    <<~'RAW'
+      <crtrStatus exist="3240317" hostile="1" disengaged="1"/><crtrStatus exist="3240377" hostile="1"/><crtrStatus exist="3240463" hostile="1" disengaged="1"/><crtrStatus exist="3240504" hostile="1"/><crtrStatus exist="3240560" hostile="1"/><crtrStatus exist="3240518" hostile="1" disengaged="1"/><prompt time="1790618395">&gt;</prompt>
+      Thargrund angles his tower shield at a tall forager goblin and charges forwards!
+
+      Thargrund's tower shield lands an extremely heavy hit to a tall forager goblin's left arm!
+      A tall forager goblin collapses to the ground, shuddering and moaning until it ceases all movement.
+      <component id='room objs'>You also see <pushBold/>a tall forager goblin<popBold/> which appears dead, a broadsword, <pushBold/>a hostile forager goblin<popBold/>, <pushBold/>a beady-eyed forager goblin<popBold/>, <pushBold/>a drooling forager goblin<popBold/>, <pushBold/>a drooling forager goblin<popBold/>, <pushBold/>a large musk hog<popBold/> and some junk.</component>
+      <crtrStatus exist="3240317" hostile="1" disengaged="1" dead="1" sleeping="1"/><crtrStatus exist="3240377" hostile="1"/><crtrStatus exist="3240463" hostile="1" disengaged="1"/><crtrStatus exist="3240504" hostile="1"/><crtrStatus exist="3240560" hostile="1"/><crtrStatus exist="3240518" hostile="1" disengaged="1"/><prompt time="1790618396">&gt;</prompt>
+    RAW
+  end
+
+  it 'attributes one kill to the killer in both hunters\' streams, though both were engaged' do
+    vrakk = tracker('Vrakk', pcs: ['Thargrund'])
+    feed(vrakk, vrakk_kill_vrakk_view)
+    thargrund = tracker('Thargrund', pcs: ['Vrakk'])
+    feed(thargrund, vrakk_kill_thargrund_view)
+
+    expect(vrakk.record('3240264')).to include(kind: :own, engaged: true)
+    expect(thargrund.record('3240264')).to include(kind: :peer, peer: 'Vrakk', engaged: true)
+    expect(vrakk.harvestable?('3240264')).to be(true)
+    expect(thargrund.harvestable?('3240264')).to be(false)
+  end
+
+  it 'attributes a rush through its landing line, with and without the combat stream' do
+    thargrund = tracker('Thargrund', pcs: ['Vrakk'])
+    feed(thargrund, thargrund_rush_thargrund_view)
+    vrakk = tracker('Vrakk', pcs: ['Thargrund'])
+    feed(vrakk, thargrund_rush_vrakk_view)
+
+    expect(thargrund.harvestable?('3240317')).to be(true)
+    expect(vrakk.record('3240317')).to include(kind: :peer, peer: 'Thargrund')
+    expect(vrakk.harvestable?('3240317')).to be(false)
+  end
+
+  it 'attributes a thrown kill through "lands at your feet" (17:44:36, #3238760)' do
+    vrakk = tracker('Vrakk', pcs: ['Thargrund'])
+    feed(vrakk, <<~'RAW')
+      <crtrStatus exist="3238760" hostile="1" prone="1"/><crtrStatus exist="3238812" hostile="1" disengaged="1"/><prompt time="1790617475">&gt;</prompt>
+      <pushBold/><popBold/><pushBold/><popBold/><pushStream id="combat" />&lt; Moving with dominating grace, you lob a double-bit greataxe at a forager goblin.  A forager goblin fails to dodge, taking the full blow.  <pushBold/>The greataxe lands a spine-rattling strike that cuts deeply into the goblin's groin.<popBold/>
+      The double-bit greataxe lands at your feet!
+      A forager goblin shudders and then suddenly stops all movement.
+      [You're nimbly balanced]
+      [Roundtime 3 sec.]
+      <popStream id="combat" /><component id='room objs'>You also see <pushBold/>a forager goblin<popBold/> which appears dead and some junk.</component>
+      <crtrStatus exist="3238760" hostile="1" disengaged="1" dead="1" sleeping="1" prone="1"/><crtrStatus exist="3238812" hostile="1" disengaged="1"/><prompt time="1790617476">&gt;</prompt>
+    RAW
+
+    expect(vrakk.record('3238760')).to include(kind: :own)
+  end
+
+  it 'attributes a combination finish (17:51:09, #3239476)' do
+    vrakk = tracker('Vrakk', pcs: ['Thargrund'])
+    feed(vrakk, <<~'RAW')
+      <crtrStatus exist="3239476" hostile="1" stunned="1" prone="1"/><crtrStatus exist="3239484" hostile="1"/><prompt time="1790617869">&gt;</prompt>
+      <pushStream id="combat" />&lt; Moving with amazing force and guile, you slap your plate-clad hand at a dour forager goblin.  A dour forager goblin barely fails to parry with a broadsword.  <pushBold/>The hand lands a very heavy hit that bruises the left forearm.<popBold/>
+      Utilizing flawless combat expertise you execute an aggressive attack combination and fan the flames of your internal fire.
+      A dour forager goblin shudders and then suddenly stops all movement.
+      [You're slightly off balance]
+      [Roundtime 2 sec.]
+      <popStream id="combat" /><crtrStatus exist="3239476" hostile="1" disengaged="1" dead="1" sleeping="1" prone="1"/><crtrStatus exist="3239484" hostile="1"/><prompt time="1790617869">&gt;</prompt>
+    RAW
+    thargrund = tracker('Thargrund', pcs: ['Vrakk'])
+    feed(thargrund, <<~'RAW')
+      <crtrStatus exist="3239476" hostile="1"/><prompt time="1790617869">&gt;</prompt>
+      <pushStream id="combat" />Utilizing flawless combat expertise Vrakk executes an aggressive attack combination.
+      A dour forager goblin shudders and then suddenly stops all movement.
+      <popStream id="combat" /><crtrStatus exist="3239476" hostile="1" disengaged="1" dead="1" sleeping="1" prone="1"/><prompt time="1790617869">&gt;</prompt>
+    RAW
+
+    expect(vrakk.record('3239476')).to include(kind: :own)
+    expect(thargrund.record('3239476')).to include(kind: :peer, peer: 'Vrakk')
+  end
+
+  # Lanjefast 2026-09-26 02:07:52, lout #2840088: a bolt 60 seconds earlier,
+  # then the death line alone in its chunk. No one else attacked it.
+  let(:bleed_out) do
+    <<~'RAW'
+      <crtrStatus exist="2840076" hostile="1"/><crtrStatus exist="2840088" hostile="1"/><crtrStatus exist="2840091" hostile="1"/><prompt time="1790388467">&gt;</prompt>
+      You move into position to stalk a sleazy lout when it moves.
+      Roundtime: 5 sec.
+      <prompt time="1790388472">&gt;</prompt>
+      Gasping out in terror, a sleazy lout crumples to the ground.  Eyes closing, the once rebellious flame dies out completely.
+      <component id='room objs'>You also see <pushBold/>a sleazy lout<popBold/>, <pushBold/>a sleazy lout<popBold/> which appears dead, <pushBold/>a sleazy lout<popBold/> and some junk.</component>
+      <crtrStatus exist="2840076" hostile="1"/><crtrStatus exist="2840088" hostile="1" disengaged="1" dead="1" sleeping="1"/><crtrStatus exist="2840091" hostile="1"/><prompt time="1790388472">&gt;</prompt>
+    RAW
+  end
+
+  it 'harvests a lone hunter\'s bleed-out of a creature engaged with it' do
+    lanjefast = tracker('Lanjefast')
+    feed(lanjefast, bleed_out)
+
+    expect(lanjefast.record('2840088')).to include(kind: :none, alone: true, engaged: true)
+    expect(lanjefast.harvestable?('2840088')).to be(true)
+  end
+
+  it 'leaves a bleed-out when another player was in the room' do
+    lanjefast = tracker('Lanjefast', pcs: ['Thargrund'])
+    feed(lanjefast, bleed_out)
+
+    expect(lanjefast.harvestable?('2840088')).to be(false)
+  end
+
+  it 'leaves a bleed-out of a creature that was not engaged with this hunter' do
+    lanjefast = tracker('Lanjefast')
+    feed(lanjefast, bleed_out.sub('<crtrStatus exist="2840088" hostile="1"/>', '<crtrStatus exist="2840088" hostile="1" disengaged="1"/>'))
+
+    expect(lanjefast.harvestable?('2840088')).to be(false)
+  end
+
+  it 'never harvests a corpse this visit did not see alive (Vrakk returning to room 1473, 17:34:01)' do
+    # Seen alive at 17:30:20; he walked to town and back; the next creature
+    # update listed Thargrund's hog kill as dead with no death line, beside
+    # Thargrund's punch at another hog.
+    vrakk = tracker('Vrakk', pcs: ['Thargrund'])
+    feed(vrakk, <<~'RAW')
+      <crtrStatus exist="3237765" hostile="1" disengaged="1"/><crtrStatus exist="3237810" hostile="1" disengaged="1"/><crtrStatus exist="3237855" hostile="1" disengaged="1"/><prompt time="1790616620">&gt;</prompt>
+      <nav rm='227205'/>
+      <prompt time="1790616838">&gt;</prompt>
+      <pushStream id="combat" />Moving with dominating grace, Thargrund punches his plate-clad fist at a large musk hog.  A large musk hog attempts to evade, moving directly into the blow.
+      <popStream id="combat" /><component id='room objs'>You also see <pushBold/>a large musk hog<popBold/> which appears dead, <pushBold/>a large musk hog<popBold/> that appears stunned.</component>
+      <crtrStatus exist="3237810" hostile="1" disengaged="1" dead="1" sleeping="1"/><crtrStatus exist="3237855" hostile="1" disengaged="1" stunned="1"/><prompt time="1790616841">&gt;</prompt>
+    RAW
+
+    expect(vrakk.record('3237810')).to include(kind: :foreign)
+    expect(vrakk.harvestable?('3237810')).to be(false)
+  end
+
+  it 'claims a two-kill chunk only when every death line is its own' do
+    vrakk = tracker('Vrakk', pcs: ['Thargrund'])
+    feed(vrakk, <<~'RAW')
+      <crtrStatus exist="1" hostile="1"/><crtrStatus exist="2" hostile="1"/><prompt time="1">&gt;</prompt>
+      <pushStream id="combat" />&lt; You cleave a forager goblin.
+      A forager goblin collapses to the ground, shuddering and moaning until it ceases all movement.
+      Thargrund lobs a narrow-headed spear at a forager goblin.
+      A forager goblin shudders and then suddenly stops all movement.
+      <popStream id="combat" /><crtrStatus exist="1" dead="1"/><crtrStatus exist="2" dead="1"/><prompt time="2">&gt;</prompt>
+    RAW
+
+    expect(vrakk.record('1')).to include(kind: :none)
+    expect(vrakk.harvestable?('1')).to be(false)
+    expect(vrakk.harvestable?('2')).to be(false)
+  end
+
+  it 'records each death once and ignores the corpse in later updates' do
+    vrakk = tracker('Vrakk', pcs: ['Thargrund'])
+    feed(vrakk, vrakk_kill_vrakk_view)
+    feed(vrakk, thargrund_rush_vrakk_view)
+
+    expect(vrakk.record('3240264')).to include(kind: :own)
+  end
+
+  it 'never raises out of the hook, returns every line, and fails closed after an error' do
+    broken = described_class.new(%w[Thargrund], pcs: -> { raise 'room unavailable' }, self_name: -> { 'Vrakk' })
+    vrakk_kill_vrakk_view.each_line { |line| expect(broken.feed(line.chomp)).to eq(line.chomp) }
+
+    expect(broken.errors).to eq(1)
+    expect(broken.tracking?).to be(false)
+    expect(broken.harvestable?('3240264')).to be(false)
+  end
+
+  it 'is not tracking once its hook is gone' do
+    vrakk = tracker('Vrakk')
+    feed(vrakk, vrakk_kill_vrakk_view)
+    allow(DownstreamHook).to receive(:list).and_return([])
+
+    expect(vrakk.harvestable?('3240264')).to be(false)
+  end
+
+  it 'installs one observing, script-scoped downstream hook' do
+    added = []
+    allow(DownstreamHook).to receive(:remove)
+    allow(DownstreamHook).to receive(:add) { |name, action, **options| added << [name, action, options] }
+
+    installed = described_class.install(%w[Vrakk Thargrund])
+
+    expect(added.map(&:first)).to eq([described_class::HOOK])
+    expect(added.first[2]).to eq(persist: false)
+    expect(added.first[1].call('text')).to eq('text')
+    expect(installed).to be_a(described_class)
   end
 end
 

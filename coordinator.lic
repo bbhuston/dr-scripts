@@ -186,10 +186,16 @@ class Coordinator
   # just the current hunt. Neither condition is a hunting-task predicate: a
   # town walk with a bleeder or at the health floor is the dangerous part.
   #
-  # Bleeding latches. One tend attempt is made and then the schedule holds
-  # until an operator stops the script: a stopped bleeder is not evidence that
-  # re-entering the same activity is safe, and a character has bled out after
-  # a completed extraction.
+  # Bleeding latches, and acts before it holds. A profile naming a reviewed
+  # recovery child (drbot_bleeding_recovery) runs it at once, at most
+  # BLEEDING_RECOVERY_ATTEMPTS times per latch; the coordinator itself never
+  # moves. Only the child's published verified result, together with the
+  # bleeding indicator observed clear and the character observed in the
+  # configured safe room, clears the latch and lets the schedule resume.
+  # Anything else holds until an operator stops the script: a stopped bleeder
+  # is not evidence that re-entering the same activity is safe, and a
+  # character has bled out after a completed extraction. Without the setting
+  # the single upstream tend attempt remains.
   #
   # The health floor does not latch. Resting in place is how it recovers, and
   # the hold is exactly that, so the schedule resumes on its own once health
@@ -214,10 +220,16 @@ class Coordinator
     nil
   end
 
+  BLEEDING_RECOVERY_ATTEMPTS = 2
+
   def hold_schedule(reason)
-    if @bleeding_hold && !@tend_attempted
-      @tend_attempted = true
-      wait_for_child('tendme') if DRCH.has_tendable_bleeders?
+    if @bleeding_hold
+      # A task or weapon custody hold outranks the latch (schedule_hold_reason
+      # returns it first) and must be settled before any child moves.
+      latched = reason == @bleeding_hold
+      return if recover_from_bleeding(latched)
+
+      reason = @bleeding_hold if latched
     end
     # The echo lands in this character's Lich transcript, which an operator
     # reads through the console; it is not parsed by the daemon. The UserVars
@@ -228,6 +240,49 @@ class Coordinator
     UserVars.coordinator_safety_hold ||= { 'reason' => reason, 'since' => Time.now.to_f }
     echo("***COORDINATOR HOLD*** #{reason}")
     pause 60
+  end
+
+  # Vrakk 2026-09-28: a held bleeding schedule only waited, and he bled from
+  # 18:43 until a guardian extraction at 19:26. The recovery child (a
+  # repo-reviewed script named by the profile) acts: it tends or walks to a
+  # healer and back, and publishes its result on its Script instance the way
+  # a box handoff child does. A retry runs only when that result says a fresh
+  # observation found the character still bleeding, never to replay an
+  # unconfirmed step.
+  def recover_from_bleeding(latched)
+    script = @settings.drbot_bleeding_recovery
+    unless script.is_a?(String) && !script.empty?
+      unless @tend_attempted
+        @tend_attempted = true
+        wait_for_child('tendme') if DRCH.has_tendable_bleeders?
+      end
+      return false
+    end
+    return false unless latched
+
+    @bleeding_recovery_attempts = @bleeding_recovery_attempts.to_i
+    return false if @bleeding_recovery_attempts >= BLEEDING_RECOVERY_ATTEMPTS
+    return false if @bleeding_recovery_attempts.positive? && !@bleeding_recovery_retryable
+
+    @bleeding_recovery_attempts += 1
+    echo("***STATUS*** Bleeding recovery #{@bleeding_recovery_attempts}/#{BLEEDING_RECOVERY_ATTEMPTS}: #{script}")
+    child = wait_for_child(script, [@settings.safe_room.to_s])
+    result = child.respond_to?(:drbot_bleeding_recovery_result) ? child.drbot_bleeding_recovery_result : nil
+    if result.is_a?(Hash) && result['status'] == 'stopped' && result['room'] == @settings.safe_room &&
+       !bleeding? && Room.current && Room.current.id == @settings.safe_room
+      echo("***STATUS*** Bleeding recovery verified (#{result['method']}); schedule hold cleared")
+      @bleeding_hold = nil
+      @tend_attempted = false
+      @bleeding_recovery_attempts = 0
+      @bleeding_recovery_retryable = false
+      UserVars.coordinator_safety_hold = nil
+      return true
+    end
+    @bleeding_recovery_retryable = result.is_a?(Hash) && result['retryable'] == true
+    detail = result.is_a?(Hash) ? "#{result['status']}: #{result['reason'].to_s[0, 160]}" : 'result unconfirmed'
+    @bleeding_hold = "bleeding observed; recovery #{detail}; operator recovery required"
+    UserVars.coordinator_safety_hold = { 'reason' => @bleeding_hold, 'since' => Time.now.to_f }
+    false
   end
 
   def get_next_task

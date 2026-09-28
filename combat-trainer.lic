@@ -585,6 +585,11 @@ class LootProcess
     @dissect_retry_once = skinning['dissect_retry_once'] || false
     echo("  @dissect_retry_once: #{@dissect_retry_once}") if $debug_mode_ct
 
+    # Successful DISSECTs in a row without a First Aid gain before dissecting
+    # stops for the run (see note_dissect_learning).
+    @dissect_barren_limit = skinning['dissect_barren_limit']
+    echo("  @dissect_barren_limit: #{@dissect_barren_limit}") if $debug_mode_ct
+
     @dissect_cycle_skills = []
     @dissect_cycle_skills.append("Thanatology") if @dissect_for_thanatology
     @dissect_cycle_skills.append("First Aid") if @dissect
@@ -1357,8 +1362,15 @@ class LootProcess
       return !!(corpse && corpse.noun.to_s.casecmp?(mob_noun.split.last))
     end
     searched = @searched_corpse_ids || {}
+    own = @drbot_own_kill_state
+    if own
+      # Only this character's own kill, and the one the pass chose first.
+      preferred, others = corpses.partition { |entry| entry.id.to_s == @own_kill_candidate_id }
+      corpses = preferred + others
+    end
     corpse = corpses.find do |entry|
-      !entry.name.to_s.empty? && entry.noun.to_s.casecmp?(mob_noun.split.last) && !searched.key?(entry.id.to_s)
+      !entry.name.to_s.empty? && entry.noun.to_s.casecmp?(mob_noun.split.last) && !searched.key?(entry.id.to_s) &&
+        (own.nil? || own.drbot_own_kill_harvestable?(entry.id.to_s))
     end
     return false unless corpse
 
@@ -1379,6 +1391,7 @@ class LootProcess
 
   def harvest_corpse_present?(mob_noun, game_state)
     @drbot_harvest_ids = game_state.respond_to?(:drbot_corpse_ids?) && game_state.drbot_corpse_ids?
+    @drbot_own_kill_state = @drbot_harvest_ids && own_kills_only?(game_state) ? game_state : nil
     return false if mob_noun.nil? || mob_noun.empty?
 
     waitrt?
@@ -1391,9 +1404,10 @@ class LootProcess
     # defer the harvest (operator direction 2026-09-25): loot, skin and
     # dissect each kill immediately, before moving to the next enemy.
     result = DRC.bput('look', /^Obvious (?:paths|exits):/, /You can't see anything/, /It's pitch dark/)
-    ready = result.to_s.match?(/^Obvious (?:paths|exits):/) &&
-      DRRoom.npcs.is_a?(Array) && harvest_corpse_identity?(mob_noun)
-    ready &&= !harvest_peer_busy?
+    looked = result.to_s.match?(/^Obvious (?:paths|exits):/) && DRRoom.npcs.is_a?(Array)
+    identified = looked && harvest_corpse_identity?(mob_noun)
+    note_own_kill_miss if looked && !identified
+    ready = identified && !harvest_peer_busy?
     unless ready
       @drbot_harvest_deferred = true
       @drbot_harvest_retry_at = Time.now + 2
@@ -1451,6 +1465,7 @@ class LootProcess
   def harvest_corpse_candidate(game_state)
     names = Array(DRRoom.dead_npcs)
     return names.first unless game_state.respond_to?(:drbot_corpse_ids?) && game_state.drbot_corpse_ids?
+    return own_kill_candidate(game_state) if own_kills_only?(game_state)
 
     counts = dead_corpse_counts
     searched = @searched_corpses || {}
@@ -1458,6 +1473,74 @@ class LootProcess
       !(searched[noun] && counts[noun] <= searched[noun][:count])
     end
     fresh || names.first
+  end
+
+  def own_kills_only?(game_state)
+    game_state.respond_to?(:drbot_own_kills_only?) && game_state.drbot_own_kills_only?
+  end
+
+  # drbot_own_kill_harvest: a pass names only a corpse of this character's own
+  # kill (see CombatTrainerOwnKills), oldest first, and every other corpse is
+  # left to decay. The noun comes from the corpse's own registry entry, so a
+  # lingering searched goblin cannot set the arrange type for a fresh hog
+  # (Vrakk 2026-09-28 17:47:57). nil sends nothing, not even a LOOK.
+  def own_kill_candidate(game_state)
+    unless game_state.drbot_own_kill_tracking?
+      unless @own_kill_tracking_lost
+        @own_kill_tracking_lost = true
+        DRC.message('*** combat-trainer: own-kill tracking is unavailable; leaving every corpse for the rest of this run.')
+      end
+      return nil
+    end
+
+    searched = @searched_corpse_ids || {}
+    @own_kill_misses ||= {}
+    own = Lich::DragonRealms::Creature.in_room.select do |corpse|
+      id = corpse.id.to_s
+      next false unless id.match?(/\A[1-9]\d*\z/) && corpse.crtr_flag?(:dead) && !searched.key?(id)
+
+      harvestable = game_state.drbot_own_kill_harvestable?(id)
+      note_left_corpse(id, corpse, game_state.drbot_own_kill(id)) unless harvestable
+      harvestable && !corpse.name.to_s.empty? && @own_kill_misses[id].to_i < 3
+    end
+    corpse = own.min_by { |entry| game_state.drbot_own_kill(entry.id.to_s)&.fetch(:at, nil).to_f }
+    @own_kill_candidate_id = corpse&.id&.to_s
+    corpse&.noun&.to_s&.downcase
+  rescue StandardError
+    @own_kill_candidate_id = nil
+    nil
+  end
+
+  # One line per corpse left for someone else, once its death was recorded.
+  def note_left_corpse(id, corpse, record)
+    return unless record
+
+    @own_kill_left ||= {}
+    return if @own_kill_left.key?(id)
+
+    @own_kill_left.shift while @own_kill_left.length >= 200
+    @own_kill_left[id] = true
+    reason = case record[:kind]
+             when :peer then "#{record[:peer]}'s kill"
+             when :none then record[:alone] ? 'killer not seen and it was not engaged with me' : 'killer not seen with another player here'
+             else 'not seen killed in this visit'
+             end
+    DRC.message("*** combat-trainer: leaving ##{id} #{corpse.noun} (#{reason}).")
+  end
+
+  # A LOOK whose corpse identity does not confirm is retried two seconds
+  # later. Three misses for one own corpse stop the retries for it.
+  def note_own_kill_miss
+    return unless @drbot_own_kill_state
+
+    id = @drbot_harvest_corpse ? @drbot_harvest_corpse[:id] : @own_kill_candidate_id
+    return unless id
+
+    @own_kill_misses ||= {}
+    @own_kill_misses[id] = @own_kill_misses[id].to_i + 1
+    return unless @own_kill_misses[id] == 3
+
+    DRC.message("*** combat-trainer: leaving ##{id} (its corpse ID did not confirm 3 times).")
   end
 
   # True when every listed corpse is one this hunt searched. While any listed
@@ -1561,7 +1644,16 @@ class LootProcess
     if @dissect_for_thanatology
       return false if (DRSkill.getxp('Thanatology') == 34 && DRSkill.getxp('First Aid') == 34)
     else
-      return false if DRSkill.getxp('First Aid') == 34
+      return false if first_aid_locked?
+    end
+
+    # "That's going to be hard to accomplish while concealed." (Lanjefast
+    # 2026-09-28, six times under Khri Silence, each a 15 second stall):
+    # DISSECT is refused while invisible or hidden. Skip it for this corpse,
+    # with no knife swap and no UNHIDE; the corpse keeps its other steps.
+    if checkinvisible || checkhidden
+      note_concealed_dissect
+      return false
     end
 
     # DISSECT, like SKIN, needs a small bladed weapon in hand; a sword or axe
@@ -1595,6 +1687,7 @@ class LootProcess
 
     # Judged from the LOOK just taken: a corpse can decay during the knife swap.
     sole_corpse = Array(DRRoom.dead_npcs).length == 1
+    first_aid_before = DRSkill.getxp('First Aid')
     result = DRC.bput("dissect #{target}",
                       /You'll gain no insights from this attempt/,
                       /You succeed in dissecting the corpse/,
@@ -1616,7 +1709,8 @@ class LootProcess
                       'Rituals do not work upon constructs',
                       /Your .+ isn't suitable for this type of delicate work/,
                       /(?:You cannot do the delicate work necessary because you )?lack a suitably small, bladed weapon/,
-                      'You need at least one free hand')
+                      'You need at least one free hand',
+                      'hard to accomplish while concealed')
     if result =~ /You'll gain no insights from this attempt/
       waitrt?
       if harvest_corpse_present?(mob_noun, game_state)
@@ -1641,8 +1735,13 @@ class LootProcess
 
     case result
     when /You succeed in dissecting the corpse/, /You learn something/i, "With less concern than you'd give a fresh corpse"
+      note_dissect_learning(first_aid_before) unless @dissect_for_thanatology
       return true
     when /You'll gain no insights from this attempt/
+      return false
+    when /hard to accomplish while concealed/
+      # Not performed: concealment began after the check above.
+      note_concealed_dissect
       return false
     when "You'll learn nothing"
       # "You'll learn nothing further of value from the musk hog's mutilated
@@ -1859,6 +1958,49 @@ class LootProcess
     return disable_dissect('DISSECT needs a small bladed weapon and no skinning knife is configured (skinning: knife)') unless @skinning_knife
 
     prepare_skinning_knife(game_state, :dissect)
+  end
+
+  # A mind-locked First Aid learns nothing from DISSECT; the corpse keeps its
+  # arrange and skin. Said once per lock.
+  def first_aid_locked?
+    unless DRSkill.getxp('First Aid') == 34
+      @first_aid_lock_noted = false
+      return false
+    end
+    unless @first_aid_lock_noted
+      @first_aid_lock_noted = true
+      DRC.message('*** combat-trainer: First Aid is mind-locked; skipping DISSECT until it drains.')
+    end
+    true
+  end
+
+  # Vrakk and Thargrund at First Aid 41 learned nothing from goblin, hog or
+  # lout DISSECTs (none of 93 and 77 successes raised the mindstate), while
+  # Lanjefast at 32-33 learned from all 33 of his, the exp update arriving in
+  # the same packet as the success. A skill that stays clear keeps winning
+  # sort_by_rate_then_rank, so dissecting never ends on its own: after three
+  # successful DISSECTs in a row without a First Aid gain (skinning:
+  # dissect_barren_limit), stop for the run and take the arrange and SKIN
+  # path, which gives the configured bones or skins.
+  def note_dissect_learning(before)
+    if DRSkill.getxp('First Aid').to_i > before.to_i
+      @dissect_barren = 0
+      return
+    end
+
+    limit = @dissect_barren_limit.to_i
+    limit = 3 unless limit.positive?
+    @dissect_barren = @dissect_barren.to_i + 1
+    return if @dissect_barren < limit
+
+    disable_dissect("First Aid #{DRSkill.getrank('First Aid')} learned nothing from #{@dissect_barren} successful DISSECTs in a row")
+  end
+
+  def note_concealed_dissect
+    return if @dissect_concealed_noted
+
+    @dissect_concealed_noted = true
+    DRC.message('*** combat-trainer: DISSECT is refused while concealed; skipping it for corpses harvested while hidden or invisible.')
   end
 
   def disable_dissect(reason)
@@ -5646,6 +5788,231 @@ class CombatTrainer
   end
 end
 
+# Own-kill attribution for corpse harvesting (drbot_own_kill_harvest).
+#
+# Two hunters in one room otherwise ARRANGE, DISSECT, SKIN and LOOT each
+# other's kills: Vrakk searched 25 of Thargrund's kills in room 1473 on
+# 2026-09-28 17:33-18:10, and each lost race cost the other an "Arrange
+# what?" or "I could not find what you were referring to." The server marks
+# a creature dead with <crtrStatus exist="N" ... dead="1"/> in the same
+# prompt chunk as its death line ("A forager goblin collapses to the
+# ground, shuddering and moaning until it ceases all movement."), and the
+# line before that (skipping thrown-weapon, bolt and balance lines) is the
+# killing blow: "< ..., you gouge ..." for this character, "..., Thargrund
+# lobs ..." for another. Both hunters' raw logs for the same moments
+# agreed on every death both saw (60 in all), with no conflicting or double
+# claims. The engaged flag (disengaged absent) is per viewer and says who a
+# creature faces, not who killed it: 36 of those 60 were engaged with both.
+#
+# A kill with no attributable line (a bleed-out, an unrecognised message)
+# is harvested only when no other player was in the room when it died and
+# the creature was last seen engaged with this character. A corpse this
+# visit to the room never saw alive is never harvested: on returning to a
+# room the server can list a corpse killed meanwhile with the next
+# creature update and no death line (Vrakk, room 1473, 17:34:01). The feed
+# runs on Lich's game thread for every server line, never raises, and
+# always returns the line unchanged; any internal error stops harvesting
+# for the rest of the run instead of guessing.
+class CombatTrainerOwnKills
+  HOOK = 'combat-trainer-own-kills'
+  RECORD_TTL = 600
+  MAX_LINES = 120
+  MAX_LINE = 600
+  DEATH = [
+    /falls to the ground lifeless/,
+    /until it ceases all movement/,
+    /shudders and then suddenly stops all movement/,
+    /crumples to the ground/
+  ].freeze
+  # Lines between a killing blow and the death line.
+  CONTINUATION = /lodges itself|lands at (?:your|[A-Z][\w'-]*'s) feet|\A\[.*\]\z|\ARoundtime|\AWith expert skill|That would have stuck/
+  OWN_STRONG = [/\A<\s.*\byou\b/i, /\AYour .+ lands /, /lands at your feet/, /\AUtilizing .*\byou\b/i].freeze
+  OWN_MANEUVER = /\A(?:[^,.]*, )?[Yy]ou [a-z]+/
+  STATUS = %r{<crtrStatus ([^>]*)/>}
+  TOKEN = /<[^>]*>|[^<]+/
+  ENTITIES = { '&lt;' => '<', '&gt;' => '>', '&quot;' => '"', '&apos;' => "'", '&amp;' => '&' }.freeze
+
+  def self.install(members)
+    tracker = new(members)
+    DownstreamHook.remove(HOOK)
+    DownstreamHook.add(HOOK, proc { |raw| tracker.feed(raw) }, persist: false)
+    tracker
+  end
+
+  attr_reader :errors
+
+  def initialize(members = [], clock: -> { Time.now.to_f }, pcs: -> { DRRoom.pcs }, self_name: -> { XMLData.name })
+    @members = Array(members).map(&:to_s)
+    @clock = clock
+    @pcs = pcs
+    @self_name = self_name
+    @lock = Mutex.new
+    @records = {}
+    @status = {}
+    @lines = []
+    @stream = nil
+    @visit = 0
+    @errors = 0
+  end
+
+  # Lich's DownstreamHook callback: observe, never alter or drop the line.
+  def feed(raw)
+    process(raw.to_s.dup.force_encoding(Encoding::UTF_8).scrub('?')) unless @errors.positive?
+    raw
+  rescue StandardError
+    @errors += 1
+    @lines = []
+    raw
+  end
+
+  def tracking?
+    return false if @errors.positive?
+    return true unless defined?(DownstreamHook) && DownstreamHook.respond_to?(:list)
+
+    DownstreamHook.list.include?(HOOK)
+  rescue StandardError
+    false
+  end
+
+  def record(id)
+    @lock.synchronize { @records[id.to_s]&.dup }
+  end
+
+  def harvestable?(id)
+    rec = record(id)
+    return false unless rec && tracking?
+
+    case rec[:kind]
+    when :own then true
+    when :none then rec[:alone] && rec[:engaged]
+    else false
+    end
+  end
+
+  private
+
+  def process(raw)
+    text = +''
+    component = false
+    raw.scan(TOKEN) do |token|
+      if token.start_with?('<')
+        if (stream = token[/\A<pushStream id=["']([\w-]+)/, 1])
+          @stream = stream
+        elsif token.start_with?('<nav')
+          # Movement, not LOOK: a new visit to a room.
+          @visit += 1
+          @lines = []
+        elsif token.start_with?('<popStream')
+          @stream = nil
+        elsif token.start_with?('<component')
+          component = true
+        elsif token.start_with?('</component')
+          component = false
+        end
+      elsif !component && (@stream.nil? || @stream == 'combat')
+        text << token
+      end
+    end
+    line = text.gsub(/&(?:lt|gt|quot|apos|amp);/, ENTITIES).strip
+    unless line.empty?
+      @lines << line[0, MAX_LINE]
+      @lines.shift while @lines.length > MAX_LINES
+    end
+    observe(raw.scan(STATUS).map { |(attrs)| attrs.scan(/(\w+)="([^"]*)"/).to_h }) if raw.include?('<crtrStatus')
+    return unless raw.include?('<prompt')
+
+    @lines = []
+    @stream = nil
+  end
+
+  def observe(statuses)
+    now = @clock.call
+    fresh = []
+    foreign = []
+    @lock.synchronize do
+      statuses.each do |flags|
+        id = flags['exist'].to_s
+        next unless id.match?(/\A[1-9]\d*\z/)
+
+        if flags['dead'] == '1'
+          next if @records.key?(id) || fresh.include?(id) || foreign.include?(id)
+
+          (@status.dig(id, :visit) == @visit ? fresh : foreign) << id
+        else
+          @status[id] = { visit: @visit, engaged: flags['disengaged'] != '1', at: now }
+        end
+      end
+      @records.delete_if { |_id, rec| now - rec[:at] > RECORD_TTL }
+      @status.delete_if { |_id, seen| now - seen[:at] > RECORD_TTL }
+    end
+    return if fresh.empty? && foreign.empty?
+
+    others = Array(@pcs.call).map(&:to_s).reject(&:empty?)
+    names = (others + @members).uniq - [@self_name.call.to_s]
+    kind, peer, deaths = attribute(names)
+    alone = others.empty?
+    # More deaths than recognised death lines: the extra one may be anyone's.
+    if deaths.positive? && fresh.length > deaths
+      kind = :none
+      peer = nil
+    end
+    @lock.synchronize do
+      fresh.each do |id|
+        @records[id] = { kind: kind, peer: peer, alone: alone, engaged: @status.dig(id, :engaged) == true, at: now }
+      end
+      foreign.each do |id|
+        # A creature not seen alive this visit died here only when its death
+        # line is in this chunk and no creature seen alive claims it.
+        attributed = fresh.empty? && deaths >= foreign.length
+        @records[id] = { kind: attributed ? kind : :foreign, peer: attributed ? peer : nil,
+                         alone: alone, engaged: false, at: now }
+      end
+    end
+  end
+
+  # [kind, peer, recognised death lines]. Every death line must name the
+  # same killer; without one, every killing-blow-shaped line in the chunk
+  # must agree.
+  def attribute(names)
+    deaths = @lines.each_index.select { |i| death?(@lines[i]) }
+    verdicts = if deaths.empty?
+                 @lines.map { |line| classify(line, names, strong: true) }.reject { |verdict| verdict.first == :none }
+               else
+                 deaths.map { |i| walk_back(i, names) }
+               end
+    verdict = verdicts.uniq.length == 1 ? verdicts.first : [:none, nil]
+    [verdict[0], verdict[1], deaths.length]
+  end
+
+  def death?(line)
+    DEATH.any? { |pattern| pattern.match?(line) }
+  end
+
+  def walk_back(index, names)
+    (index - 1).downto(0) do |i|
+      line = @lines[i]
+      next if CONTINUATION.match?(line) || death?(line)
+
+      return classify(line, names)
+    end
+    [:none, nil]
+  end
+
+  def classify(line, names, strong: false)
+    return [:own, nil] if OWN_STRONG.any? { |pattern| pattern.match?(line) }
+    return [:own, nil] if !strong && OWN_MANEUVER.match?(line)
+
+    names.each do |name|
+      escaped = Regexp.escape(name)
+      next unless line.match?(/\A(?:[^,.]*, )?#{escaped}(?:'s)?\b/) || line.include?("lands at #{name}'s feet") ||
+                  line.match?(/\AUtilizing .*\b#{escaped}\b/)
+
+      return [:peer, name]
+    end
+    [:none, nil]
+  end
+end
+
 load File.join(File.dirname(File.realpath(defined?(Script) && Script.current ? Script.current.file_name : __FILE__)), 'combat-trainer-group-threats.rb')
 
 class GameState
@@ -5760,6 +6127,10 @@ class GameState
     if defined?(CombatTrainerGroupThreats)
       CombatTrainerGroupThreats.members = [XMLData.name.to_s] + Array(settings.hunting_buddies)
     end
+    # Harvest only this character's own kills, by corpse ID. An explicit opt-in
+    # beside server-ID targeting; lvt-goblins keeps its own corpse IDs.
+    @drbot_own_kill_harvest = settings.drbot_own_kill_harvest == true
+    @drbot_own_kills = CombatTrainerOwnKills.install([XMLData.name.to_s] + Array(settings.hunting_buddies)) if drbot_own_kills_only?
     @retreat_threshold = settings.retreat_threshold
     echo("  @retreat_threshold: #{@retreat_threshold}") if $debug_mode_ct
     @escape_unsafe_multi_enemy = settings.escape_unsafe_multi_enemy || false
@@ -6587,7 +6958,23 @@ class GameState
   # Individual creature identity does not depend on shared group attribution.
   # Roll out strict corpse IDs only where the live ID collector is exercised.
   def drbot_corpse_ids?
-    @drbot_supervised_group == 'lvt-goblins'
+    @drbot_supervised_group == 'lvt-goblins' || (@drbot_own_kill_harvest == true && @drbot_server_id_targeting == true)
+  end
+
+  def drbot_own_kills_only?
+    @drbot_own_kill_harvest == true && @drbot_server_id_targeting == true
+  end
+
+  def drbot_own_kill_tracking?
+    @drbot_own_kills.respond_to?(:tracking?) && @drbot_own_kills.tracking? ? true : false
+  end
+
+  def drbot_own_kill(id)
+    @drbot_own_kills.respond_to?(:record) ? @drbot_own_kills.record(id) : nil
+  end
+
+  def drbot_own_kill_harvestable?(id)
+    @drbot_own_kills.respond_to?(:harvestable?) && @drbot_own_kills.harvestable?(id) ? true : false
   end
 
   def drbot_target_context
@@ -8028,6 +8415,8 @@ before_dying do
   Flags.delete('ct-barbarian-whirlwind-expired')
   Flags.delete('war-stomp-ready')
   Flags.delete('pounce-ready')
+
+  DownstreamHook.remove(CombatTrainerOwnKills::HOOK)
 
   # Let plugins release any resources they acquired.
   CombatTrainer.notify_hook(:cleanup, $COMBAT_TRAINER)
