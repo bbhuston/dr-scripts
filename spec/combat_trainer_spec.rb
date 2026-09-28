@@ -1557,6 +1557,437 @@ RSpec.describe LootProcess do
     end
   end
 
+  describe 'corpse harvest passes' do
+    let(:equipment_manager) do
+      double('EquipmentManager', stow_weapon: true, wield_weapon?: true, is_listed_item?: false)
+    end
+    let(:game_state) do
+      state = gs_double(need_bundle: false, weapon_name: 'stout broadsword', weapon_skill: 'Large Edged',
+                        dissectable?: true, necro_casting?: false, blessed_room: false)
+      allow(state).to receive(:sheath_whirlwind_offhand)
+      allow(state).to receive(:wield_whirlwind_offhand)
+      allow(state).to receive(:unskinnable)
+      state
+    end
+
+    before(:each) do
+      allow(DRC).to receive(:message)
+      allow(DRC).to receive(:bput).and_return('Roundtime')
+      allow(DRCI).to receive(:dispose_trash)
+      allow(DRCI).to receive(:get_item?).with('skinning knife', 'backpack').and_return(true)
+      allow(DRCI).to receive(:put_away_item?).with('skinning knife', 'backpack').and_return(true)
+      DRRoom.dead_npcs = ['hog']
+      DRRoom.npcs = []
+    end
+
+    def build_harvester(**overrides)
+      instance = build_loot(
+        skin: true, dissect: false, dissect_for_thanatology: false,
+        dissect_cycle_skills: ['Skinning'], arrange_for_dissect: true,
+        arrange_all: false, arrange_count: 2, arrange_types: { 'hog' => 'bone' },
+        skinning_knife: 'skinning knife', skinning_knife_container: 'backpack',
+        equipment_manager: equipment_manager, loot_bodies: true, loot_delay: 0,
+        loot_timer: Time.now - 60, last_rites: false, last_rites_timer: Time.now,
+        custom_loot_type: nil, **overrides
+      )
+      allow(instance).to receive(:harvest_corpse_present?).and_return(true)
+      allow(instance).to receive(:harvest_peer_busy?).and_return(false)
+      allow(instance).to receive(:check_rituals?).and_return(true)
+      instance
+    end
+
+    # skin_or_dissect checks the corpse, and so binds its ID, before any step.
+    def bound_to(instance, id)
+      bind = lambda do
+        instance.instance_variable_set(:@drbot_harvest_ids, true)
+        instance.instance_variable_set(:@drbot_harvest_corpse, { room: [1, 7], noun: 'hog', id: id })
+      end
+      bind.call
+      allow(instance).to receive(:harvest_corpse_present?) do
+        bind.call
+        true
+      end
+    end
+
+    def arranges
+      commands = []
+      allow(DRC).to receive(:bput).with(/\Aarrange/, any_args) do |command, *|
+        commands << command
+        yield(command)
+      end
+      commands
+    end
+
+    context 'DISSECT with corpse IDs' do
+      it 'dissects the bound corpse by its server ID' do
+        instance = build_harvester(dissect: true, dissect_cycle_skills: ['First Aid', 'Skinning'])
+        bound_to(instance, '4242')
+        allow(DRC).to receive(:bput).with('dissect #4242', any_args).and_return('You succeed in dissecting the corpse')
+
+        expect(instance.dissected?('hog', game_state)).to be(true)
+        expect(DRC).not_to have_received(:bput).with('dissect hog', any_args)
+      end
+
+      it 'confirms a no-insights DISSECT on the same bound corpse' do
+        instance = build_harvester(dissect: true, dissect_cycle_skills: ['First Aid', 'Skinning'])
+        bound_to(instance, '4242')
+        allow(DRC).to receive(:bput).with('dissect #4242', any_args).and_return("You'll gain no insights from this attempt")
+        allow(instance).to receive(:fput)
+
+        expect(instance.dissected?('hog', game_state)).to be(false)
+        expect(instance).to have_received(:fput).with('dissect #4242')
+        expect(DRCI).to have_received(:put_away_item?).with('skinning knife', 'backpack')
+      end
+
+      it 'keeps DISSECT by noun and the bare confirmation without corpse IDs' do
+        instance = build_harvester(dissect: true, dissect_cycle_skills: ['First Aid', 'Skinning'])
+        allow(DRC).to receive(:bput).with('dissect hog', any_args).and_return("You'll gain no insights from this attempt")
+        allow(instance).to receive(:fput)
+
+        expect(instance.dissected?('hog', game_state)).to be(false)
+        expect(instance).to have_received(:fput).with('dissect')
+      end
+
+      it 'returns the knife and sends nothing when the bound ID is unusable' do
+        instance = build_harvester(dissect: true, dissect_cycle_skills: ['First Aid', 'Skinning'])
+        bound_to(instance, 'not-an-id')
+
+        expect(instance.dissected?('hog', game_state)).to be(false)
+        expect(DRC).not_to have_received(:bput).with(/\Adissect/, any_args)
+        expect(DRCI).to have_received(:put_away_item?).with('skinning knife', 'backpack')
+        expect(equipment_manager).to have_received(:wield_weapon?).with('stout broadsword', 'Large Edged')
+      end
+    end
+
+    context 'a creature that cannot produce the configured part' do
+      it 'goes straight to the plain arrange for the rest of the run' do
+        instance = build_harvester
+        sent = arranges { |command| command.include?('for bone') ? 'That creature cannot' : 'You begin to arrange' }
+
+        instance.arrange_mob('hog', game_state)
+        instance.arrange_mob('hog', game_state)
+
+        expect(sent).to eq(['arrange for bone', 'arrange ', 'arrange ', 'arrange ', 'arrange '])
+        expect(DRC).to have_received(:message).with(/hog cannot produce bone; arranging it without a part/).once
+      end
+
+      it 'keeps asking for the part when the noun has produced it this run' do
+        # One goblin type may give bone where another cannot; a noun that has
+        # accepted the part is never switched to the plain arrange.
+        instance = build_harvester
+        replies = ['You begin to arrange', 'You complete arranging',
+                   'That creature cannot', 'You begin to arrange', 'You complete arranging',
+                   'You begin to arrange', 'You complete arranging']
+        sent = arranges { |_command| replies.shift }
+
+        3.times { instance.arrange_mob('hog', game_state) }
+
+        expect(sent).to eq(['arrange for bone', 'arrange for bone',
+                            'arrange for bone', 'arrange ', 'arrange ',
+                            'arrange for bone', 'arrange for bone'])
+        expect(DRC).not_to have_received(:message)
+      end
+
+      it 'learns per noun and per part' do
+        instance = build_harvester(arrange_types: { 'hog' => 'bone', 'goblin' => 'bone' })
+        sent = arranges { |command| command == 'arrange for bone' && sent.length == 1 ? 'That creature cannot' : 'You complete arranging' }
+
+        instance.arrange_mob('hog', game_state)
+        DRRoom.dead_npcs = ['goblin']
+        instance.arrange_mob('goblin', game_state)
+        DRRoom.dead_npcs = ['hog']
+        instance.instance_variable_set(:@arrange_types, { 'hog' => 'skin' })
+        instance.arrange_mob('hog', game_state)
+
+        expect(sent).to eq(['arrange for bone', 'arrange ', 'arrange for bone', 'arrange for skin'])
+      end
+
+      it 'does not learn from a room that lists more than one kind of corpse' do
+        # DRRoom lists "goblin" first; the bare ARRANGE was the hog's.
+        DRRoom.dead_npcs = ['goblin', 'hog']
+        instance = build_harvester(arrange_types: { 'hog' => 'bone', 'goblin' => 'bone' })
+        sent = arranges { |command| command.include?('for bone') && sent.length == 1 ? 'That creature cannot' : 'You complete arranging' }
+
+        instance.arrange_mob('goblin', game_state)
+        DRRoom.dead_npcs = ['goblin']
+        instance.arrange_mob('goblin', game_state)
+
+        expect(sent).to eq(['arrange for bone', 'arrange ', 'arrange for bone'])
+        expect(DRC).not_to have_received(:message)
+      end
+
+      it 'learns in a mixed room with corpse IDs' do
+        DRRoom.dead_npcs = ['goblin', 'hog']
+        instance = build_harvester
+        bound_to(instance, '777')
+        sent = arranges { |command| command.include?('for bone') ? 'That creature cannot' : 'You complete arranging' }
+
+        instance.arrange_mob('hog', game_state)
+        instance.arrange_mob('hog', game_state)
+
+        expect(sent).to eq(['arrange #777 for bone', 'arrange #777', 'arrange #777'])
+        expect(DRC).to have_received(:message).with(/hog cannot produce bone/).once
+      end
+
+      it 'uses ARRANGE ALL and the bound ID for the plain arrange' do
+        instance = build_harvester(arrange_all: true, arrange_count: 1)
+        bound_to(instance, '777')
+        sent = arranges { |command| command.include?('for bone') ? 'That creature cannot' : 'You complete arranging' }
+
+        instance.arrange_mob('hog', game_state)
+        instance.arrange_mob('hog', game_state)
+
+        expect(sent).to eq(['arrange #777 all for bone', 'arrange #777 all', 'arrange #777 all'])
+      end
+
+      it 'never loops when a plain arrange is refused too' do
+        instance = build_harvester
+        sent = arranges { |_command| 'That creature cannot' }
+
+        instance.arrange_mob('hog', game_state)
+
+        expect(sent).to eq(['arrange for bone', 'arrange '])
+      end
+    end
+
+    context "'Arrange what?'" do
+      it 'ends the pass before DISSECT and SKIN' do
+        instance = build_harvester(dissect: true, dissect_cycle_skills: ['First Aid', 'Skinning'])
+        arranges { |_command| 'Arrange what' }
+        allow(instance).to receive(:dissected?)
+        allow(instance).to receive(:check_skinning)
+
+        instance.skin_or_dissect('hog', game_state)
+
+        expect(instance).not_to have_received(:dissected?)
+        expect(instance).not_to have_received(:check_skinning)
+      end
+
+      it 'skips SKIN on the skinning-only path' do
+        instance = build_harvester
+        arranges { |_command| 'Arrange what' }
+        allow(instance).to receive(:check_skinning)
+
+        instance.skin_or_dissect('hog', game_state)
+
+        expect(instance).not_to have_received(:check_skinning)
+      end
+
+      it 'still skins after a completed arrange' do
+        instance = build_harvester
+        arranges { |_command| 'You complete arranging' }
+        allow(instance).to receive(:check_skinning)
+
+        instance.skin_or_dissect('hog', game_state)
+
+        expect(instance).to have_received(:check_skinning).with('hog', game_state)
+      end
+    end
+
+    context 'a corpse this hunt has searched' do
+      def loots
+        allow(DRC).to receive(:bput).with(/\Aloot/, any_args).and_return('You search')
+      end
+
+      def dispose(instance)
+        instance.instance_variable_set(:@loot_timer, Time.now - 60)
+        instance.dispose_body(game_state)
+      end
+
+      it 'is left to decay instead of being harvested again' do
+        instance = build_harvester
+        allow(instance).to receive(:skin_or_dissect)
+        loots
+
+        dispose(instance)
+        dispose(instance)
+
+        expect(instance).to have_received(:skin_or_dissect).once
+        expect(DRC).to have_received(:bput).with('loot', any_args).once
+      end
+
+      it 'does not hide a fresh corpse of the same noun' do
+        instance = build_harvester
+        allow(instance).to receive(:skin_or_dissect)
+        loots
+
+        dispose(instance)
+        DRRoom.dead_npcs = ['hog', 'second hog']
+        dispose(instance)
+        dispose(instance)
+        DRRoom.dead_npcs = ['hog']
+        dispose(instance)
+
+        expect(instance).to have_received(:skin_or_dissect).twice
+      end
+
+      it 'harvests the next corpse once the searched one has decayed' do
+        instance = build_harvester
+        allow(instance).to receive(:skin_or_dissect)
+        loots
+
+        dispose(instance)
+        DRRoom.dead_npcs = []
+        dispose(instance)
+        DRRoom.dead_npcs = ['hog']
+        dispose(instance)
+
+        expect(instance).to have_received(:skin_or_dissect).twice
+      end
+
+      it 'takes the searched corpse from the LOOT reply in a mixed room' do
+        instance = build_harvester
+        allow(instance).to receive(:skin_or_dissect)
+        DRRoom.dead_npcs = ['goblin', 'hog']
+        allow(DRC).to receive(:bput).with(/\Aloot/, any_args).and_return('You search the musk hog')
+
+        dispose(instance)
+        dispose(instance)
+        allow(DRC).to receive(:bput).with(/\Aloot/, any_args).and_return('You search the forager goblin')
+        dispose(instance)
+        dispose(instance)
+
+        expect(instance).to have_received(:skin_or_dissect).exactly(3).times
+        expect(instance.instance_variable_get(:@searched_corpses).keys).to contain_exactly('goblin', 'hog')
+      end
+
+      it 'records nothing from an unnamed search in a mixed room' do
+        instance = build_harvester
+        allow(instance).to receive(:skin_or_dissect)
+        DRRoom.dead_npcs = ['goblin', 'hog']
+        loots
+
+        dispose(instance)
+        dispose(instance)
+
+        expect(instance).to have_received(:skin_or_dissect).twice
+        expect(instance.instance_variable_get(:@searched_corpses)).to be_empty
+      end
+
+      it 'with corpse IDs names a kind that still has an unsearched corpse' do
+        instance = build_harvester
+        ids = gs_double(drbot_corpse_ids?: true)
+        DRRoom.dead_npcs = ['goblin', 'hog', 'second hog']
+        instance.instance_variable_set(:@searched_corpses, { 'goblin' => { count: 1, at: Time.now } })
+
+        expect(instance.harvest_corpse_candidate(ids)).to eq('hog')
+        expect(instance.harvest_corpse_candidate(game_state)).to eq('goblin')
+        one_hog = { 'goblin' => { count: 1, at: Time.now }, 'hog' => { count: 1, at: Time.now } }
+        instance.instance_variable_set(:@searched_corpses, one_hog)
+        expect(instance.harvest_corpse_candidate(ids)).to eq('hog')
+        both_hogs = { 'goblin' => { count: 1, at: Time.now }, 'hog' => { count: 2, at: Time.now } }
+        instance.instance_variable_set(:@searched_corpses, both_hogs)
+        expect(instance.harvest_corpse_candidate(ids)).to eq('goblin')
+      end
+
+      it 'forgets the record in another room and after 15 seconds' do
+        instance = build_harvester
+        allow(instance).to receive(:skin_or_dissect)
+        loots
+
+        dispose(instance)
+        allow(Room).to receive(:current).and_return(double('Room', id: 2))
+        dispose(instance)
+        expect(instance).to have_received(:skin_or_dissect).twice
+
+        allow(Time).to receive(:now).and_return(Time.at(Time.now.to_i + 16))
+        dispose(instance)
+        expect(instance).to have_received(:skin_or_dissect).exactly(3).times
+      end
+
+      it 'treats every listed corpse as spent when a bare LOOT finds nothing' do
+        instance = build_harvester
+        allow(instance).to receive(:skin_or_dissect)
+        DRRoom.dead_npcs = ['hog', 'second hog']
+        allow(DRC).to receive(:bput).with(/\Aloot/, any_args).and_return('I could not find what you were referring to')
+
+        dispose(instance)
+        dispose(instance)
+
+        expect(instance).to have_received(:skin_or_dissect).once
+      end
+
+      it 'does not track corpses when the room is unknown' do
+        instance = build_harvester
+        allow(instance).to receive(:skin_or_dissect)
+        allow(Room).to receive(:current).and_return(nil)
+        loots
+
+        dispose(instance)
+        dispose(instance)
+
+        expect(instance).to have_received(:skin_or_dissect).twice
+      end
+    end
+
+    context 'DISSECT replies about another corpse or creature' do
+      let(:dissecting) { build_harvester(dissect: true, dissect_cycle_skills: ['First Aid', 'Skinning']) }
+
+      before(:each) do
+        allow(game_state).to receive(:sort_by_rate_then_rank).and_return(['First Aid', 'Skinning'])
+        allow(DRC).to receive(:bput).with(/\Aarrange/, any_args).and_return('You complete arranging')
+        allow(dissecting).to receive(:check_skinning)
+      end
+
+      it 'does not retry a DISSECT that named a live creature and still skins the corpse' do
+        allow(DRC).to receive(:bput).with('dissect hog', any_args).and_return('would probably object')
+
+        dissecting.skin_or_dissect('hog', game_state)
+
+        expect(DRC).to have_received(:bput).with(/\Adissect/, any_args).once
+        expect(dissecting).to have_received(:check_skinning).with('hog', game_state)
+        expect(dissecting.instance_variable_get(:@dissect)).to be(true)
+      end
+
+      it 'ends the pass on the only corpse when it was dissected already' do
+        allow(DRC).to receive(:bput).with('dissect hog', any_args).and_return("You'll learn nothing")
+
+        dissecting.skin_or_dissect('hog', game_state)
+
+        expect(dissecting).not_to have_received(:check_skinning)
+      end
+
+      it 'still skins when another corpse is listed' do
+        DRRoom.dead_npcs = ['hog', 'second hog']
+        allow(DRC).to receive(:bput).with('dissect hog', any_args).and_return("You'll learn nothing")
+
+        dissecting.skin_or_dissect('hog', game_state)
+
+        expect(dissecting).to have_received(:check_skinning).with('hog', game_state)
+      end
+
+      it 'judges the only corpse before DISSECT, not after one decays during the knife swap' do
+        DRRoom.dead_npcs = ['hog', 'second hog']
+        allow(DRC).to receive(:bput).with('dissect hog', any_args).and_return("You'll learn nothing")
+        allow(DRCI).to receive(:put_away_item?).with('skinning knife', 'backpack') do
+          DRRoom.dead_npcs = ['hog']
+          true
+        end
+
+        dissecting.skin_or_dissect('hog', game_state)
+
+        expect(dissecting).to have_received(:check_skinning).with('hog', game_state)
+      end
+    end
+
+    context 'after a skinning knife custody failure' do
+      it 'sends no ARRANGE or LOOT for the rest of the pass' do
+        instance = build_harvester(dissect: true, dissect_cycle_skills: ['First Aid', 'Skinning'])
+        allow(DRC).to receive(:bput).with(/\Aarrange/, any_args).and_return('You complete arranging')
+        allow(DRCI).to receive(:put_away_item?).with('skinning knife', 'backpack').and_return(false)
+        allow(game_state).to receive(:sort_by_rate_then_rank).and_return(['First Aid', 'Skinning'])
+
+        instance.instance_variable_set(:@arrange_for_dissect, false)
+        instance.dispose_body(game_state)
+        instance.dispose_body(game_state)
+
+        expect(DRC).to have_received(:bput).with('dissect hog', any_args).once
+        expect(DRC).not_to have_received(:bput).with(/\Aarrange|\Aloot/, any_args)
+        expect($COMBAT_TRAINER).to have_received(:stop)
+      end
+    end
+  end
+
   describe '#execute' do
     before(:each) do
       allow(DRC).to receive(:bput).and_return('Roundtime')

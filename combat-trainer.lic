@@ -1201,11 +1201,14 @@ class LootProcess
 
   def dispose_body(game_state)
     return unless @loot_bodies
+    # A skinning knife custody failure stops the hunt; leave every corpse alone.
+    return if @harvest_stopped
 
     if DRRoom.dead_npcs.empty?
       Flags.reset('using-corpse')
       @drbot_peer_harvest_until = nil
       @last_ritual = nil
+      @searched_corpses = nil
       return
     end
     return if Time.now - @loot_timer < @loot_delay
@@ -1217,7 +1220,8 @@ class LootProcess
 
     waitrt?
     @drbot_harvest_corpse = nil
-    corpse = DRRoom.dead_npcs.first
+    return if searched_corpses_only?
+    corpse = harvest_corpse_candidate(game_state)
     return unless harvest_corpse_present?(corpse, game_state)
     return if harvest_peer_busy?
     game_state.mob_died = true
@@ -1237,16 +1241,17 @@ class LootProcess
     skin_or_dissect(corpse, game_state) if check_rituals?(game_state)
 
     game_state.wield_whirlwind_offhand
-    return if @drbot_harvest_deferred
+    return if @drbot_harvest_deferred || @harvest_stopped
 
     unless game_state.necro_casting?
       return unless harvest_corpse_present?(corpse, game_state)
 
-      while DRC.bput("loot #{harvest_corpse_selector} #{@custom_loot_type}".squeeze(' ').strip, 'You search', 'I could not find what you were referring to', 'and get ready to search it') == 'and get ready to search it'
+      while (loot_result = DRC.bput("loot #{harvest_corpse_selector} #{@custom_loot_type}".squeeze(' ').strip, /You search[^.]*/, 'I could not find what you were referring to', 'and get ready to search it')) == 'and get ready to search it'
         pause
         waitrt?
         return unless harvest_corpse_present?(corpse, game_state)
       end
+      remember_searched_corpse(loot_result)
       @last_ritual = nil
     end
     @loot_timer = Time.now
@@ -1259,10 +1264,25 @@ class LootProcess
     return if game_state.necro_casting?
 
     return if @drbot_harvest_ids && @drbot_harvest_corpse && @drbot_harvest_corpse[:skinned]
+    return if @harvest_stopped
 
     arranges = 0
     type = @arrange_types[mob_noun] || 'skin'
-    arrange_message = @arrange_all ? "arrange #{harvest_corpse_selector} all for #{type}" : "arrange #{harvest_corpse_selector} for #{type}"
+    # "That creature cannot produce bones." is a property of the creature:
+    # every musk hog answered it in Vrakk's and Thargrund's 2026-09-27/28
+    # hunts, and every forager goblin gave bone. Once a noun has refused its
+    # configured part this run, and never accepted it, arrange it without a
+    # part from the start instead of paying a command and a reply for the
+    # refusal on every corpse. Only a reply known to be about this noun
+    # counts (see harvest_corpse_certain?).
+    @arrange_part_refused ||= {}
+    @arrange_part_accepted ||= {}
+    plain = @arrange_part_refused[mob_noun] == type
+    arrange_message = if plain
+                        @arrange_all ? "arrange #{harvest_corpse_selector} all" : "arrange #{harvest_corpse_selector}"
+                      else
+                        @arrange_all ? "arrange #{harvest_corpse_selector} all for #{type}" : "arrange #{harvest_corpse_selector} for #{type}"
+                      end
     while arranges < @arrange_count
       # Each arrange adds roundtime; a new arrival must stop the next step.
       return unless harvest_corpse_present?(mob_noun, game_state)
@@ -1272,15 +1292,34 @@ class LootProcess
       when /already been skinned, there's no point/i
         @drbot_harvest_corpse[:skinned] = true if @drbot_harvest_ids && @drbot_harvest_corpse
         return
-      when 'You complete arranging', 'That has already been arranged', 'You make a serious mistake in the arranging process', 'Arrange what'
+      when 'Arrange what'
+        # Nothing here can be arranged: the corpse was searched (it lingers
+        # about 13 seconds before it decays) or is gone. DISSECT and SKIN are
+        # refused the same way, so the pass goes straight to LOOT.
+        @harvest_corpse_gone = true
+        return
+      when 'You complete arranging', 'You make a serious mistake in the arranging process'
+        @arrange_part_accepted[mob_noun] = type if !plain && harvest_corpse_certain?(mob_noun)
+        break
+      when 'That has already been arranged'
         break
       when 'cannot be skinned'
         game_state.unskinnable(mob_noun)
         # This is a property of this creature type, not the whole hunt.
         break
       when 'That creature cannot'
+        # A plain arrange names no part; never loop on a refusal of it.
+        break if plain
+
+        if harvest_corpse_certain?(mob_noun) && @arrange_part_accepted[mob_noun] != type
+          @arrange_part_refused[mob_noun] = type
+          DRC.message("*** combat-trainer: #{mob_noun} cannot produce #{type}; arranging it without a part for the rest of this run.")
+        end
+        plain = true
         arranges = 0
         arrange_message = @arrange_all ? "arrange #{harvest_corpse_selector} all" : "arrange #{harvest_corpse_selector}"
+      when 'You begin to arrange', 'You continue arranging', 'You make a mistake'
+        @arrange_part_accepted[mob_noun] = type if !plain && harvest_corpse_certain?(mob_noun)
       end
     end
   end
@@ -1317,8 +1356,9 @@ class LootProcess
       corpse = corpses.find { |entry| entry.id.to_s == bound[:id] }
       return !!(corpse && corpse.noun.to_s.casecmp?(mob_noun.split.last))
     end
+    searched = @searched_corpse_ids || {}
     corpse = corpses.find do |entry|
-      !entry.name.to_s.empty? && entry.noun.to_s.casecmp?(mob_noun.split.last)
+      !entry.name.to_s.empty? && entry.noun.to_s.casecmp?(mob_noun.split.last) && !searched.key?(entry.id.to_s)
     end
     return false unless corpse
 
@@ -1366,7 +1406,114 @@ class LootProcess
     false
   end
 
+  # A corpse this hunt searched stays listed for about 13 seconds before it
+  # decays, and the game no longer offers it to ARRANGE, SKIN or LOOT
+  # ("Arrange what?", "Skin what?", "I could not find what you were referring
+  # to."). Vrakk's 2026-09-27/28 hunt went back to such corpses 95 times and
+  # sent a doomed ARRANGE, DISSECT, SKIN (with the knife swaps) and LOOT to
+  # each. Count, per room and creature noun, the corpses this hunt has
+  # searched, taking the noun from the LOOT reply ("You search the musk
+  # hog."), and skip the pass while every listed corpse is one of them. With
+  # corpse IDs the searched IDs are kept too. Decay or an empty room shrinks
+  # a count, and a record older than 15 seconds is dropped (351 of 355
+  # searched corpses in Vrakk's and Thargrund's logs decayed within 13
+  # seconds of LOOT), so a wrong record can only delay a harvest, never lose
+  # one.
+  def searched_corpse_room
+    map_id = defined?(Room) && Room.respond_to?(:current) ? Room.current&.id : nil
+    uid = defined?(XMLData) && XMLData.respond_to?(:room_id) ? XMLData.room_id : nil
+    room = [map_id, uid]
+    room.any? ? room : nil
+  rescue StandardError
+    nil
+  end
+
+  def dead_corpse_counts
+    Array(DRRoom.dead_npcs).each_with_object(Hash.new(0)) { |name, counts| counts[name.to_s.split.last] += 1 }
+  end
+
+  def forget_searched_corpses(room, counts)
+    now = Time.now
+    unless @searched_corpses && room && room == @searched_corpses_room
+      @searched_corpses = {}
+      @searched_corpses_room = room
+    end
+    @searched_corpses.delete_if do |noun, entry|
+      entry[:count] = [entry[:count], counts[noun]].min
+      entry[:count] <= 0 || now - entry[:at] > 15
+    end
+    @searched_corpse_ids = (@searched_corpse_ids || {}).reject { |_id, at| now - at > 15 }
+  end
+
+  # With corpse IDs a pass binds a corpse of the kind it names, so name the
+  # first kind that still has an unsearched corpse. Without them the bare
+  # commands pick the corpse, and the name stays upstream's first listed noun.
+  def harvest_corpse_candidate(game_state)
+    names = Array(DRRoom.dead_npcs)
+    return names.first unless game_state.respond_to?(:drbot_corpse_ids?) && game_state.drbot_corpse_ids?
+
+    counts = dead_corpse_counts
+    searched = @searched_corpses || {}
+    fresh = names.map { |name| name.to_s.split.last }.uniq.find do |noun|
+      !(searched[noun] && counts[noun] <= searched[noun][:count])
+    end
+    fresh || names.first
+  end
+
+  # True when every listed corpse is one this hunt searched. While any listed
+  # corpse is unsearched the pass runs as before; the bare ARRANGE, SKIN and
+  # LOOT pass over searched corpses by themselves.
+  def searched_corpses_only?
+    room = searched_corpse_room
+    counts = dead_corpse_counts
+    forget_searched_corpses(room, counts)
+    return false unless room && !counts.empty?
+
+    counts.all? { |noun, count| @searched_corpses[noun] && count <= @searched_corpses[noun][:count] }
+  end
+
+  def remember_searched_corpse(result)
+    result = result.to_s
+    searched = result.start_with?('You search')
+    return unless searched || result.start_with?('I could not find')
+
+    room = searched_corpse_room
+    return unless room
+
+    counts = dead_corpse_counts
+    forget_searched_corpses(room, counts)
+    now = Time.now
+    if @drbot_harvest_ids
+      # LOOT #id answers for that corpse alone.
+      return unless @drbot_harvest_corpse
+
+      @searched_corpse_ids[@drbot_harvest_corpse[:id]] = now
+      result = "You search the #{@drbot_harvest_corpse[:noun]}" unless searched
+    elsif !searched
+      # A bare LOOT found nothing to search: every corpse listed here is spent.
+      counts.each { |noun, count| @searched_corpses[noun] = { count: count, at: now } }
+      return
+    end
+    # The reply names the corpse the game chose; DRRoom lists corpse nouns
+    # alphabetically, not in the order the game picks from.
+    noun = result.split.last.to_s.delete('.')
+    noun = counts.keys.first if counts.size == 1 && !counts.key?(noun)
+    return unless counts.key?(noun)
+
+    @searched_corpses[noun] = { count: [(@searched_corpses.dig(noun, :count) || 0) + 1, counts[noun]].min, at: now }
+  end
+
+  # Without corpse IDs a bare ARRANGE acts on whichever corpse the game picks,
+  # while DRRoom lists corpse nouns alphabetically: in a room with a musk hog
+  # and a goblin corpse the trainer names "goblin" and the game arranges the
+  # hog. A reply is known to be about this noun only with corpse IDs or when
+  # it is the only kind of corpse listed.
+  def harvest_corpse_certain?(mob_noun)
+    @drbot_harvest_ids || dead_corpse_counts.keys == [mob_noun.to_s.split.last]
+  end
+
   def skin_or_dissect(mob_noun, game_state)
+    @harvest_corpse_gone = false
     return unless harvest_corpse_present?(mob_noun, game_state)
     return unless (game_state.dissectable?(mob_noun) || game_state.skinnable?(mob_noun))
     return unless (@dissect || @skin)
@@ -1377,6 +1524,7 @@ class LootProcess
       if @arrange_for_dissect
         arrange_mob(mob_noun, game_state)
         already_arranged = true
+        return if @harvest_corpse_gone
       end
 
       if game_state.skinnable?(mob_noun)
@@ -1386,17 +1534,21 @@ class LootProcess
       end
 
       if skill_to_train == 'First Aid' || skill_to_train == 'Thanatology'
-        unless dissected?(mob_noun, game_state)
+        # A DISSECT that teaches nothing ("You'll gain no insights from this
+        # attempt") returns false, so the corpse still gets its arrange and
+        # skin: upstream's intent since 2023, and that reply has not appeared
+        # in the fleet's retained hunt logs.
+        unless dissected?(mob_noun, game_state) || @harvest_corpse_gone
           arrange_mob(mob_noun, game_state) unless already_arranged
-          check_skinning(mob_noun, game_state) if @skin
+          check_skinning(mob_noun, game_state) if @skin && !@harvest_corpse_gone
         end
       elsif skill_to_train == 'Skinning'
         arrange_mob(mob_noun, game_state) unless already_arranged
-        check_skinning(mob_noun, game_state) if @skin
+        check_skinning(mob_noun, game_state) if @skin && !@harvest_corpse_gone
       end
     elsif @skin && game_state.skinnable?(mob_noun)
       arrange_mob(mob_noun, game_state) unless already_arranged
-      check_skinning(mob_noun, game_state)
+      check_skinning(mob_noun, game_state) unless @harvest_corpse_gone
     else
       return
     end
@@ -1422,7 +1574,19 @@ class LootProcess
       return false
     end
 
-    result = DRC.bput("dissect #{mob_noun}",
+    # With corpse IDs on, DISSECT names the bound corpse exactly as ARRANGE,
+    # SKIN and LOOT do, so a shared room cannot dissect another hunter's
+    # same-named corpse. Without them it keeps the creature noun (a bare
+    # DISSECT is the confirmation form).
+    target = dissect_target(mob_noun)
+    unless target
+      restore_skinning_weapon(game_state)
+      return false
+    end
+
+    # Judged from the LOOK just taken: a corpse can decay during the knife swap.
+    sole_corpse = Array(DRRoom.dead_npcs).length == 1
+    result = DRC.bput("dissect #{target}",
                       /You'll gain no insights from this attempt/,
                       /You succeed in dissecting the corpse/,
                       'What exactly are you trying to dissect',
@@ -1445,7 +1609,10 @@ class LootProcess
                       /(?:You cannot do the delicate work necessary because you )?lack a suitably small, bladed weapon/)
     if result =~ /You'll gain no insights from this attempt/
       waitrt?
-      fput("dissect") if harvest_corpse_present?(mob_noun, game_state)
+      if harvest_corpse_present?(mob_noun, game_state)
+        confirm = @drbot_harvest_ids ? dissect_target(mob_noun) : ''
+        fput("dissect #{confirm}".strip) if confirm
+      end
     end
     return false unless restore_skinning_weapon(game_state)
 
@@ -1464,6 +1631,14 @@ class LootProcess
       return true
     when /You'll gain no insights from this attempt/
       return false
+    when "You'll learn nothing"
+      # "You'll learn nothing further of value from the musk hog's mutilated
+      # remains.": that corpse was dissected already, and a dissected corpse
+      # is not arranged or skinned either. Without corpse IDs the noun may have
+      # named another corpse, so this is certain only for the bound ID or the
+      # only corpse listed.
+      @harvest_corpse_gone = true if @drbot_harvest_ids || sole_corpse
+      return false
     when /isn't suitable for this type of delicate work/, /lack a suitably small, bladed weapon/
       return disable_dissect("DISSECT refused the held weapon (#{result})")
     when 'This ritual may only be performed on a corpse', 'A failed or completed ritual has rendered', 'You realize after a few seconds', 'prevents a meaningful dissection'
@@ -1479,7 +1654,11 @@ class LootProcess
       @dissect = false
       return false
     when 'would probably object', "should be left alone."
-      return dissected?('', game_state)
+      # "You believe the forager goblin would probably object to you trying to
+      # do that while it is still alive.": the noun named a live creature
+      # listed before the corpse. Do not retry; the corpse keeps its arrange
+      # and skin.
+      return false
     end
     return false
   end
@@ -1618,6 +1797,12 @@ class LootProcess
     false
   end
 
+  def dissect_target(mob_noun)
+    @drbot_harvest_ids ? harvest_corpse_selector : mob_noun
+  rescue StandardError
+    nil
+  end
+
   # Without a configured knife DISSECT uses whatever is held, and a sword or
   # axe is refused on every corpse. Switch dissection off once instead; the
   # corpse still gets the arrange/skin path.
@@ -1650,6 +1835,9 @@ class LootProcess
   def stop_for_skinning_knife(reason)
     @skin = false
     @dissect = false
+    # The hands are not in a known state: no further ARRANGE or LOOT before the
+    # hunt stops.
+    @harvest_stopped = true
     DRC.message("*** combat-trainer: Skinning knife custody failure: #{reason}. Stopping hunt.")
     $HUNTING_BUDDY&.stop_hunting
     $COMBAT_TRAINER&.stop
