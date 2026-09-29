@@ -2,8 +2,32 @@
   Documentation: https://elanthipedia.play.net/Lich_script_repository#sell-loot
 =end
 
+require 'securerandom'
+
 class SellLoot
   def initialize
+    @drbot_run_id = SecureRandom.hex(12)
+    @drbot_bank_outcome = 'no_bank_action'
+    @drbot_bank_reason = nil
+    drbot_bank_marker('start')
+    begin
+      run
+    rescue StandardError
+      @drbot_bank_reason ||= 'script_error' if @drbot_bank_outcome == 'bank_unverified'
+      raise
+    ensure
+      drbot_bank_marker('end', outcome: @drbot_bank_outcome, reason: @drbot_bank_reason)
+    end
+  end
+
+  def drbot_bank_marker(phase, outcome: nil, reason: nil)
+    marker = "DRBOT-SELL-LOOT v1 run=#{@drbot_run_id} phase=#{phase}"
+    marker += " outcome=#{outcome}" if outcome
+    marker += " reason=#{reason}" if reason
+    DRC.message(marker, false)
+  end
+
+  def run
     arg_definitions = [
       [
         { name: 'town', regex: $HOMETOWN_REGEX, variable: true, description: 'Override the town to sell loot in.' }
@@ -109,6 +133,9 @@ class SellLoot
     return if @bankbot_enabled && (@bankbot_name.nil? || @bankbot_room_id.nil?)
 
     if skip_bank && @bankbot_enabled
+      @drbot_bank_outcome = 'bank_unverified'
+      @drbot_bank_reason = 'bankbot_unconfirmed'
+      drbot_bank_marker('bank_attempt')
       $CURRENCIES.each do |currency|
         give_money_to_bankbot(currency, currency =~ /#{@local_currency}/i ? @bankbot_deposit_threshold : 0)
       end
@@ -121,9 +148,20 @@ class SellLoot
 
     exchange_coins unless skip_exchange
     if @bankbot_enabled
+      @drbot_bank_outcome = 'bank_unverified'
+      @drbot_bank_reason = 'bankbot_unconfirmed'
+      drbot_bank_marker('bank_attempt')
       give_money_to_bankbot(@local_currency, @bankbot_deposit_threshold)
     else
-      DRCM.deposit_coins(keep_coppers_bank, @settings)
+      @drbot_bank_outcome = 'bank_unverified'
+      @drbot_bank_reason = 'missing_teller_balance'
+      drbot_bank_marker('bank_attempt')
+      balance, currency = DRCM.deposit_coins(keep_coppers_bank, @settings)
+      if balance.is_a?(Integer) && balance >= 0 &&
+         %w[Kronars Lirums Dokoras].include?(currency)
+        @drbot_bank_outcome = 'bank_verified'
+        @drbot_bank_reason = nil
+      end
     end
   end
 
