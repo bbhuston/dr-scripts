@@ -1043,4 +1043,74 @@ before_dying do
   $COORDINATOR = nil
 end
 
+# A crafting child stops when a required item is missing (drg-w12).
+#
+# dr-scripts' common-crafting.lic ended DRCC.get_crafting_item's missing-item
+# branch with `exit unless skip_exit`, and every crafting script is written for
+# that. The pinned Lich 5.20 port still prints "Cannot continue crafting without
+# required item. Stopping script." but then returns nil, so the caller goes on
+# without the item. Agondar's remedy child did that for eight hours on
+# 2026-09-29: each crush asked for another splash of water, `get my water from
+# my purple sack` found none, `put water in my mortar` failed, and the crush
+# asked again (375 times between 11:18 and 14:42 alone).
+#
+# Every crafting script drbot runs is a child of this coordinator, so the
+# coordinator restores upstream's contract for its Lich process before the
+# first task: once Lich has printed that line, the script whose thread asked
+# for the item records it (drbot_crafting_missing_item on its Script handle),
+# logs one status line and exits. A call with skip_exit still returns nil, and
+# nothing else changes. Starting the coordinator again replaces the two hook
+# bodies instead of stacking them.
+module DrfCraftingItemStop
+  def self.stop_text
+    'DRCC: Cannot continue crafting without required item. Stopping script.'
+  end
+
+  def self.install
+    return false unless defined?(Lich::DragonRealms::DRCC) && defined?(Lich::Messaging)
+
+    key = :drf_crafting_item_stop
+    stop_text = self.stop_text
+    getter = Module.new do
+      define_method(:get_crafting_item) do |name, bag, bag_items, belt, skip_exit = false|
+        return super(name, bag, bag_items, belt, skip_exit) if skip_exit
+
+        asked = Thread.current.thread_variable_get(key) || []
+        Thread.current.thread_variable_set(key, asked + [name])
+        begin
+          super(name, bag, bag_items, belt, skip_exit)
+        ensure
+          Thread.current.thread_variable_set(key, asked)
+        end
+      end
+    end
+    messages = Module.new do
+      define_method(:msg) do |type = 'info', text = '', **options|
+        result = super(type, text, **options)
+        name = text == stop_text && (Thread.current.thread_variable_get(key) || []).last
+        script = name && Script.current
+        if script
+          script.define_singleton_method(:drbot_crafting_missing_item) { name }
+          echo("***STATUS*** #{script.name} stopped: missing required crafting item #{name}")
+          exit
+        end
+        result
+      end
+    end
+    [[Lich::DragonRealms::DRCC.singleton_class, getter, :get_crafting_item],
+     [Lich::Messaging.singleton_class, messages, :msg]].each do |target, hook, method_name|
+      installed = target.instance_variable_get(:@drf_crafting_item_stop)
+      if installed.is_a?(Module)
+        installed.send(:define_method, method_name, hook.instance_method(method_name))
+      else
+        target.prepend(hook)
+        target.instance_variable_set(:@drf_crafting_item_stop, hook)
+      end
+    end
+    true
+  end
+end
+
+DrfCraftingItemStop.install
+
 Coordinator.new(true)

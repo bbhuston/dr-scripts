@@ -23,6 +23,14 @@ class CreateRemedies
     # Get recipe
     recipe = get_data('recipes').crafting_recipes.find { |each_recipe| each_recipe['name'] =~ /#{args.target}/i }
     DRC.message("Recipe is: #{recipe}.") if debug
+    # Solvent and catalyst first: no herb is foraged or crafted without them.
+    missing = consumables(recipe, catalyst).reject { |name| consumable_available?(name) }
+    unless missing.empty?
+      reason = 'missing ' + missing.map { |name| [name, consumable_container(name)].compact.join(' in ') }.join(', ')
+      Script.current.define_singleton_method(:drbot_remedy_unavailable) { reason }
+      DRC.message("***STATUS*** create_remedies skipped #{recipe['name']}: #{reason}")
+      exit
+    end
     # Gather first herb section based on settings
     herb1 = recipe['herb1']
     if herb1 == "red flower"
@@ -67,11 +75,50 @@ class CreateRemedies
     if child.respond_to?(:drbot_remedy_unavailable) && child.drbot_remedy_unavailable
       reason = child.drbot_remedy_unavailable
       Script.current.define_singleton_method(:drbot_remedy_unavailable) { reason }
+    elsif child.respond_to?(:drbot_crafting_missing_item) && child.drbot_crafting_missing_item
+      # The coordinator stopped remedy mid-recipe for a missing item. Put the
+      # vessel back in the crafting container with whatever it holds, and back
+      # off like any other missing supply.
+      reason = "remedy stopped: missing #{child.drbot_crafting_missing_item}"
+      Script.current.define_singleton_method(:drbot_remedy_unavailable) { reason }
+      DRC.message("***STATUS*** create_remedies stopped #{recipe['name']}: #{reason}")
+      vessel = recipe['container']
+      if @settings.crafting_container && [DRC.left_hand, DRC.right_hand].compact.any? { |h| h =~ /\b#{Regexp.escape(vessel)}\b/i }
+        DRCC.stow_crafting_item(vessel, @settings.crafting_container, @settings.alchemy_belt)
+      end
     elsif @settings.crafting_container && [DRC.left_hand, DRC.right_hand].compact.any? { |h| h =~ /\b#{Regexp.escape(recipe['noun'])}\b/i }
       DRCC.stow_crafting_item(recipe['noun'], @settings.crafting_container, @settings.alchemy_belt)
     end
     # Store tools?
     get_store_tools("store") if tools
+  end
+
+  # Every remedy takes a solvent and a catalyst besides its herbs. Wound
+  # remedies (chapters 3 and 4 of the remedies book) take water and scar
+  # remedies (5 and 6) alcohol; for another chapter remedy.lic may ask for
+  # either. A water_container or alcohol_container is remedy.lic's own supply.
+  def consumables(recipe, catalyst)
+    solvents = case recipe['chapter'].to_i
+               when 3, 4 then %w[water]
+               when 5, 6 then %w[alcohol]
+               else %w[water alcohol]
+               end
+    supplied = { 'water' => @settings.water_container, 'alcohol' => @settings.alcohol_container }
+    solvents.reject { |solvent| supplied[solvent] } + [catalyst]
+  end
+
+  # remedy.lic takes a consumable with DRCC.get_crafting_item: from the crafting
+  # container when crafting_items_in_container lists it, otherwise with a plain
+  # GET, and one already held counts. Look only there: on 2026-09-29 Agondar's
+  # backpack held five waters that his remedy, asking the purple sack, never
+  # reached.
+  def consumable_container(name)
+    bag = @settings.crafting_container
+    bag if bag && @settings.crafting_items_in_container.to_a.include?(name)
+  end
+
+  def consumable_available?(name)
+    DRCI.in_hands?(name) || DRCI.exists?(name, consumable_container(name))
   end
 
   def herb_containers
