@@ -2073,6 +2073,31 @@ class SafetyProcess
     false
   end
 
+  # Under drbot the health floor stops the hunt instead of quitting the game.
+  # Fleet profiles set health_threshold as the hunt floor hunting-buddy also
+  # uses (80-92, above the 75% guardian). The upstream EXIT left Thargrund
+  # offline in the hunting ground at 90% health with no significant injury
+  # (Farmland 1473, 2026-09-29 02:08), and a login returns there. A stopped
+  # hunt, as safety_exit_on_bleeding stops it, ends hunting-buddy; the
+  # coordinator walks to the safe room, where its health-floor hold, the
+  # bleeding recovery and the guardian act. drbot's watchdog publishes
+  # $DRBOT_DIRECT_CONTROL in every Lich session it supervises (the group
+  # threat ASSESS writes through it); without it the upstream EXIT stays.
+  def drbot_supervised?
+    control = defined?($DRBOT_DIRECT_CONTROL) && $DRBOT_DIRECT_CONTROL
+    control.is_a?(Hash)
+  end
+
+  # Once per trainer run: the floor stays crossed on every cleanup tick.
+  def stop_hunt_below_health_floor
+    return if @health_floor_stop_requested
+
+    @health_floor_stop_requested = true
+    DRC.message("*** combat-trainer: Health #{DRStats.health}% is below the #{@health_threshold}% floor (health_threshold). Stopping hunt instead of exiting the game.")
+    $HUNTING_BUDDY&.stop_hunting
+    $COMBAT_TRAINER&.stop
+  end
+
   def execute(game_state)
     waive_untendable = drbot_health_waived?('active_hunt.untendable_bleeding')
     waive_escape = drbot_health_waived?('active_hunt.health_escape')
@@ -2117,7 +2142,13 @@ class SafetyProcess
       end
     end
 
-    fput 'exit' if DRStats.health < @health_threshold && !waive_floor
+    if DRStats.health < @health_threshold && !waive_floor
+      if drbot_supervised?
+        stop_hunt_below_health_floor
+      else
+        fput 'exit'
+      end
+    end
     DRC.fix_standing unless standing?
     check_item_recovery(game_state)
     tend_lodged

@@ -3987,6 +3987,97 @@ RSpec.describe SafetyProcess do
     end
   end
 
+  # Thargrund 2026-09-29 02:08: health 90 against his 92 floor sent EXIT and
+  # left him offline in the hunting ground. Under drbot the floor stops the
+  # hunt instead; without drbot upstream's EXIT is unchanged.
+  describe 'health floor under drbot supervision' do
+    after(:each) { $DRBOT_DIRECT_CONTROL = nil }
+
+    def supervise
+      $DRBOT_DIRECT_CONTROL = { 'mode' => 'B', 'closed' => false }
+    end
+
+    def below_floor(**overrides)
+      instance = build_safety_process(health_threshold: 92, **overrides)
+      stub_post_safety(instance)
+      allow(instance).to receive(:fput)
+      allow(DRC).to receive(:message)
+      DRStats.health = 90
+      instance
+    end
+
+    it 'keeps the upstream EXIT without drbot supervision' do
+      $DRBOT_DIRECT_CONTROL = nil
+      instance = below_floor
+
+      instance.execute(build_game_state)
+
+      expect(instance).to have_received(:fput).with('exit')
+      expect($HUNTING_BUDDY).not_to have_received(:stop_hunting)
+      expect($COMBAT_TRAINER).not_to have_received(:stop)
+    end
+
+    it 'stops the hunt instead of sending EXIT under drbot' do
+      supervise
+      instance = below_floor
+
+      instance.execute(build_game_state)
+
+      expect(instance).not_to have_received(:fput).with('exit')
+      expect($HUNTING_BUDDY).to have_received(:stop_hunting).once
+      expect($COMBAT_TRAINER).to have_received(:stop).once
+      expect(DRC).to have_received(:message)
+        .with('*** combat-trainer: Health 90% is below the 92% floor (health_threshold). Stopping hunt instead of exiting the game.').once
+    end
+
+    it 'stops and logs once while the floor stays crossed through cleanup' do
+      supervise
+      instance = below_floor
+
+      3.times { instance.execute(build_game_state) }
+
+      expect(instance).not_to have_received(:fput).with('exit')
+      expect($HUNTING_BUDDY).to have_received(:stop_hunting).once
+      expect($COMBAT_TRAINER).to have_received(:stop).once
+      expect(DRC).to have_received(:message).with(/Stopping hunt instead of exiting the game/).once
+    end
+
+    it 'does nothing at the floor' do
+      supervise
+      instance = below_floor
+      DRStats.health = 92
+
+      instance.execute(build_game_state)
+
+      expect(instance).not_to have_received(:fput).with('exit')
+      expect($HUNTING_BUDDY).not_to have_received(:stop_hunting)
+      expect($COMBAT_TRAINER).not_to have_received(:stop)
+    end
+
+    it 'neither exits nor stops while the health floor waiver is active' do
+      supervise
+      stub_const('DrbotHuntingHealthPolicy', Class.new { def self.waived?(_signal) = true })
+      instance = below_floor
+
+      instance.execute(build_game_state)
+
+      expect(instance).not_to have_received(:fput).with('exit')
+      expect($HUNTING_BUDDY).not_to have_received(:stop_hunting)
+      expect($COMBAT_TRAINER).not_to have_received(:stop)
+    end
+
+    it 'stops the trainer when no hunting-buddy runs' do
+      supervise
+      $HUNTING_BUDDY = nil
+      instance = below_floor
+
+      instance.execute(build_game_state)
+
+      expect(instance).not_to have_received(:fput).with('exit')
+      expect($COMBAT_TRAINER).to have_received(:stop).once
+    end
+  end
+
   describe '#execute' do
     describe 'safety_untendable_threshold' do
       it 'stops hunt at default threshold of 3' do
