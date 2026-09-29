@@ -23,10 +23,11 @@ class CreateRemedies
     # Get recipe
     recipe = get_data('recipes').crafting_recipes.find { |each_recipe| each_recipe['name'] =~ /#{args.target}/i }
     DRC.message("Recipe is: #{recipe}.") if debug
-    # Solvent and catalyst first: no herb is foraged or crafted without them.
-    missing = consumables(recipe, catalyst).reject { |name| consumable_available?(name) }
+    # Tools, solvent and catalyst first: no herb is foraged or crafted without
+    # them, and remedy.lic stops at the first one it cannot get.
+    missing = (remedy_tools(recipe) + consumables(recipe, catalyst)).reject { |name| supply_available?(name) }
     unless missing.empty?
-      reason = 'missing ' + missing.map { |name| [name, consumable_container(name)].compact.join(' in ') }.join(', ')
+      reason = 'missing ' + missing.map { |name| [name, supply_container(name)].compact.join(' in ') }.join(', ')
       Script.current.define_singleton_method(:drbot_remedy_unavailable) { reason }
       DRC.message("***STATUS*** create_remedies skipped #{recipe['name']}: #{reason}")
       exit
@@ -107,18 +108,32 @@ class CreateRemedies
     solvents.reject { |solvent| supplied[solvent] } + [catalyst]
   end
 
-  # remedy.lic takes a consumable with DRCC.get_crafting_item: from the crafting
+  # The tools remedy.lic takes, named as it names them: the remedies book
+  # (unless a master book is set), the vessel its resolve_container finds in
+  # alchemy_tools, the pestle (a mixing stick for anything but a mortar) and the
+  # sieve. Without them a stop leaves herbs in the vessel, and every retry after
+  # the coordinator's delay would spend another batch.
+  def remedy_tools(recipe)
+    tools = @settings.alchemy_tools.to_a
+    pattern = recipe['container'] =~ /bowl/ ? /cauldron|bowl/ : /#{recipe['container']}/
+    vessel = tools.find { |tool| pattern =~ tool } || recipe['container']
+    stirrer = /mort/ =~ vessel ? (tools.find { |tool| /pestle/ =~ tool } || 'pestle') : 'mixing stick'
+    book = 'remed book' unless @settings.master_crafting_book
+    [book, vessel, stirrer, 'sieve'].compact
+  end
+
+  # remedy.lic takes each with DRCC.get_crafting_item: from the crafting
   # container when crafting_items_in_container lists it, otherwise with a plain
   # GET, and one already held counts. Look only there: on 2026-09-29 Agondar's
   # backpack held five waters that his remedy, asking the purple sack, never
   # reached.
-  def consumable_container(name)
+  def supply_container(name)
     bag = @settings.crafting_container
     bag if bag && @settings.crafting_items_in_container.to_a.include?(name)
   end
 
-  def consumable_available?(name)
-    DRCI.in_hands?(name) || DRCI.exists?(name, consumable_container(name))
+  def supply_available?(name)
+    DRCI.in_hands?(name) || DRCI.exists?(name, supply_container(name))
   end
 
   def herb_containers
