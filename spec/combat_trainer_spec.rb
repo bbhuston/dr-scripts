@@ -773,6 +773,104 @@ RSpec.describe GameState do
       expect(DRC).to have_received(:bput).with('engage #11', any_args).once
       expect(DRC).to have_received(:bput).with('engage #22', any_args).once
     end
+
+    it "ranks its own refused attacker ahead of a buddy's opponent once the holder has died" do
+      gs = refusal_state(%w[11 22 33], engaged: %w[11 22])
+      replies('engage #11' => refused, 'engage #22' => 'You are already at melee with a goblin.')
+      gs.engage
+      gs.engage
+      census(%w[11 33], engaged: %w[11])
+      replies('engage #11' => 'You begin to advance on a goblin.')
+
+      expect(gs.engage).to be false
+      expect(DRC).not_to have_received(:bput).with('engage #33', any_args)
+    end
+
+    it 'ranks the creature it began to advance on first while it closes' do
+      gs = refusal_state(%w[22])
+      replies('engage #22' => 'You begin to advance on a goblin.')
+      gs.engage
+      census(%w[11 22])
+      replies('engage #22' => 'You are already at melee with a goblin.')
+
+      expect(gs.engage).to be true
+      expect(DRC).not_to have_received(:bput).with('engage #11', any_args)
+    end
+
+    it 'forgets every refusal after a retreat' do
+      gs = refusal_state(%w[11 22])
+      replies('engage #11' => refused, 'engage #22' => 'You are already at melee with a goblin.')
+      gs.engage
+      Flags['ct-melee-retreat'] = 'You retreat from combat.'
+
+      expect(gs.drbot_melee_refusals).to be_empty
+      expect(Flags['ct-melee-retreat']).to be false
+    end
+
+    context 'without server IDs' do
+      it 'faces the next creature once when its attack is out of reach' do
+        gs = refusal_state([], server_ids: false)
+        DRRoom.npcs = %w[goblin hog]
+        replies('engage goblin' => refused, 'face next' => 'You turn to face a large musk hog.')
+        gs.engage
+
+        expect(gs.drbot_melee_out_of_reach).to be true
+        expect(gs.drbot_melee_out_of_reach).to be false
+        expect(DRC).to have_received(:bput).with('face next', any_args).once
+      end
+
+      it 'does not face anything without a bare refusal' do
+        gs = refusal_state([], server_ids: false)
+        allow(DRC).to receive(:bput)
+
+        expect(gs.drbot_melee_out_of_reach).to be false
+        expect(DRC).not_to have_received(:bput)
+      end
+
+      it 'holds back a bare ENGAGE refused again with no roundtime between for 15 seconds, logged once' do
+        now = 500.0
+        allow(Process).to receive(:clock_gettime) { now }
+        gs = refusal_state([], server_ids: false)
+        allow(gs).to receive(:drbot_roundtime_mark).and_return(7)
+        DRRoom.npcs = %w[goblin hog]
+        replies('engage goblin' => refused)
+        expect(gs.engage).to be true
+        gs.drbot_forget_melee_refusals
+
+        expect(gs.engage).to be false
+        2.times { expect(gs.engage).to be false }
+        expect(DRC).to have_received(:bput).with('engage goblin', any_args).twice
+        expect(DRC).to have_received(:message).with(/ENGAGE goblin refused again .*not engaging for 15 s/).once
+
+        now += 15
+        gs.engage
+        expect(DRC).to have_received(:bput).with('engage goblin', any_args).exactly(3).times
+      end
+
+      it 'treats a bare refusal after roundtime as a new melee' do
+        gs = refusal_state([], server_ids: false)
+        rt = 7
+        allow(gs).to receive(:drbot_roundtime_mark) { rt }
+        DRRoom.npcs = %w[goblin hog]
+        replies('engage goblin' => refused)
+        gs.engage
+        gs.drbot_forget_melee_refusals
+        rt = 9
+
+        expect(gs.engage).to be true
+        expect(DRC).not_to have_received(:message).with(/refused again/)
+      end
+
+      it 'honours the refusal in engage_slow' do
+        gs = refusal_state([], server_ids: false)
+        DRRoom.npcs = %w[goblin hog]
+        replies('engage goblin' => refused)
+        gs.engage_slow
+        gs.engage_slow
+
+        expect(DRC).to have_received(:bput).with('engage goblin', any_args).once
+      end
+    end
   end
 
   # ---- NPC handling ----
@@ -1449,6 +1547,33 @@ RSpec.describe AttackProcess do
 
       expect(gs).to have_received(:drbot_forget_melee_refusals).twice
       expect(gs).to have_received(:engage).twice
+    end
+
+    # "You turn to face a sleazy lout, leaving the sleazy lout on your flank at
+    # melee!": the creature faced need not be the one at melee.
+    it 'faces the next creature instead of re-sending a bare ENGAGE while its refusal stands' do
+      gs = gs_double(engage: true, drbot_forget_melee_refusals: nil, drbot_melee_out_of_reach: true)
+      allow(gs).to receive(:loaded=)
+      allow(DRC).to receive(:bput).and_return("You aren't close enough to attack.")
+      $server_buffer = ["You aren't close enough to attack."]
+
+      build_attack.execute(gs)
+      expect(gs).to have_received(:drbot_melee_out_of_reach).once
+      expect(gs).not_to have_received(:drbot_forget_melee_refusals)
+      expect(gs).to have_received(:engage).once
+    end
+
+    it 'keeps recorded ENGAGE refusals when an attack lands after an older out-of-reach line' do
+      gs = gs_double(engage: true, drbot_forget_melee_refusals: nil, drbot_melee_out_of_reach: false)
+      allow(gs).to receive(:loaded=)
+      allow(DRC).to receive(:bput).and_return('Roundtime')
+      $server_buffer = ["You aren't close enough to attack.", 'You turn to face a large musk hog.', 'Roundtime: 2 sec.']
+
+      build_attack.execute(gs)
+      expect(gs).not_to have_received(:drbot_melee_out_of_reach)
+      expect(gs).not_to have_received(:drbot_forget_melee_refusals)
+      expect(gs).to have_received(:engage).once
+      expect(gs).to have_received(:action_taken)
     end
   end
 
