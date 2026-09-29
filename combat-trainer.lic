@@ -4936,6 +4936,13 @@ class AttackProcess
       end
     end
 
+    # An attack that finds nothing at melee proves no creature holds this
+    # character any longer, so a recorded ENGAGE refusal no longer stands.
+    if game_state.respond_to?(:drbot_forget_melee_refusals) &&
+       reget(5, 'You aren\'t close enough to attack', 'It would help if you were closer', 'There is nothing else to face', 'Face What?')
+      game_state.drbot_forget_melee_refusals
+    end
+
     if reget(5, 'You aren\'t close enough to attack', 'It would help if you were closer')
       game_state.engage
     elsif ordinary_attack_confirmed
@@ -5332,6 +5339,8 @@ class AttackProcess
     when 'close enough', 'must be closer'
       return false unless game_state.can_engage?
 
+      # Out of range: nothing holds this character in melee.
+      game_state.drbot_forget_melee_refusals if game_state.respond_to?(:drbot_forget_melee_refusals)
       game_state.engage
     when 'What are you', 'There is nothing'
       return false unless action.include?('whip')
@@ -5418,6 +5427,7 @@ class AttackProcess
       game_state.set_dance_queue
       case DRC.bput(game_state.next_dance_action, 'You must be closer', 'There is nothing else', 'What are you trying', /.*/)
       when 'You must be closer', 'There is nothing else', 'What are you trying'
+        game_state.drbot_forget_melee_refusals if game_state.respond_to?(:drbot_forget_melee_refusals)
         game_state.engage
       end
     elsif !game_state.retreating?
@@ -6550,13 +6560,23 @@ class GameState
     observation = fresh_target_selector
     return false unless observation && @target_observation == observation
 
+    # An ENGAGE the game refused because this character already holds melee
+    # is not sent again while that melee lasts.
+    held = drbot_melee_refusal_hold(observation)
+    return held unless held.nil?
+
     result = DRC.bput("engage #{observation.last}", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/, /^You will have to retreat from your current melee first/, /^You had better stand up first/, /^You spin around to face/)
     case result
     when /You are already (?:stealthily )?at melee/
+      drbot_note_melee_target(observation)
       true
     when /You are already advancing/, /You begin to advance/, /You begin to stealthily advance/
+      # Only a new advance proves that no creature holds this character.
+      drbot_forget_melee_refusals if result.match?(/You begin to/)
       pause 2
       false
+    when /You will have to retreat from your current melee first/
+      drbot_note_melee_refusal(observation)
     else
       reject_target_observation
       false
@@ -6568,11 +6588,17 @@ class GameState
 
     observation = fresh_target_selector
     return unless observation && @target_observation == observation
+    return unless drbot_melee_refusal_hold(observation).nil?
 
-    case DRC.bput("engage #{observation.last}", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/, /^You will have to retreat from your current melee first/, /^You had better stand up first/, /^You spin around to face/)
+    case (result = DRC.bput("engage #{observation.last}", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/, /^You will have to retreat from your current melee first/, /^You had better stand up first/, /^You spin around to face/))
     when /You are already advancing/, /You begin to advance/, /You begin to stealthily advance/
+      drbot_forget_melee_refusals if result.match?(/You begin to/)
       pause 2
     when /You are already (?:stealthily )?at melee/
+      drbot_note_melee_target(observation)
+      nil
+    when /You will have to retreat from your current melee first/
+      drbot_note_melee_refusal(observation)
       nil
     else
       reject_target_observation
@@ -6940,10 +6966,13 @@ class GameState
     @drbot_server_id_targeting == true || @drbot_supervised_group == 'lvt-goblins'
   end
 
-  def drbot_capture_living_target(excluded = [])
+  # `order` ranks the census (drbot_melee_target_order); IDs it omits are not
+  # candidates. Without it the census's own ID order applies.
+  def drbot_capture_living_target(excluded = [], order: nil)
     context = drbot_target_context
     return nil unless context
-    id = context[:ids].find { |candidate| !excluded.include?(candidate) }
+    candidates = order ? order & context[:ids] : context[:ids]
+    id = candidates.find { |candidate| !excluded.include?(candidate) }
     return nil unless id
     { id: id, room: context[:room], generation: context[:room_count], xml_room: context[:xml_room] }
   end
@@ -7153,7 +7182,8 @@ class GameState
       return nil if @drbot_target_retry_at && now < @drbot_target_retry_at
       context = drbot_target_context
       return nil unless context && context[:npcs].all? { |name| name.is_a?(String) && name.match?(/\A[a-zA-Z][a-zA-Z '-]*\z/) }
-      target = drbot_capture_living_target
+      order, excluded = drbot_melee_target_order(context)
+      target = drbot_capture_living_target(excluded, order: order)
       return nil unless target && drbot_living_target_current?(target) && context == drbot_target_context
 
       return [context[:room], context, target[:id], "##{target[:id]}"]
@@ -7201,10 +7231,141 @@ class GameState
   end
 
   def reject_target_observation
-    @target_observation = @drbot_corpse_target = @drbot_personal_melee_target = nil
+    @target_observation = @drbot_corpse_target = @drbot_personal_melee_target = @drbot_melee_pin = nil
     @drbot_target_rejected = true
     @drbot_target_retry_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2.0
     pause 2
+  end
+
+  # ---- A refused ENGAGE ends that attempt ----
+  #
+  # "You will have to retreat from your current melee first." means another
+  # creature already holds this character in melee. It used to be handled like
+  # any rejected target: a two-second back-off, then the same selector again.
+  # Server-ID selection always offered the lowest live ID, so Vrakk sent
+  # ENGAGE #3282527 948 times in 55 minutes (2026-09-29 02:08-03:03) while the
+  # two goblins at melee attacked him, and he never swung. No target here is
+  # required, so a refusal never retreats. The refused selector is recorded and
+  # not sent again while that melee can still be in place, and the trainer
+  # fights the creature that holds it.
+
+  def drbot_melee_refusals
+    @drbot_melee_refusals ||= {}
+  end
+
+  # The selector's refusal while the melee that refused it can still be in
+  # place. Records from another room are dropped. An ID refusal lasts while
+  # every creature present at the refusal is still here: a death, decay or
+  # departure may have ended that melee, an arrival cannot. A bare selector's
+  # refusal lasts until an attack finds nothing at melee or an advance begins
+  # (drbot_forget_melee_refusals); its plain attacks keep landing meanwhile.
+  def drbot_melee_refusal(selector, ids = nil)
+    room = Room.current&.id
+    drbot_melee_refusals.delete_if { |_, record| record[:room] != room }
+    record = drbot_melee_refusals[selector.to_s]
+    return record unless record && selector.to_s.start_with?('#')
+
+    ids ||= drbot_target_context&.fetch(:ids, nil)
+    return record unless ids
+
+    (record[:census] - ids).empty? ? record : nil
+  rescue StandardError
+    nil
+  end
+
+  # nil: send the ENGAGE. Otherwise engage's result without sending it. A bare
+  # selector's refusal proves melee, so the plain attack goes to the creature
+  # this character faces (true); an ID waits for selection to rank another
+  # creature first (false).
+  def drbot_melee_refusal_hold(observation)
+    return nil unless drbot_melee_refusal(observation.last)
+
+    !observation.last.to_s.start_with?('#')
+  end
+
+  # Records the refusal, logs it once per creature, and returns engage's
+  # result: true for a bare selector (attack what holds this character),
+  # false for an ID (the next selection ranks the census without it).
+  def drbot_note_melee_refusal(observation)
+    selector = observation.last.to_s
+    census = observation[1].is_a?(Hash) ? observation[1][:ids] : nil
+    drbot_melee_refusals[selector] = { room: observation[0], census: Array(census).dup,
+                                       at: Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+    @drbot_melee_pin = nil if @drbot_melee_pin && @drbot_melee_pin[:selector] == selector
+    logged = (@drbot_melee_refusals_logged ||= [])
+    unless logged.include?([observation[0], selector])
+      logged << [observation[0], selector]
+      logged.shift while logged.length > 100
+      DRC.message("*** combat-trainer: ENGAGE #{selector} refused: already in melee with another creature; fighting the creature in melee instead of retreating.")
+    end
+    return true unless selector.start_with?('#')
+
+    @target_observation = @drbot_corpse_target = @drbot_personal_melee_target = nil
+    false
+  end
+
+  # ENGAGE #id answered "already at melee": that creature holds this
+  # character, so it ranks first until it dies, leaves or is rejected.
+  def drbot_note_melee_target(observation)
+    selector = observation.last.to_s
+    drbot_melee_refusals.delete(selector)
+    @drbot_melee_pin = selector.start_with?('#') ? { room: observation[0], selector: selector } : nil
+  end
+
+  # A new advance, or an attack that finds nothing at melee, proves nothing
+  # holds this character in melee any longer.
+  def drbot_forget_melee_refusals
+    @drbot_melee_refusals = {}
+    @drbot_melee_pin = nil
+    @drbot_melee_exhausted = nil
+  end
+
+  # crtrStatus marks each hostile that is not engaged with this character
+  # disengaged="1": a buddy's opponent, an idle or passing creature.
+  def drbot_engaged_ids(ids)
+    Lich::DragonRealms::Creature.targets.filter_map do |creature|
+      id = creature.id.to_s
+      id if ids.include?(id) && creature.respond_to?(:crtr_flag?) && !creature.crtr_flag?(:disengaged)
+    end
+  rescue StandardError
+    []
+  end
+
+  # Server-ID ranking: the creature confirmed at melee, then creatures engaged
+  # with this character, then the rest, each in census order. IDs refused for
+  # the current melee are excluded; IDs refused before a creature left or died
+  # rank last, so a refused ENGAGE is not repeated while another creature is
+  # left to try. Returns [order, excluded].
+  def drbot_melee_target_order(context)
+    ids = context[:ids]
+    if @drbot_melee_room != context[:room]
+      drbot_forget_melee_refusals
+      @drbot_melee_room = context[:room]
+    end
+    drbot_melee_refusals.select! { |selector, _| ids.include?(selector.delete_prefix('#')) }
+    pin = @drbot_melee_pin && @drbot_melee_pin[:selector].delete_prefix('#')
+    @drbot_melee_pin = pin = nil unless pin && ids.include?(pin)
+    refused = drbot_melee_refusals.keys.map { |selector| selector.delete_prefix('#') }
+    excluded = refused.select { |id| drbot_melee_refusal("##{id}", ids) }
+    engaged = drbot_engaged_ids(ids)
+    order = ([pin].compact + ids.select { |id| engaged.include?(id) } + ids).uniq
+    order = (order - refused) + (order & refused)
+    return [order, excluded] if ids.empty? || !(ids - excluded).empty?
+
+    # Every creature here refused and none has left or died: the melee moved
+    # between refusals. Rank them again once the newest refusal is 15 s old;
+    # until then send nothing.
+    newest = drbot_melee_refusals.values.map { |record| record[:at] }.max
+    if Process.clock_gettime(Process::CLOCK_MONOTONIC) - newest >= 15.0
+      DRC.message('*** combat-trainer: every creature here refused ENGAGE for this melee; ranking them again.')
+      drbot_forget_melee_refusals
+      return [order, []]
+    end
+    unless @drbot_melee_exhausted == ids
+      @drbot_melee_exhausted = ids.dup
+      DRC.message('*** combat-trainer: every creature here refused ENGAGE for this melee; not engaging until one leaves or dies (15 s at most).')
+    end
+    [order, excluded]
   end
 
   def target_selector
