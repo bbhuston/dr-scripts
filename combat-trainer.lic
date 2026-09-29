@@ -2089,13 +2089,20 @@ class SafetyProcess
   end
 
   # Once per trainer run: the floor stays crossed on every cleanup tick.
-  def stop_hunt_below_health_floor
+  # Cleanup starts now and skips the optional finish-killing phase, as a
+  # bleeding stop skips it and the weapon custody stop ends it: the EXIT this
+  # replaces left at once, and a kill phase could otherwise keep fighting
+  # below the floor for up to 120 seconds (profiles without skip_last_kill,
+  # or a kill phase an earlier stop already began).
+  def stop_hunt_below_health_floor(game_state)
     return if @health_floor_stop_requested
 
     @health_floor_stop_requested = true
     DRC.message("*** combat-trainer: Health #{DRStats.health}% is below the #{@health_threshold}% floor (health_threshold). Stopping hunt instead of exiting the game.")
     $HUNTING_BUDDY&.stop_hunting
     $COMBAT_TRAINER&.stop
+    game_state.next_clean_up_step unless game_state.cleaning_up?
+    game_state.force_cleanup
   end
 
   def execute(game_state)
@@ -2144,7 +2151,7 @@ class SafetyProcess
 
     if DRStats.health < @health_threshold && !waive_floor
       if drbot_supervised?
-        stop_hunt_below_health_floor
+        stop_hunt_below_health_floor(game_state)
       else
         fput 'exit'
       end

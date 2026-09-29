@@ -4006,6 +4006,15 @@ RSpec.describe SafetyProcess do
       instance
     end
 
+    # A live GameState: the floor stop drives the trainer's real cleanup steps.
+    def floor_state(clean_up_step: nil, skip_last_kill: false)
+      state = GameState.allocate
+      { clean_up_step: clean_up_step, skip_last_kill: skip_last_kill, stop_on_bleeding: true,
+        danger: false, retreating: false }.each { |k, v| state.instance_variable_set(:"@#{k}", v) }
+      allow(state).to receive(:bleeding?).and_return(false)
+      state
+    end
+
     it 'keeps the upstream EXIT without drbot supervision' do
       $DRBOT_DIRECT_CONTROL = nil
       instance = below_floor
@@ -4021,7 +4030,7 @@ RSpec.describe SafetyProcess do
       supervise
       instance = below_floor
 
-      instance.execute(build_game_state)
+      instance.execute(floor_state)
 
       expect(instance).not_to have_received(:fput).with('exit')
       expect($HUNTING_BUDDY).to have_received(:stop_hunting).once
@@ -4034,7 +4043,8 @@ RSpec.describe SafetyProcess do
       supervise
       instance = below_floor
 
-      3.times { instance.execute(build_game_state) }
+      state = floor_state
+      3.times { instance.execute(state) }
 
       expect(instance).not_to have_received(:fput).with('exit')
       expect($HUNTING_BUDDY).to have_received(:stop_hunting).once
@@ -4071,10 +4081,56 @@ RSpec.describe SafetyProcess do
       $HUNTING_BUDDY = nil
       instance = below_floor
 
-      instance.execute(build_game_state)
+      instance.execute(floor_state)
 
       expect(instance).not_to have_received(:fput).with('exit')
       expect($COMBAT_TRAINER).to have_received(:stop).once
+    end
+
+    # Like a bleeding stop, the floor stop skips the optional finish-killing
+    # phase: the EXIT it replaces left at once, and a kill phase could keep
+    # fighting below the floor for up to 120 seconds.
+    it 'starts cleanup without the last kill when skip_last_kill is off' do
+      supervise
+      instance = below_floor
+      state = floor_state(skip_last_kill: false)
+
+      instance.execute(state)
+
+      expect(state.finish_killing?).to be false
+      expect(state.finish_spell_casting?).to be true
+    end
+
+    it 'ends a kill phase an earlier stop already began' do
+      supervise
+      instance = below_floor
+      state = floor_state(clean_up_step: 'kill')
+
+      instance.execute(state)
+
+      expect(state.finish_killing?).to be false
+      expect(state.finish_spell_casting?).to be true
+    end
+
+    it 'leaves a later cleanup step alone' do
+      supervise
+      instance = below_floor
+      state = floor_state(clean_up_step: 'dismiss_pet')
+
+      instance.execute(state)
+
+      expect(state.dismiss_pet?).to be true
+    end
+
+    it 'leaves cleanup alone without drbot supervision' do
+      $DRBOT_DIRECT_CONTROL = nil
+      instance = below_floor
+      state = floor_state
+
+      instance.execute(state)
+
+      expect(instance).to have_received(:fput).with('exit')
+      expect(state.cleaning_up?).to be false
     end
   end
 
