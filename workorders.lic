@@ -524,13 +524,46 @@ class WorkOrders
       price = forging_material_cost(recipe, stock, quantity)
       next "#{quantity} #{name} stock and parts cost #{price}; material budget is #{budget}" if price > budget
     end
-    return true if blocked.empty?
+    return forging_tools_present?(recipes) if blocked.empty?
     if any_recipe && blocked.length < recipes.length
       Lich::Messaging.msg('plain', "WorkOrders: Stock permits #{recipes.length - blocked.length}/#{recipes.length} admitted candidates; one request only, unsupported offers will be preserved without spending")
-      return true
+      return forging_tools_present?(recipes)
     end
 
     Lich::Messaging.msg('bold', "WorkOrders: BLOCKED stock preflight: #{blocked.join('; ')}; recipe choices and materials preserved, no request or purchase")
+    false
+  end
+
+  # drg-w12: forge.lic stops when it cannot get a forging tool or its recipe
+  # book, but only after this runner has bought the ingot, and every later pass
+  # resumes the order and buys another. Before any request or purchase, look
+  # for each where DRCC.get_crafting_item will take it: in the crafting
+  # container when crafting_items_in_container lists it (and no forging belt
+  # does), otherwise anywhere; one already held counts. A tool found once stays
+  # found for this run.
+  def forging_tools_present?(recipes)
+    books = if @settings.master_crafting_book
+              []
+            else
+              recipes.grep(Hash).filter_map { |recipe| "#{recipe['type'].to_s.downcase} book" unless recipe['name'].to_s.include?('temper') }
+            end
+    bag = @settings.crafting_container
+    listed = @settings.crafting_items_in_container.to_a
+    belt = @settings.forging_belt
+    @forging_tools_found ||= []
+    where = lambda do |name|
+      on_belt = belt && belt['items'].to_a.any? { |item| /\b#{name}/i =~ item || /\b#{item}/i =~ name }
+      bag if bag && !on_belt && listed.include?(name)
+    end
+    missing = (@settings.forging_tools.to_a + books).uniq.reject do |name|
+      found = @forging_tools_found.include?(name) || DRCI.in_hands?(name) || DRCI.exists?(name, where.call(name))
+      @forging_tools_found << name if found
+      found
+    end
+    return true if missing.empty?
+
+    named = missing.map { |name| [name, where.call(name)].compact.join(' in ') }
+    Lich::Messaging.msg('bold', "WorkOrders: BLOCKED tool preflight: missing #{named.join(', ')}; forge would stop after the purchase. No request or purchase")
     false
   end
 

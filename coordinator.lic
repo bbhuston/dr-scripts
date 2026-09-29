@@ -1046,7 +1046,7 @@ end
 # A crafting child stops when a required item is missing (drg-w12).
 #
 # dr-scripts' common-crafting.lic ended DRCC.get_crafting_item's missing-item
-# branch with `exit unless skip_exit`, and every crafting script is written for
+# branch with `exit unless skip_exit`, and most crafting scripts are written for
 # that. The pinned Lich 5.20 port still prints "Cannot continue crafting without
 # required item. Stopping script." but then returns nil, so the caller goes on
 # without the item. Agondar's remedy child did that for eight hours on
@@ -1055,15 +1055,38 @@ end
 # asked again (375 times between 11:18 and 14:42 alone).
 #
 # Every crafting script drbot runs is a child of this coordinator, so the
-# coordinator restores upstream's contract for its Lich process before the
-# first task: once Lich has printed that line, the script whose thread asked
-# for the item records it (drbot_crafting_missing_item on its Script handle),
-# logs one status line and exits. A call with skip_exit still returns nil, and
-# nothing else changes. Starting the coordinator again replaces the two hook
-# bodies instead of stacking them.
+# coordinator restores that contract for its Lich process before the first
+# task: once Lich has printed that line, the script whose thread asked for the
+# item records it (drbot_crafting_missing_item on its Script handle), logs one
+# status line and exits. A call with skip_exit still returns nil.
+#
+# The methods in checked_callers were rewritten upstream for Lich's nil: right
+# after the GET they check the hands, then stow, release crafting magic, log
+# and exit themselves (forge's verify_tool_in_hand and cleanup_and_exit, sew's
+# and tinker's swap_tool). A call made from one of them keeps its nil, so that
+# cleanup runs; the item is still recorded. Lich names each frame of a script
+# after the script, so the asking script's first frame names its method.
+# Starting the coordinator again replaces the two hook bodies instead of
+# stacking them.
 module DrfCraftingItemStop
   def self.stop_text
     'DRCC: Cannot continue crafting without required item. Stopping script.'
+  end
+
+  def self.checked_callers
+    {
+      'forge' => %w[get_tool swap_tool prep_with_instructions prep_with_individual_book],
+      'sew' => %w[swap_tool],
+      'tinker' => %w[swap_tool]
+    }
+  end
+
+  def self.checks_itself?(script_name, locations)
+    methods = checked_callers[script_name]
+    return false unless methods
+
+    frame = locations.find { |location| location.path == script_name }
+    !frame.nil? && methods.include?(frame.base_label)
   end
 
   def self.install
@@ -1071,12 +1094,15 @@ module DrfCraftingItemStop
 
     key = :drf_crafting_item_stop
     stop_text = self.stop_text
+    stopper = self
     getter = Module.new do
       define_method(:get_crafting_item) do |name, bag, bag_items, belt, skip_exit = false|
         return super(name, bag, bag_items, belt, skip_exit) if skip_exit
 
+        script = Script.current
+        checked = !script.nil? && stopper.checks_itself?(script.name, caller_locations(1))
         asked = Thread.current.thread_variable_get(key) || []
-        Thread.current.thread_variable_set(key, asked + [name])
+        Thread.current.thread_variable_set(key, asked + [[name, checked]])
         begin
           super(name, bag, bag_items, belt, skip_exit)
         ensure
@@ -1087,12 +1113,14 @@ module DrfCraftingItemStop
     messages = Module.new do
       define_method(:msg) do |type = 'info', text = '', **options|
         result = super(type, text, **options)
-        name = text == stop_text && (Thread.current.thread_variable_get(key) || []).last
+        name, checked = (Thread.current.thread_variable_get(key) || []).last if text == stop_text
         script = name && Script.current
         if script
           script.define_singleton_method(:drbot_crafting_missing_item) { name }
-          echo("***STATUS*** #{script.name} stopped: missing required crafting item #{name}")
-          exit
+          unless checked
+            echo("***STATUS*** #{script.name} stopped: missing required crafting item #{name}")
+            exit
+          end
         end
         result
       end

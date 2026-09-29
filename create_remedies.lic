@@ -24,8 +24,10 @@ class CreateRemedies
     recipe = get_data('recipes').crafting_recipes.find { |each_recipe| each_recipe['name'] =~ /#{args.target}/i }
     DRC.message("Recipe is: #{recipe}.") if debug
     # Tools, solvent and catalyst first: no herb is foraged or crafted without
-    # them, and remedy.lic stops at the first one it cannot get.
-    missing = (remedy_tools(recipe) + consumables(recipe, catalyst)).reject { |name| supply_available?(name) }
+    # them, and remedy.lic stops at the first one it cannot get. With `tools`,
+    # clerk-tools hands the tools over below, so only the supplies are checked.
+    wanted = (tools ? [] : remedy_tools(recipe)) + consumables(recipe, catalyst)
+    missing = wanted.reject { |name| supply_available?(name) }
     unless missing.empty?
       reason = 'missing ' + missing.map { |name| [name, supply_container(name)].compact.join(' in ') }.join(', ')
       Script.current.define_singleton_method(:drbot_remedy_unavailable) { reason }
@@ -83,10 +85,7 @@ class CreateRemedies
       reason = "remedy stopped: missing #{child.drbot_crafting_missing_item}"
       Script.current.define_singleton_method(:drbot_remedy_unavailable) { reason }
       DRC.message("***STATUS*** create_remedies stopped #{recipe['name']}: #{reason}")
-      vessel = recipe['container']
-      if @settings.crafting_container && [DRC.left_hand, DRC.right_hand].compact.any? { |h| h =~ /\b#{Regexp.escape(vessel)}\b/i }
-        DRCC.stow_crafting_item(vessel, @settings.crafting_container, @settings.alchemy_belt)
-      end
+      put_away_after_stop(recipe, [herb1, recipe['herb2']])
     elsif @settings.crafting_container && [DRC.left_hand, DRC.right_hand].compact.any? { |h| h =~ /\b#{Regexp.escape(recipe['noun'])}\b/i }
       DRCC.stow_crafting_item(recipe['noun'], @settings.crafting_container, @settings.alchemy_belt)
     end
@@ -94,15 +93,20 @@ class CreateRemedies
     get_store_tools("store") if tools
   end
 
-  # Every remedy takes a solvent and a catalyst besides its herbs. Wound
-  # remedies (chapters 3 and 4 of the remedies book) take water and scar
-  # remedies (5 and 6) alcohol; for another chapter remedy.lic may ask for
-  # either. A water_container or alcohol_container is remedy.lic's own supply.
+  # Every remedy takes a solvent and a catalyst besides its herbs. A recipe
+  # that names its liquid takes that one. Otherwise wound remedies (chapters 3
+  # and 4 of the remedies book) take water and scar remedies (5 and 6) alcohol,
+  # and for another chapter remedy.lic may ask for either. A water_container or
+  # alcohol_container is remedy.lic's own supply.
   def consumables(recipe, catalyst)
-    solvents = case recipe['chapter'].to_i
-               when 3, 4 then %w[water]
-               when 5, 6 then %w[alcohol]
-               else %w[water alcohol]
+    solvents = if %w[water alcohol].include?(recipe['liquid'])
+                 [recipe['liquid']]
+               else
+                 case recipe['chapter'].to_i
+                 when 3, 4 then %w[water]
+                 when 5, 6 then %w[alcohol]
+                 else %w[water alcohol]
+                 end
                end
     supplied = { 'water' => @settings.water_container, 'alcohol' => @settings.alcohol_container }
     solvents.reject { |solvent| supplied[solvent] } + [catalyst]
@@ -115,11 +119,39 @@ class CreateRemedies
   # the coordinator's delay would spend another batch.
   def remedy_tools(recipe)
     tools = @settings.alchemy_tools.to_a
-    pattern = recipe['container'] =~ /bowl/ ? /cauldron|bowl/ : /#{recipe['container']}/
-    vessel = tools.find { |tool| pattern =~ tool } || recipe['container']
+    vessel = remedy_vessel(recipe)
     stirrer = /mort/ =~ vessel ? (tools.find { |tool| /pestle/ =~ tool } || 'pestle') : 'mixing stick'
     book = 'remed book' unless @settings.master_crafting_book
     [book, vessel, stirrer, 'sieve'].compact
+  end
+
+  def remedy_vessel(recipe)
+    pattern = recipe['container'] =~ /bowl/ ? /cauldron|bowl/ : /#{recipe['container']}/
+    @settings.alchemy_tools.to_a.find { |tool| pattern =~ tool } || recipe['container']
+  end
+
+  # After a stop, put back what remedy.lic had out: first any herb stack it
+  # held (into the herb container, as remedy.lic stows herbs; a held name that
+  # ends in the herb, so not an unfinished georin salve), then the vessel with
+  # its unfinished remedy. While gathering herbs remedy.lic keeps the vessel at
+  # its feet, so a vessel not in hand is lifted from there first.
+  def put_away_after_stop(recipe, herbs)
+    bag = @settings.crafting_container
+    return unless bag
+
+    belt = @settings.alchemy_belt
+    herbs = herbs.compact - ['na', 'water', 'alcohol', 'catalyst', 'nugget', 'coal nugget']
+    [DRC.right_hand, DRC.left_hand].compact.each do |item|
+      herb = herbs.find { |name| item =~ /\b#{Regexp.escape(name)}\z/i }
+      DRCC.stow_crafting_item(herb, @settings.herb_container || bag, belt) if herb
+    end
+    vessel = remedy_vessel(recipe)
+    DRCI.lift?(vessel) unless held?(vessel)
+    DRCC.stow_crafting_item(vessel, bag, belt) if held?(vessel)
+  end
+
+  def held?(noun)
+    [DRC.left_hand, DRC.right_hand].compact.any? { |item| item =~ /\b#{Regexp.escape(noun)}\b/i }
   end
 
   # remedy.lic takes each with DRCC.get_crafting_item: from the crafting
