@@ -117,7 +117,17 @@ class WorkOrders
   LOGBOOK_TIMED_REMAINING_PATTERN = /You must bundle and deliver (?<remaining>\d+) more within the next (?<left>\d+) rois(?:aen|an)\b/.freeze
   LOGBOOK_ITEM_PATTERN = /This logbook is tracking a work order requiring you to craft (?<item>.+?) from any/i.freeze
   LOGBOOK_NO_ORDER_PATTERN = /(?:\AThis logbook is not currently tracking (?:a work order|any work orders)\.\z|This logbook has been used to complete:)/i.freeze
+  # drf (drg-v4vt): the whole active-order line in one match. DRC.bput returns
+  # only the matched text, and a second read sent before the first read's
+  # trailing "This logbook has been used to complete:" arrived matched that
+  # stale line (Khazdar 2026-09-30 16:53:00), so one read now yields the item,
+  # the remaining count and the time limit together.
+  LOGBOOK_ACTIVE_PATTERN = /This logbook is tracking a work order requiring you to craft (?<item>.+?) from any material\.\s+You must bundle and deliver (?<remaining>\d+) more within the next (?<left>\d+) rois(?:aen|an)\b/i.freeze
+  # A read's first line only: every read also ends with "This logbook has been
+  # used to complete:", which must never answer a later read.
+  LOGBOOK_NOT_TRACKING_PATTERN = /\AThis logbook is not currently tracking (?:a work order|any work orders)\./i.freeze
   RESUME_LOGBOOK_PATTERNS = [
+    LOGBOOK_ACTIVE_PATTERN,
     LOGBOOK_ITEM_PATTERN,
     'This work order appears to be complete.',
     LOGBOOK_NO_ORDER_PATTERN,
@@ -338,8 +348,9 @@ class WorkOrders
   # drf (drg-9yh): the result coordinator's train_forging reads from this
   # script's handle after it exits, the way it reads a box handoff or remedy
   # result. Statuses: turned_in; the benign no-spend exits no_suitable_offer,
-  # master_not_found, kept_unadmitted, kept_short_time, mindstate and
-  # turnin_retry; anything else (failed) latches train_forging.
+  # master_not_found, kept_unadmitted, kept_short_time, mindstate,
+  # turnin_retry and confirm_mismatch; anything else (failed) latches
+  # train_forging.
   def publish_result(status, detail = nil)
     result = { 'status' => status.to_s, 'detail' => detail.to_s[0, 200], 'turned_in' => @orders_turned_in.to_i }
     @workorders_result = result
@@ -550,7 +561,7 @@ class WorkOrders
 
     # The timed pattern comes first: DRC.bput returns only the matched text,
     # and the time limit is read from this same line (drg-9yh).
-    result = DRC.bput("read my #{logbook} logbook", LOGBOOK_TIMED_REMAINING_PATTERN, *READ_LOGBOOK_PATTERNS, 'has expired', LOGBOOK_NO_ORDER_PATTERN, 'I could not find', 'What were you')
+    result = DRC.bput("read my #{logbook} logbook", LOGBOOK_TIMED_REMAINING_PATTERN, *READ_LOGBOOK_PATTERNS, 'has expired', LOGBOOK_NOT_TRACKING_PATTERN, 'I could not find', 'What were you')
     stow_tool('logbook')
     timed = result&.match(LOGBOOK_TIMED_REMAINING_PATTERN)
     @logbook_minutes_left = timed && timed[:left].to_i
@@ -607,8 +618,15 @@ class WorkOrders
     end
 
     @logbook_minutes_left = nil
-    remaining = logbook_remaining(logbook)
-    minutes_left = @logbook_minutes_left
+    active = result.match(LOGBOOK_ACTIVE_PATTERN)
+    if active
+      stow_tool('logbook')
+      remaining = active[:remaining].to_i
+      minutes_left = active[:left].to_i
+    else
+      remaining = logbook_remaining(logbook)
+      minutes_left = @logbook_minutes_left
+    end
     if remaining.nil?
       Lich::Messaging.msg('bold', 'WorkOrders: Active logbook count is ambiguous - no request or purchase was made')
       exit
@@ -648,7 +666,11 @@ class WorkOrders
     )
     confirmed = read_active_work_order(recipes, logbook)
     unless confirmed && confirmed == requested
-      Lich::Messaging.msg('bold', 'WorkOrders: Requested order did not match the confirmed logbook state; stopping before purchase')
+      # drf (drg-v4vt): nothing has been bought, and the next pass reads the
+      # logbook afresh and resumes or asks again, so this does not latch.
+      detail = "requested #{requested.inspect}, logbook #{confirmed.inspect}"
+      Lich::Messaging.msg('bold', "WorkOrders: Requested order did not match the confirmed logbook state; stopping before purchase (#{detail})")
+      publish_result('confirm_mismatch', detail)
       exit
     end
     selected = recipes.find { |candidate| candidate['name'] == confirmed.first }
@@ -793,9 +815,17 @@ class WorkOrders
     end
 
     result = DRC.bput("read my #{logbook} logbook", *RESUME_LOGBOOK_PATTERNS)
-    match = result&.match(LOGBOOK_ITEM_PATTERN)
-    recipe = match && recipes.find { |candidate| candidate['name'] == match[:item] }
-    remaining = recipe && logbook_remaining(logbook)
+    active = result&.match(LOGBOOK_ACTIVE_PATTERN)
+    if active
+      stow_tool('logbook')
+      recipe = recipes.find { |candidate| candidate['name'] == active[:item] }
+      remaining = active[:remaining].to_i
+    else
+      match = result&.match(LOGBOOK_ITEM_PATTERN)
+      recipe = match && recipes.find { |candidate| candidate['name'] == match[:item] }
+      remaining = recipe && logbook_remaining(logbook)
+      stow_tool('logbook') unless recipe
+    end
     return nil unless recipe && remaining&.positive?
 
     [recipe['name'], remaining]

@@ -867,7 +867,7 @@ class Coordinator
   # which keeps train_forging from running again, across restarts, until an
   # operator reconciles and clears it. Before this latch every later pass
   # resumed the order and bought another ingot before forging failed again.
-  FORGING_BENIGN_RESULTS = %w[turned_in no_suitable_offer master_not_found kept_unadmitted kept_short_time mindstate turnin_retry].freeze
+  FORGING_BENIGN_RESULTS = %w[turned_in no_suitable_offer master_not_found kept_unadmitted kept_short_time mindstate turnin_retry confirm_mismatch].freeze
   # What workorders starts on its own and leaves running when it is killed.
   FORGING_GRANDCHILDREN = %w[smith forge go2].freeze
 
