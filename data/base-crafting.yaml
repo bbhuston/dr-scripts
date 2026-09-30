@@ -392,10 +392,9 @@ blacksmithing:
       - 8777
       - 8778
       # - 760  # do not add back in - removed because it is outside the forging society and prone to getting stolen from
-      - 19_252
-      - 19_211
-      - 50_270
-      - 19_267
+      # drf (drg-c7i): the Therengia Lava Forge anvils 19_252, 19_211, 50_270
+      # and 19_267 are 72 hops from the Crossing through the Obsidian Pass; a
+      # busy society now waits in the idle room instead of walking there.
     crucibles:
       - 8774
       - 19_030
@@ -406,11 +405,8 @@ blacksmithing:
       - 8909
       - 8910
       - 8911
-      - 50_270
-      - 19_267
-      - 19_261
-      - 19_252
-      - 19_255
+      # drf (drg-c7i): Therengia grindstones 50_270, 19_267, 19_261, 19_252
+      # and 19_255 removed for the same reason.
     private_forge: 16936
     logbook: forging
     pattern-book: blacksmithing

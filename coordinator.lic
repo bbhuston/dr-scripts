@@ -375,6 +375,7 @@ class Coordinator
 
   def predicate_met?(task)
     return false if task[:retry_after] && Time.now < task[:retry_after]
+    return false if task[:action] == 'train_forging' && forging_latched?
 
     echo("Checking predicates for task: #{task}") if @debug
     start = evaluate_predicate?(task[:start_on])
@@ -857,9 +858,103 @@ class Coordinator
     wait_for_child('sell-loot')
   end
 
+  # drf (drg-1ku, drg-9yh): the fail-closed runner (workorders_resume_or_request)
+  # publishes drbot_workorders_result on its Script handle. A turn-in or one of
+  # the benign no-spend exits lets sell-loot bank the pass as before. Anything
+  # else -- a forge or bundle failure after an ingot was bought, a preflight
+  # block, a missing result, or the train_forging_deadline_seconds bound --
+  # holds the schedule where it stands and records UserVars.drbot_forging_hold,
+  # which keeps train_forging from running again, across restarts, until an
+  # operator reconciles and clears it. Before this latch every later pass
+  # resumed the order and bought another ingot before forging failed again.
+  FORGING_BENIGN_RESULTS = %w[turned_in no_suitable_offer master_not_found kept_unadmitted kept_short_time mindstate turnin_retry].freeze
+  # What workorders starts on its own and leaves running when it is killed.
+  FORGING_GRANDCHILDREN = %w[smith forge go2].freeze
+
   def train_forging(_task)
-    wait_for_child('workorders', ['Blacksmithing'])
-    wait_for_child('sell-loot')
+    unless @settings.workorders_resume_or_request
+      wait_for_child('workorders', ['Blacksmithing'])
+      wait_for_child('sell-loot')
+      return
+    end
+
+    child, failure = run_forging_child
+    result = child.respond_to?(:drbot_workorders_result) ? child.drbot_workorders_result : nil
+    status = result.is_a?(Hash) ? result['status'].to_s : nil
+    if failure.nil? && FORGING_BENIGN_RESULTS.include?(status)
+      echo("***STATUS*** train_forging: workorders #{status} (#{result['detail']})")
+      wait_for_child('sell-loot')
+      return
+    end
+
+    latch_forging(failure || (status ? "workorders #{status}: #{result['detail']}" : 'workorders published no result'))
+  end
+
+  def run_forging_child
+    return [nil, 'workorders was already running; not started'] if Script.running?('workorders')
+
+    @child_script = 'workorders'
+    child = start_script('workorders', ['Blacksmithing'])
+    return [nil, 'workorders start unconfirmed'] unless child
+
+    limit = @settings.train_forging_deadline_seconds
+    deadline = limit.is_a?(Integer) && limit.positive? ? Time.now + limit : nil
+    while Script.list.any? { |candidate| candidate.equal?(child) }
+      if deadline && Time.now >= deadline
+        stop_forging_family(child)
+        return [nil, "workorders exceeded #{limit} seconds; stopped with smith, forge and go2, custody unconfirmed"]
+      end
+      pause 0.5
+    end
+    [child, nil]
+  ensure
+    @child_script = nil
+  end
+
+  def stop_forging_family(child)
+    begin
+      child.kill if Script.list.any? { |candidate| candidate.equal?(child) }
+    rescue StandardError
+      nil
+    end
+    FORGING_GRANDCHILDREN.each { |name| stop_script(name) if Script.running?(name) }
+  end
+
+  def latch_forging(detail)
+    reason = "train_forging stopped (#{detail}); reconcile the forging logbook, ingots, coins and hands, " \
+             'then clear UserVars.drbot_forging_hold'
+    record = { 'reason' => reason, 'since' => Time.now.to_f }
+    record['persistence_unconfirmed'] = true unless persist_forging_hold(record)
+    UserVars.drbot_forging_hold = record
+    @task_hold = reason
+    UserVars.coordinator_safety_hold = record
+    echo("***COORDINATOR HOLD*** #{reason}")
+  end
+
+  # Vars.save can cache its digest before SQL succeeds; verify the stored
+  # character-scoped record, as combat-trainer does for its custody hold.
+  def persist_forging_hold(record)
+    UserVars.drbot_forging_hold = record
+    Vars.save
+    persisted = Lich.db_mutex.synchronize do
+      blob = Lich.db.get_first_value('SELECT hash FROM uservars WHERE scope=?;',
+                                     ["#{XMLData.game}:#{XMLData.name}".encode('UTF-8')])
+      blob && Marshal.load(blob)['drbot_forging_hold']
+    end
+    persisted == record
+  rescue StandardError
+    false
+  end
+
+  def forging_latched?
+    hold = UserVars.drbot_forging_hold
+    return false unless hold.is_a?(Hash)
+
+    unless @forging_latch_reported
+      @forging_latch_reported = true
+      echo("***STATUS*** train_forging skipped until UserVars.drbot_forging_hold is cleared: #{hold['reason']}")
+    end
+    true
   end
 
   def crossing_training(task)
@@ -1033,6 +1128,10 @@ before_dying do
   # coordinator is killed.
   ['hunting-buddy', 'crossing-training', $COORDINATOR&.child_script].compact.uniq.each do |script_name|
     stop_script(script_name) if Script.running?(script_name)
+  end
+  # A killed workorders leaves smith, forge or a walk running (drg-9yh).
+  if $COORDINATOR&.child_script == 'workorders'
+    Coordinator::FORGING_GRANDCHILDREN.each { |script_name| stop_script(script_name) if Script.running?(script_name) }
   end
   # run_town_task and run_hunting_task pause this on :pause_sanowret and only
   # unpause on the success path, so any crash left it paused indefinitely.

@@ -113,6 +113,8 @@ class WorkOrders
   ].freeze
 
   LOGBOOK_REMAINING_PATTERN = /You must bundle and deliver (?<remaining>\d+) more/.freeze
+  # drf (drg-9yh): the same logbook line carries the order's time limit.
+  LOGBOOK_TIMED_REMAINING_PATTERN = /You must bundle and deliver (?<remaining>\d+) more within the next (?<left>\d+) rois(?:aen|an)\b/.freeze
   LOGBOOK_ITEM_PATTERN = /This logbook is tracking a work order requiring you to craft (?<item>.+?) from any/i.freeze
   LOGBOOK_NO_ORDER_PATTERN = /(?:\AThis logbook is not currently tracking (?:a work order|any work orders)\.\z|This logbook has been used to complete:)/i.freeze
   RESUME_LOGBOOK_PATTERNS = [
@@ -174,6 +176,11 @@ class WorkOrders
     @workorders_override_store = @settings.workorders_override_store
     @workorders_materials = @settings.workorders_materials
     @resume_or_request = @settings.workorders_resume_or_request
+    # drf (drg-9yh): until this order ends in a turn-in or a benign no-spend
+    # exit, the published result says it failed. coordinator's train_forging
+    # latches on anything it does not recognize, so an unexpected exit, crash or
+    # stop can never read as success.
+    publish_result('failed', 'ended without a turn-in or a benign no-spend exit') if @resume_or_request
 
     Flags.add('proper-repair', 'Your excellent training in the ways of tool repair')
 
@@ -299,12 +306,15 @@ class WorkOrders
     return repair_items(info, tools) if repair
 
     if @resume_or_request && quantity.zero?
-      complete_work_order(info)
-      return
+      return unless complete_work_order(info)
+
+      return chain_next_order(discipline, repair, turnin, skill)
     end
 
     if DRSkill.getxp(skill) > @craft_max_mindstate
       Lich::Messaging.msg('bold', "WorkOrders: Exiting because your current mindstate for #{skill} (#{DRSkill.getxp(skill)}) is over the set maximum craft_max_mindstate: #{@craft_max_mindstate}")
+      # Nothing was bought for the order; the next pass resumes it.
+      publish_result('mindstate', "#{skill} mindstate #{DRSkill.getxp(skill)}") if @resume_or_request
       exit
     end
 
@@ -322,6 +332,77 @@ class WorkOrders
     return if @resume_or_request && turned_in == false
 
     repair_items(info, tools) if @workorders_repair
+    chain_next_order(discipline, repair, turnin, skill) if @resume_or_request
+  end
+
+  # drf (drg-9yh): the result coordinator's train_forging reads from this
+  # script's handle after it exits, the way it reads a box handoff or remedy
+  # result. Statuses: turned_in; the benign no-spend exits no_suitable_offer,
+  # master_not_found, kept_unadmitted, kept_short_time, mindstate and
+  # turnin_retry; anything else (failed) latches train_forging.
+  def publish_result(status, detail = nil)
+    result = { 'status' => status.to_s, 'detail' => detail.to_s[0, 200], 'turned_in' => @orders_turned_in.to_i }
+    @workorders_result = result
+    script = Script.current if defined?(Script) && Script.respond_to?(:current)
+    script&.define_singleton_method(:drbot_workorders_result) { result }
+    result
+  end
+
+  # A bounded integer setting; anything missing, malformed or out of range
+  # keeps the conservative default (drf_profile_policy refuses such values).
+  def bounded_setting(name, default, range)
+    value = begin
+      @settings&.public_send(name)
+    rescue NoMethodError
+      nil
+    end
+    value.is_a?(Integer) && range.cover?(value) ? value : default
+  end
+
+  # Asks per pass. One (the default) keeps the single-request behavior; more
+  # also replaces an active order this runner will not work (an unadmitted
+  # recipe, or too little time left), because a new request "replaces the
+  # first without penalty" once nothing is bundled (Elanthipedia, Work order).
+  # The game itself refuses the replacement while items are bundled.
+  def max_requests
+    bounded_setting(:workorders_max_requests, 1, 1..25)
+  end
+
+  def replace_unworkable_orders?
+    max_requests > 1
+  end
+
+  # drf (drg-9yh): after a turn-in, request another order in the same pass
+  # while the skill is still below workorders_chain_below_mindstate, up to
+  # workorders_orders_per_pass orders. Off unless both are configured.
+  def chain_next_order(discipline, repair, turnin, skill)
+    @orders_turned_in = @orders_turned_in.to_i + 1
+    publish_result('turned_in', "#{@orders_turned_in} order(s) turned in this pass")
+    limit = bounded_setting(:workorders_orders_per_pass, 1, 1..3)
+    below = bounded_setting(:workorders_chain_below_mindstate, nil, 1..34)
+    return unless below && @orders_turned_in < limit
+
+    mindstate = DRSkill.getxp(skill)
+    unless mindstate.is_a?(Integer) && mindstate < below
+      Lich::Messaging.msg('plain', "WorkOrders: #{skill} mindstate #{mindstate.inspect} is not below #{below}; no further order this pass")
+      return
+    end
+    Lich::Messaging.msg('plain', "WorkOrders: #{skill} mindstate #{mindstate} is below #{below}; requesting order #{@orders_turned_in + 1} of #{limit} this pass")
+    work_order(discipline, repair, turnin)
+  end
+
+  # Why a resumed order must not be bought for: too few roisaen left (read by
+  # the last logbook_remaining) for the remaining pieces plus the turn-in
+  # search, or no readable limit. nil when there is time, or when the guard is
+  # not configured (workorders_minutes_per_piece unset).
+  def resumed_order_time_shortfall(left, remaining)
+    per_piece = bounded_setting(:workorders_minutes_per_piece, nil, 1..60)
+    return nil unless per_piece
+
+    needed = remaining * per_piece + bounded_setting(:workorders_turnin_minutes, 15, 0..60)
+    return nil if left.is_a?(Integer) && left >= needed
+
+    left.is_a?(Integer) ? "#{left} roisaen left, about #{needed} needed for #{remaining} piece(s) and the turn-in" : 'time left is unreadable'
   end
 
   def complete_work_order(info)
@@ -356,6 +437,9 @@ class WorkOrders
     DRCI.stow_hands
     unless find_npc(info['npc-rooms'], info['npc_last_name'], purpose: :turn_in)
       Lich::Messaging.msg('bold', "WorkOrders: Could not find NPC #{info['npc_last_name']} in any of the expected rooms")
+      # The complete order stays in the logbook and the next pass turns it
+      # in; latching here would let it expire with its bundled items.
+      publish_result('turnin_retry', "#{info['npc_last_name']} not found for the turn-in")
       return false
     end
     unless DRCI.get_item?("#{info['logbook']} logbook")
@@ -406,8 +490,12 @@ class WorkOrders
       return nil
     end
 
-    result = DRC.bput("read my #{logbook} logbook", *READ_LOGBOOK_PATTERNS, 'has expired', LOGBOOK_NO_ORDER_PATTERN, 'I could not find', 'What were you')
+    # The timed pattern comes first: DRC.bput returns only the matched text,
+    # and the time limit is read from this same line (drg-9yh).
+    result = DRC.bput("read my #{logbook} logbook", LOGBOOK_TIMED_REMAINING_PATTERN, *READ_LOGBOOK_PATTERNS, 'has expired', LOGBOOK_NO_ORDER_PATTERN, 'I could not find', 'What were you')
     stow_tool('logbook')
+    timed = result&.match(LOGBOOK_TIMED_REMAINING_PATTERN)
+    @logbook_minutes_left = timed && timed[:left].to_i
     return 0 if result && result.include?('appears to be complete')
 
     match = result&.match(LOGBOOK_REMAINING_PATTERN)
@@ -434,23 +522,7 @@ class WorkOrders
 
     if result && (LOGBOOK_NO_ORDER_PATTERN.match?(result) || result.include?("has expired"))
       stow_tool('logbook')
-      # The generic discipline catalog includes high-tier recipes the server
-      # may never offer at this difficulty. Keep the operator's list intact,
-      # require at least one feasible candidate, and request exactly once.
-      exit unless safe_forging_stock_preflight(recipes, any_recipe: true)
-      requested = request_work_order(
-        recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff,
-        max_requests: 1, allow_bundled_cleanup: false
-      )
-      confirmed = read_active_work_order(recipes, logbook)
-      unless confirmed && confirmed == requested
-        Lich::Messaging.msg('bold', 'WorkOrders: Requested order did not match the confirmed logbook state; stopping before purchase')
-        exit
-      end
-      selected = recipes.find { |candidate| candidate['name'] == confirmed.first }
-      exit unless safe_forging_stock_preflight([selected], quantity: confirmed.last)
-
-      return confirmed
+      return request_confirmed_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
     end
 
     match = result&.match(LOGBOOK_ITEM_PATTERN)
@@ -463,11 +535,22 @@ class WorkOrders
     recipe = recipes.find { |candidate| candidate['name'] == match[:item] }
     unless recipe
       stow_tool('logbook')
+      if replace_unworkable_orders?
+        # drf (drg-4ju): an unadmitted offer used to strand the logbook until
+        # it expired (up to 105 roisaen); a diagonal-peen mallet was 10 of
+        # Khazdar's 11 asks on 2026-09-29. Nothing is bought for it, and the
+        # game refuses the replacement while anything is bundled.
+        Lich::Messaging.msg('plain', "WorkOrders: Active order '#{match[:item]}' is not an admitted recipe; asking for a replacement (up to #{max_requests} asks)")
+        return request_confirmed_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
+      end
       Lich::Messaging.msg('bold', "WorkOrders: Could not match active logbook item '#{match[:item]}' to a recipe")
+      publish_result('kept_unadmitted', match[:item])
       exit
     end
 
+    @logbook_minutes_left = nil
     remaining = logbook_remaining(logbook)
+    minutes_left = @logbook_minutes_left
     if remaining.nil?
       Lich::Messaging.msg('bold', 'WorkOrders: Active logbook count is ambiguous - no request or purchase was made')
       exit
@@ -479,8 +562,41 @@ class WorkOrders
 
     exit unless safe_forging_stock_preflight([recipe], quantity: remaining)
 
+    # drf (drg-9yh): a resumed order is bought for only when its time limit
+    # covers the remaining pieces and the turn-in.
+    if (shortfall = resumed_order_time_shortfall(minutes_left, remaining))
+      if replace_unworkable_orders? && minutes_left
+        Lich::Messaging.msg('plain', "WorkOrders: Active order for #{remaining} #{recipe['name']} has #{shortfall}; asking for a replacement (up to #{max_requests} asks)")
+        return request_confirmed_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
+      end
+      Lich::Messaging.msg('bold', "WorkOrders: Active order for #{remaining} #{recipe['name']} has #{shortfall}; no purchase")
+      publish_result('kept_short_time', shortfall) if minutes_left
+      exit
+    end
+
     Lich::Messaging.msg('plain', "WorkOrders: Resuming active order for #{remaining} #{recipe['name']}")
     [recipe['name'], remaining]
+  end
+
+  # The generic discipline catalog includes high-tier recipes the server may
+  # never offer at this difficulty. Keep the operator's list intact, require
+  # at least one feasible candidate, ask at most max_requests times, and spend
+  # nothing until the logbook confirms exactly the accepted order.
+  def request_confirmed_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
+    exit unless safe_forging_stock_preflight(recipes, any_recipe: true)
+    requested = request_work_order(
+      recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff,
+      max_requests: max_requests, allow_bundled_cleanup: false
+    )
+    confirmed = read_active_work_order(recipes, logbook)
+    unless confirmed && confirmed == requested
+      Lich::Messaging.msg('bold', 'WorkOrders: Requested order did not match the confirmed logbook state; stopping before purchase')
+      exit
+    end
+    selected = recipes.find { |candidate| candidate['name'] == confirmed.first }
+    exit unless safe_forging_stock_preflight([selected], quantity: confirmed.last)
+
+    confirmed
   end
 
   # Purchased-stock mode has no reviewed smelting/owned-ingot selection path.
@@ -1660,10 +1776,18 @@ class WorkOrders
     DRCI.stow_hands
     attempts = 0
     master_left = 0
+    # drf (drg-9yh): the bounded (safe) form publishes why it stopped. A
+    # missed master or refused offers spend nothing; anything else latches.
+    bounded_stop = nil
     while attempts < max_requests
       attempts += 1
       unless find_npc(npc_rooms, npc_last_name, purpose: master_left.positive? ? :re_search : :request)
         Lich::Messaging.msg('bold', "WorkOrders: Could not find NPC #{npc_last_name} - will retry")
+        unless allow_bundled_cleanup
+          # One roaming search per pass: the next pass searches again.
+          bounded_stop = :master_not_found
+          break
+        end
         next
       end
       if allow_bundled_cleanup
@@ -1676,10 +1800,12 @@ class WorkOrders
       else
         unless held_logbook?(logbook) || DRCI.get_item?("#{logbook} logbook")
           Lich::Messaging.msg('bold', "WorkOrders: Failed to get #{logbook} logbook for bounded request")
+          bounded_stop = 'logbook was not obtained for the request'
           break
         end
         unless held_logbook?(logbook)
           Lich::Messaging.msg('bold', "WorkOrders: #{logbook} logbook is not positively held for bounded request")
+          bounded_stop = 'logbook was not positively held for the request'
           break
         end
       end
@@ -1704,10 +1830,14 @@ class WorkOrders
             Lich::Messaging.msg('plain', "WorkOrders: Accepted work order for #{quantity} #{item}")
             return [item, quantity]
           end
+          unless allow_bundled_cleanup
+            Lich::Messaging.msg('plain', "WorkOrders: Ask #{attempts}/#{max_requests} offered #{quantity} #{item}; not admitted")
+          end
         end
       when 'You realize you have items bundled with the logbook'
         unless allow_bundled_cleanup
           Lich::Messaging.msg('bold', 'WorkOrders: Unexpected bundled items while requesting; preserving them and stopping')
+          bounded_stop = 'items are bundled with the logbook'
           break
         end
         unless DRCI.untie_item?('logbook')
@@ -1723,10 +1853,24 @@ class WorkOrders
             Lich::Messaging.msg('bold', 'WorkOrders: Failed to get logbook after untying')
           end
         end
+      else
+        unless allow_bundled_cleanup
+          # Never ask again over a reply nobody has reviewed.
+          Lich::Messaging.msg('bold', "WorkOrders: Unrecognized reply to the request (#{result.to_s[0, 120].inspect}); stopping without another ask")
+          bounded_stop = 'unrecognized reply to the request'
+          break
+        end
       end
     end
     stow_tool('logbook')
-    Lich::Messaging.msg('bold', "WorkOrders: Failed to get a suitable work order after #{max_requests} attempt(s)")
+    Lich::Messaging.msg('bold', "WorkOrders: Failed to get a suitable work order after #{allow_bundled_cleanup ? max_requests : attempts} attempt(s)")
+    unless allow_bundled_cleanup
+      case bounded_stop
+      when nil then publish_result('no_suitable_offer', "#{attempts} ask(s)")
+      when :master_not_found then publish_result('master_not_found', npc_last_name)
+      else publish_result('failed', bounded_stop)
+      end
+    end
     exit
   end
 
