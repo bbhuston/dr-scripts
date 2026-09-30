@@ -395,14 +395,72 @@ class WorkOrders
   # the last logbook_remaining) for the remaining pieces plus the turn-in
   # search, or no readable limit. nil when there is time, or when the guard is
   # not configured (workorders_minutes_per_piece unset).
-  def resumed_order_time_shortfall(left, remaining)
+  def resumed_order_time_shortfall(left, remaining, recipe = nil)
     per_piece = bounded_setting(:workorders_minutes_per_piece, nil, 1..60)
     return nil unless per_piece
 
     needed = remaining * per_piece + bounded_setting(:workorders_turnin_minutes, 15, 0..60)
+    stock = current_forging_stock
+    needed += smelt_batches(recipe, stock, remaining).size * SMELT_MINUTES if recipe && stock && smelted_recipe?(recipe, stock)
     return nil if left.is_a?(Integer) && left >= needed
 
     left.is_a?(Integer) ? "#{left} roisaen left, about #{needed} needed for #{remaining} piece(s) and the turn-in" : 'time left is unreadable'
+  end
+
+  # drf (drg-gut): a recipe that needs more metal than one purchased ingot
+  # (the 12-volume diagonal-peen mallet on 5-volume huge bronze) is forged from
+  # purchased ingots smelted together at a society crucible, in batches of at
+  # most workorders_smelt_max_volume. Unset, such recipes keep the refusal.
+  # Live canary 2026-09-30: five huge bronze ingots smelted in about four
+  # minutes into one 25-volume ingot; forge split it for two mallets.
+  SMELT_MINUTES = 10
+  SMELT_ACTIONS = 30
+  SMELT_DONE_PATTERN = /At last the metal appears to be thoroughly mixed/.freeze
+  SMELT_FLOOR_PATTERN = /you set it down upon the ground near your feet/.freeze
+
+  def current_forging_stock
+    return nil unless @crafting_stock.is_a?(Hash) && @workorders_materials.is_a?(Hash)
+
+    stock = @crafting_stock[@workorders_materials['metal_type']]
+    stock.is_a?(Hash) && stock['stock-volume'].is_a?(Integer) && stock['stock-volume'].positive? ? stock : nil
+  end
+
+  def smelt_max_volume
+    bounded_setting(:workorders_smelt_max_volume, nil, 10..50)
+  end
+
+  def smelted_recipe?(recipe, stock)
+    recipe['volume'] > stock['stock-volume']
+  end
+
+  # Pieces forged from one smelted batch; 0 when the recipe cannot be smelted.
+  def smelt_batch_pieces(recipe)
+    limit = smelt_max_volume
+    limit ? limit / recipe['volume'] : 0
+  end
+
+  # [pieces, ingots] for each smelted batch of a quantity, in order.
+  def smelt_batches(recipe, stock, quantity)
+    per_batch = smelt_batch_pieces(recipe)
+    return [] unless per_batch.positive?
+
+    pieces = [per_batch] * (quantity / per_batch)
+    pieces << quantity % per_batch if (quantity % per_batch).positive?
+    pieces.map { |count| [count, (count * recipe['volume'] + stock['stock-volume'] - 1) / stock['stock-volume']] }
+  end
+
+  # Would the whole-order stock preflight admit this offer? Quiet, so the
+  # bounded request refuses and asks again instead of accepting an order it
+  # cannot fund (four mallets on bronze cost 6,020).
+  def offer_workable?(recipes, item, quantity)
+    recipe = recipes.find { |candidate| candidate['name'] == item }
+    stock = current_forging_stock
+    return true unless recipe.is_a?(Hash) && recipe['volume'].is_a?(Integer) && stock
+    return false if smelted_recipe?(recipe, stock) && !smelt_batch_pieces(recipe).positive?
+
+    forging_material_cost(recipe, stock, quantity) <= (@material_budget.nil? ? 5000 : @material_budget)
+  rescue StandardError
+    false
   end
 
   def complete_work_order(info)
@@ -564,7 +622,7 @@ class WorkOrders
 
     # drf (drg-9yh): a resumed order is bought for only when its time limit
     # covers the remaining pieces and the turn-in.
-    if (shortfall = resumed_order_time_shortfall(minutes_left, remaining))
+    if (shortfall = resumed_order_time_shortfall(minutes_left, remaining, recipe))
       if replace_unworkable_orders? && minutes_left
         Lich::Messaging.msg('plain', "WorkOrders: Active order for #{remaining} #{recipe['name']} has #{shortfall}; asking for a replacement (up to #{max_requests} asks)")
         return request_confirmed_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
@@ -599,9 +657,10 @@ class WorkOrders
     confirmed
   end
 
-  # Purchased-stock mode has no reviewed smelting/owned-ingot selection path.
-  # A single purchased ingot must fit each admitted recipe, and its catalog
-  # whole-order stock and part cost must fit a separate material budget.
+  # Purchased-stock mode has no owned-ingot selection path. A single purchased
+  # ingot must fit each admitted recipe, or (drg-gut) the recipe is smelted from
+  # freshly purchased ingots when workorders_smelt_max_volume allows it, and the
+  # catalog whole-order stock and part cost must fit a separate material budget.
   # The cash-on-hand setting remains a withdrawal minimum, not a spend cap.
   def safe_forging_stock_preflight(recipes, stock = nil, quantity: 1, any_recipe: false, info: @forging_info)
     stock ||= @crafting_stock[@workorders_materials['metal_type']] if @crafting_stock.is_a?(Hash) && @workorders_materials.is_a?(Hash)
@@ -624,7 +683,12 @@ class WorkOrders
       end
       name = recipe['name'].to_s
       if recipe['volume'] > stock['stock-volume']
-        next "#{name} needs #{recipe['volume']} volume; configured stock supplies #{stock['stock-volume']}"
+        unless smelt_batch_pieces(recipe).positive?
+          next "#{name} needs #{recipe['volume']} volume; configured stock supplies #{stock['stock-volume']}"
+        end
+        unless @settings.forging_tools.to_a.any? { |tool| tool.to_s.end_with?('stirring rod') }
+          next "#{name} is smelted and forging_tools names no stirring rod"
+        end
       end
 
       parts = recipe['part'].nil? ? [] : recipe['part']
@@ -636,6 +700,9 @@ class WorkOrders
       end
       unless valid_parts
         next "#{name} has unverified part prices"
+      end
+      unless parts.all? { |part| part_shop(part) }
+        next "#{name} has a part with no reviewed shop"
       end
       price = forging_material_cost(recipe, stock, quantity)
       next "#{quantity} #{name} stock and parts cost #{price}; material budget is #{budget}" if price > budget
@@ -686,10 +753,24 @@ class WorkOrders
   # Scraps cannot be pooled between ingots: three 18-volume items need two
   # 50-volume ingots, and five 17-volume items need three, not two.
   def forging_material_cost(recipe, stock, quantity)
-    per_ingot = stock['stock-volume'] / recipe['volume']
-    ingots = (quantity + per_ingot - 1) / per_ingot
+    ingots = if recipe['volume'] > stock['stock-volume']
+               smelt_batches(recipe, stock, quantity).sum { |_, count| count }
+             else
+               per_ingot = stock['stock-volume'] / recipe['volume']
+               (quantity + per_ingot - 1) / per_ingot
+             end
     parts = (recipe['part'] || []).sum { |part| @crafting_stock.dig(part, 'stock-value') }
     ingots * stock['stock-value'] + quantity * parts
+  end
+
+  # The shop room for a part bought by name (recipe_parts with a part-room and
+  # no part-number), e.g. the Tool Store's crate for the mallet's short pole.
+  def part_shop(part)
+    data = @recipe_parts.is_a?(Hash) ? @recipe_parts.dig(part, @hometown) : nil
+    return nil unless data.is_a?(Hash) && data['part-number'].nil?
+
+    room = data['part-room']
+    room.is_a?(Integer) && room.positive? ? room : nil
   end
 
   def forging_stock_room(info, stock)
@@ -1268,20 +1349,25 @@ class WorkOrders
           Lich::Messaging.msg('bold', 'WorkOrders: Stock room was not reached; stopping before purchase')
           return false
         end
-        ingot = "#{materials_info['stock-name']} ingot"
-        return false unless purchase_forging_stock(stock_room, materials_info)
-        unless DRCI.put_away_item?(ingot, @bag) && !DRCI.in_hands?(ingot)
-          Lich::Messaging.msg('bold', 'WorkOrders: Material stow was not confirmed; preserving custody before smith')
-          return false
+        if smelted_recipe?(recipe, materials_info)
+          pieces, ingots = smelt_batches(recipe, materials_info, quantity - attempts).first
+          Lich::Messaging.msg('plain', "WorkOrders: Buying #{ingots} #{materials_info['stock-name']} ingots to smelt for #{pieces} #{recipe['name']}")
+          ingots.times do
+            return false unless purchase_and_stow_stock(stock_room, materials_info)
+          end
+          remaining_volume = smelt_stock_safely(info, materials_info, ingots)
+          return false unless remaining_volume
+        else
+          return false unless purchase_and_stow_stock(stock_room, materials_info)
+          remaining_volume = materials_info['stock-volume']
         end
-        return false unless save_forging_purchase(nil)
-        remaining_volume = materials_info['stock-volume']
       end
 
       unless DRCM.ensure_copper_on_hand(3000, @settings, @hometown) == true
         Lich::Messaging.msg('bold', 'WorkOrders: Smith cash reserve was not verified; stopping before child')
         return false
       end
+      return false unless buy_recipe_parts_safely(recipe)
 
       crafted = DRC.wait_for_script_to_complete('smith', [materials_info['stock-name'], item['name']])
       unless crafted
@@ -1301,6 +1387,176 @@ class WorkOrders
 
     DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive?
     true
+  end
+
+  def purchase_and_stow_stock(stock_room, stock)
+    ingot = "#{stock['stock-name']} ingot"
+    return false unless purchase_forging_stock(stock_room, stock)
+    unless DRCI.put_away_item?(ingot, @bag) && !DRCI.in_hands?(ingot)
+      Lich::Messaging.msg('bold', 'WorkOrders: Material stow was not confirmed; preserving custody before smith')
+      return false
+    end
+    save_forging_purchase(nil)
+  end
+
+  # drf (drg-gut): one part per piece, bought by name where the recipe data
+  # says it is sold, under the same durable guard and one-write rule as
+  # stock. Live 2026-09-30: `buy short pole` answered "You decide to purchase
+  # the pole, and pay the sales clerk 100 Kronars." (`buy short oak pole`
+  # answered "You can't order anything here.").
+  def buy_recipe_parts_safely(recipe)
+    Array(recipe['part']).each do |part|
+      room = part_shop(part)
+      price = @crafting_stock.dig(part, 'stock-value') if @crafting_stock.is_a?(Hash)
+      unless room && price.is_a?(Integer)
+        Lich::Messaging.msg('bold', "WorkOrders: No reviewed shop or price for #{part}; stopping before purchase")
+        return false
+      end
+      return false if forging_purchase_pending?
+      unless DRCT.walk_to(room) && Room.current&.id == room
+        Lich::Messaging.msg('bold', "WorkOrders: The #{part} shop was not reached; stopping before purchase")
+        return false
+      end
+      if DRC.left_hand || DRC.right_hand
+        Lich::Messaging.msg('bold', 'WorkOrders: Hands are not empty before part purchase; preserving custody')
+        return false
+      end
+      return false unless save_forging_purchase({ 'room' => room, 'part' => part, 'price' => price, 'since' => Time.now.to_i })
+
+      noun = part.split.last
+      receipt = forging_purchase_write("buy #{part}", room,
+                                       accept: /You decide to purchase|don't have enough coins|can't order|Buy what|What were you/)
+      held = receipt == "You decide to purchase the #{noun}, and pay the sales clerk #{price} Kronars." && part_in_hand?(part)
+      unless held
+        Lich::Messaging.msg('bold', "WorkOrders: #{part} purchase or held part was not confirmed (#{receipt.to_s[0, 120].inspect}); preserving custody without retry")
+        return false
+      end
+      unless DRCI.put_away_item?(part, @bag) && !DRCI.in_hands?(part)
+        Lich::Messaging.msg('bold', "WorkOrders: #{part} stow was not confirmed; preserving custody before smith")
+        return false
+      end
+      return false unless save_forging_purchase(nil)
+    end
+    true
+  end
+
+  # The clerk hands the part over on the line after the receipt.
+  def part_in_hand?(part)
+    30.times do
+      return true if DRCI.in_hands?(part)
+
+      pause 0.1
+    end
+    DRCI.in_hands?(part)
+  end
+
+  # drf (drg-gut): smelt `count` stowed ingots into one at an empty society
+  # crucible. Returns the new ingot's analyzed volume, stowed, or nil after
+  # stopping with the metal accounted for (backpack, crucible or at his feet).
+  # Every reply is one the live canary saw; anything else stops.
+  def smelt_stock_safely(info, stock, count)
+    metal = stock['stock-name']
+    expected = count * stock['stock-volume']
+    room = Array(info['crucibles']).find do |candidate|
+      DRCT.walk_to(candidate) && Room.current&.id == candidate &&
+        DRC.bput('look in crucible', 'There is nothing in there', 'In the .* you see', 'I could not find', 'What were you') == 'There is nothing in there'
+    end
+    unless room
+      Lich::Messaging.msg('bold', "WorkOrders: No empty crucible was found; #{count} #{metal} ingots stay in the #{@bag}")
+      return nil
+    end
+    count.times do |index|
+      unless DRCI.get_item?("#{metal} ingot", @bag) && DRCI.in_hands?("#{metal} ingot")
+        Lich::Messaging.msg('bold', "WorkOrders: Ingot #{index + 1} of #{count} was not taken for smelting; stopping")
+        return nil
+      end
+      unless DRC.bput('put my ingot in crucible', 'You put your ingot in the', 'I could not find', 'What were you', "You can't", 'too full').to_s.start_with?('You put your ingot in the')
+        Lich::Messaging.msg('bold', "WorkOrders: Ingot #{index + 1} of #{count} did not go into the crucible; stopping")
+        return nil
+      end
+    end
+    counted = DRC.bput('count crucible', /a #{metal} ingot - \d+/, 'There is nothing', 'I could not find', 'What were you')
+    unless counted == "a #{metal} ingot - #{count}"
+      Lich::Messaging.msg('bold', "WorkOrders: The crucible holds #{counted.inspect}, not #{count} #{metal} ingots; stopping")
+      return nil
+    end
+    return nil unless smelt_tool_in_hand?('stirring rod', :right)
+
+    Flags.add('workorders-smelt-done', SMELT_DONE_PATTERN)
+    Flags.add('workorders-smelt-floor', SMELT_FLOOR_PATTERN)
+    command = 'stir crucible with my rod'
+    SMELT_ACTIONS.times do
+      result = DRC.bput(command, 'clumps of molten metal', 'flickers and is unable to consume', 'needs more fuel',
+                        'needs some more fuel', 'Roundtime', "doesn't appear suitable", 'I could not find', 'What were you')
+      waitrt?
+      break if Flags['workorders-smelt-done']
+
+      case result
+      when 'clumps of molten metal'
+        command = 'turn crucible with my rod'
+      when 'flickers and is unable to consume'
+        return nil unless smelt_tool_in_hand?('bellows', :left)
+
+        command = 'push my bellows'
+      when 'needs more fuel', 'needs some more fuel'
+        return nil unless smelt_tool_in_hand?('shovel', :left)
+
+        command = 'push fuel with my shovel'
+      when 'Roundtime'
+        command = 'stir crucible with my rod'
+      else
+        Lich::Messaging.msg('bold', "WorkOrders: Unrecognized smelting reply (#{result.to_s[0, 120].inspect}); stopping with the metal in the crucible")
+        return nil
+      end
+    end
+    unless Flags['workorders-smelt-done']
+      Lich::Messaging.msg('bold', "WorkOrders: Smelting did not finish in #{SMELT_ACTIONS} actions; stopping with the metal in the crucible")
+      return nil
+    end
+    on_floor = Flags['workorders-smelt-floor']
+    Flags.delete('workorders-smelt-done')
+    Flags.delete('workorders-smelt-floor')
+    [DRC.left_hand, DRC.right_hand].compact.reject { |held| held.to_s.include?('ingot') }.each do |held|
+      next if DRCI.put_away_item?(held, @bag)
+
+      Lich::Messaging.msg('bold', "WorkOrders: Could not stow #{held} after smelting; stopping")
+      return nil
+    end
+    if on_floor && !DRC.bput("get #{metal} ingot", 'You pick up', 'You get', 'I could not find', 'What were you').to_s.start_with?('You pick up', 'You get')
+      Lich::Messaging.msg('bold', "WorkOrders: The smelted #{metal} ingot was not picked up; it is at his feet")
+      return nil
+    end
+    unless DRCI.in_hands?("#{metal} ingot")
+      Lich::Messaging.msg('bold', "WorkOrders: The smelted #{metal} ingot is not in hand; stopping")
+      return nil
+    end
+    volume = DRC.bput('analyze my ingot', /About \d+ volume/, 'I could not find', 'What were you').to_s[/\d+/].to_i
+    unless volume == expected
+      Lich::Messaging.msg('bold', "WorkOrders: The smelted ingot holds #{volume} volume, not #{expected}; stopping")
+      return nil
+    end
+    unless DRCI.put_away_item?("#{metal} ingot", @bag) && !DRCI.in_hands?("#{metal} ingot")
+      Lich::Messaging.msg('bold', 'WorkOrders: The smelted ingot was not stowed; stopping')
+      return nil
+    end
+    Lich::Messaging.msg('plain', "WorkOrders: Smelted #{count} #{metal} ingots into one #{volume}-volume ingot")
+    volume
+  end
+
+  # The stirring rod rides in the right hand; the shovel or bellows the fire
+  # asks for goes in the left, swapped for whichever tool was there.
+  def smelt_tool_in_hand?(tool, hand)
+    held = hand == :right ? DRC.right_hand : DRC.left_hand
+    return true if held.to_s.end_with?(tool.split.last)
+
+    if held && !DRCI.put_away_item?(held, @bag)
+      Lich::Messaging.msg('bold', "WorkOrders: Could not stow #{held} for the #{tool}; stopping")
+      return false
+    end
+    return true if DRCI.get_item?(tool, @bag) && DRCI.in_hands?(tool)
+
+    Lich::Messaging.msg('bold', "WorkOrders: Could not take the #{tool} for smelting; stopping")
+    false
   end
 
   # Do not use DRCT.order_item here: it confirms even an unknown first quote.
@@ -1365,7 +1621,7 @@ class WorkOrders
   # DRC.bput can replay ORDER after WAIT/type-ahead and emit recovery commands.
   # This path admits one write through the existing fence and waits at most
   # twelve seconds, never repeating a quote or an uncertain purchase.
-  def forging_purchase_write(command, room)
+  def forging_purchase_write(command, room, accept: /The attendant|don't have enough coins/)
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 12
     control = $DRBOT_DIRECT_CONTROL
     return nil unless control.is_a?(Hash) && control['lock']
@@ -1386,7 +1642,7 @@ class WorkOrders
         line = get?
         if line
           return nil if line.match?(/(?:\A\[?Wait \d|Sorry, you may only type ahead|world somehow seems frozen|while you are asleep|too busy performing|stop playing before|give away your hiding place|still stunned)/i)
-          return line if line.include?('The attendant') || line.include?("don't have enough coins")
+          return line if line.match?(accept)
         end
       end
       pause 0.1
@@ -1825,7 +2081,8 @@ class WorkOrders
         if match
           item = match[:item]
           quantity = match[:quantity].to_i
-          if @min_items <= quantity && quantity <= @max_items && match_names.include?(item)
+          if @min_items <= quantity && quantity <= @max_items && match_names.include?(item) &&
+             (allow_bundled_cleanup || offer_workable?(recipes, item, quantity))
             stow_tool('logbook')
             Lich::Messaging.msg('plain', "WorkOrders: Accepted work order for #{quantity} #{item}")
             return [item, quantity]
