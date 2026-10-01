@@ -208,6 +208,15 @@ class Coordinator
       UserVars.coordinator_safety_hold = custody_hold
       return custody_hold['reason'] || 'weapon custody unresolved; operator reconciliation required'
     end
+    # The generic custody hold a reviewed town task records when it cannot
+    # prove where coins, a purchase, a workpiece or a tool ended up (first
+    # drbot-remedy-restock). It persists in UserVars like the weapon custody
+    # hold, so a restarted coordinator holds too, and it is read every tick, so
+    # the schedule resumes once an operator has reconciled and cleared it.
+    if (custody_hold = UserVars.drbot_custody_hold).is_a?(Hash)
+      UserVars.coordinator_safety_hold = custody_hold
+      return custody_hold['reason'] || 'custody unresolved; operator reconciliation required'
+    end
     return @bleeding_hold if @bleeding_hold
     if @settings.stop_hunting_if_bleeding && bleeding?
       @bleeding_hold = 'bleeding observed; schedule held'
@@ -694,6 +703,9 @@ class Coordinator
     # this coordinator (which retains @task_hold for its current run).
     if (custody_hold = UserVars.drbot_weapon_custody_hold).is_a?(Hash)
       @task_hold = custody_hold['reason'] || 'weapon custody unresolved; operator reconciliation required'
+      UserVars.coordinator_safety_hold = custody_hold
+    elsif (custody_hold = UserVars.drbot_custody_hold).is_a?(Hash)
+      @task_hold = custody_hold['reason'] || 'custody unresolved; operator reconciliation required'
       UserVars.coordinator_safety_hold = custody_hold
     end
   end

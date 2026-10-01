@@ -440,6 +440,8 @@ class Remedy
   end
 
   def buy_item(name)
+    return if refuse_upstream_purchase?(name)
+
     DRCM.get_money_from_bank('5 silver', @settings)
 
     case name
@@ -455,6 +457,33 @@ class Remedy
     end
 
     DRCT.walk_to(@settings.alchemy_room)
+  end
+
+  # buy_item draws 5 silver from the bank and confirms DRCT.order_item's first
+  # quote unseen. A profile that sets remedy_upstream_purchase false restocks
+  # water and coal through a reviewed, bounded runner instead and buys no
+  # alcohol at all, so this path then buys nothing. remedy.lic checks every
+  # supply whatever the recipe: a solvent this chapter never takes (alcohol for
+  # a chapter 3 or 4 wound remedy, water for 5 or 6) is passed over and the
+  # remedy goes on. Anything else stops it before any herb work, published as
+  # unavailable like create_remedies' own missing supply, so the coordinator
+  # delays the task instead of looping.
+  def refuse_upstream_purchase?(name)
+    return false unless @settings.remedy_upstream_purchase == false
+
+    unneeded = case @chapter.to_i
+               when 3, 4 then name == 'alcohol'
+               when 5, 6 then name == 'water'
+               else false
+               end
+    if unneeded
+      DRC.message("remedy: no #{name} found; chapter #{@chapter} does not use it, and nothing is bought")
+      return true
+    end
+    reason = "remedy.lic upstream purchase of #{name} refused"
+    Script.current.define_singleton_method(:drbot_remedy_unavailable) { reason }
+    DRC.message("***STATUS*** #{reason}")
+    exit
   end
 
   def magic_cleanup
