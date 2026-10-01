@@ -19,7 +19,8 @@ class Smith
         { name: 'balance', regex: /^balance/i, optional: true, description: 'Balance crafted item (weapon only), increasing balance at the cost of suitability' },
         { name: 'lighten', regex: /^lighten/i, optional: true, description: 'Lightens crafted armor or shield, reducing weight only' },
         { name: 'reinforce', regex: /^reinforce/i, optional: true, description: 'Improves some absorption/protection stats at the cost of increased weight and hinderance' },
-        { name: 'buy', regex: /^buy/i, optional: true, description: 'Used to purchase the ingot' }
+        { name: 'buy', regex: /^buy/i, optional: true, description: 'Used to purchase the ingot' },
+        { name: 'noparts', regex: /^noparts$/i, optional: true, description: 'The recipe parts are already carried: neither buy nor dispose of them' }
       ]
     ]
 
@@ -55,6 +56,10 @@ class Smith
 
     parts = recipe['part'] || []
     parts << "leather strip" if args.reinforce # adds part to the list for reinforce
+    # drf (drg-2121): workorders buys a recipe's parts under its purchase guard
+    # and passes `noparts`. Buying them here as well bought a second short pole
+    # per mallet, and dispose_parts then binned the one forge did not use.
+    parts = [] if args.noparts
     smith(args.material, discipline, recipe, parts, args.buy, args.stamp, args.temper, args.hone, args.balance, args.lighten, args.reinforce, args.here)
   end
 

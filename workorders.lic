@@ -1399,7 +1399,11 @@ class WorkOrders
       end
       return false unless buy_recipe_parts_safely(recipe)
 
-      crafted = DRC.wait_for_script_to_complete('smith', [materials_info['stock-name'], item['name']])
+      # drf (drg-2121): the parts are bought above, under the purchase guard.
+      # Without `noparts` smith bought another and binned the unused one.
+      child_args = [materials_info['stock-name'], item['name']]
+      child_args << 'noparts' if Array(recipe['part']).any?
+      crafted = DRC.wait_for_script_to_complete('smith', child_args)
       unless crafted
         Lich::Messaging.msg('bold', 'WorkOrders: Smith did not complete; preserving custody and stopping before bundle')
         return false
@@ -1434,40 +1438,58 @@ class WorkOrders
   # stock. Live 2026-09-30: `buy short pole` answered "You decide to purchase
   # the pole, and pay the sales clerk 100 Kronars." (`buy short oak pole`
   # answered "You can't order anything here.").
+  # drf (drg-2121): only the shortfall is bought. A part already in the bag
+  # (left by a stopped pass) is used first. TAP shows one carried part and
+  # cannot count more, so a recipe needing several buys the rest.
   def buy_recipe_parts_safely(recipe)
-    Array(recipe['part']).each do |part|
+    Array(recipe['part']).tally.each do |part, needed|
       room = part_shop(part)
       price = @crafting_stock.dig(part, 'stock-value') if @crafting_stock.is_a?(Hash)
       unless room && price.is_a?(Integer)
         Lich::Messaging.msg('bold', "WorkOrders: No reviewed shop or price for #{part}; stopping before purchase")
         return false
       end
-      return false if forging_purchase_pending?
-      unless DRCT.walk_to(room) && Room.current&.id == room
-        Lich::Messaging.msg('bold', "WorkOrders: The #{part} shop was not reached; stopping before purchase")
-        return false
+      carried = carried_part?(part) ? 1 : 0
+      Lich::Messaging.msg('plain', "WorkOrders: Using the #{part} already in the #{@bag}") if carried.positive?
+      (needed - carried).times do
+        return false unless buy_recipe_part_safely(part, room, price)
       end
-      if DRC.left_hand || DRC.right_hand
-        Lich::Messaging.msg('bold', 'WorkOrders: Hands are not empty before part purchase; preserving custody')
-        return false
-      end
-      return false unless save_forging_purchase({ 'room' => room, 'part' => part, 'price' => price, 'since' => Time.now.to_i })
-
-      noun = part.split.last
-      receipt = forging_purchase_write("buy #{part}", room,
-                                       accept: /You decide to purchase|don't have enough coins|can't order|Buy what|What were you/)
-      held = receipt == "You decide to purchase the #{noun}, and pay the sales clerk #{price} Kronars." && part_in_hand?(part)
-      unless held
-        Lich::Messaging.msg('bold', "WorkOrders: #{part} purchase or held part was not confirmed (#{receipt.to_s[0, 120].inspect}); preserving custody without retry")
-        return false
-      end
-      unless DRCI.put_away_item?(part, @bag) && !DRCI.in_hands?(part)
-        Lich::Messaging.msg('bold', "WorkOrders: #{part} stow was not confirmed; preserving custody before smith")
-        return false
-      end
-      return false unless save_forging_purchase(nil)
     end
     true
+  end
+
+  # `tap my bellows` answered "You tap a leather bellows inside your
+  # backpack." (2026-10-01); anything else is not a carried part.
+  def carried_part?(part)
+    noun = Regexp.escape(part.split.last)
+    DRCI.tap(part).to_s.match?(/\AYou tap (?:an?|some) [^.]*\b#{noun} inside your #{Regexp.escape(@bag.to_s)}\./)
+  end
+
+  def buy_recipe_part_safely(part, room, price)
+    return false if forging_purchase_pending?
+    unless DRCT.walk_to(room) && Room.current&.id == room
+      Lich::Messaging.msg('bold', "WorkOrders: The #{part} shop was not reached; stopping before purchase")
+      return false
+    end
+    if DRC.left_hand || DRC.right_hand
+      Lich::Messaging.msg('bold', 'WorkOrders: Hands are not empty before part purchase; preserving custody')
+      return false
+    end
+    return false unless save_forging_purchase({ 'room' => room, 'part' => part, 'price' => price, 'since' => Time.now.to_i })
+
+    noun = part.split.last
+    receipt = forging_purchase_write("buy #{part}", room,
+                                     accept: /You decide to purchase|don't have enough coins|can't order|Buy what|What were you/)
+    held = receipt == "You decide to purchase the #{noun}, and pay the sales clerk #{price} Kronars." && part_in_hand?(part)
+    unless held
+      Lich::Messaging.msg('bold', "WorkOrders: #{part} purchase or held part was not confirmed (#{receipt.to_s[0, 120].inspect}); preserving custody without retry")
+      return false
+    end
+    unless DRCI.put_away_item?(part, @bag) && !DRCI.in_hands?(part)
+      Lich::Messaging.msg('bold', "WorkOrders: #{part} stow was not confirmed; preserving custody before smith")
+      return false
+    end
+    save_forging_purchase(nil)
   end
 
   # The clerk hands the part over on the line after the receipt.
