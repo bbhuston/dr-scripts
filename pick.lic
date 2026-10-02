@@ -21,6 +21,13 @@
 #   - `pick.harvest_traps` [Boolean] harvest trap components after disarm
 #   - `pick.trash_empty_boxes` [Boolean] trash instead of dismantle
 #   - `pick.debug` [Boolean] verbose debug output
+#   - `pick_keep_container` [String, nil] container that keeps box loot
+#     with no other route (not coins, loot_specials or gems) instead of
+#     trashing it; a refused item goes back into its box, which is then
+#     stowed instead of dismantled. Never dropped. Unset keeps upstream trash.
+#   - `pick_trash_nouns` [Array<String>] with pick_keep_container, the only
+#     nouns still trashed (base items data's trash_nouns lists runestones,
+#     nuggets, bars and dira, so it is not used to trash kept loot)
 #
 # @example Basic usage
 #   ;pick
@@ -82,6 +89,8 @@ class Pick
 
     @loot_nouns = @settings.lootables
     @trash_nouns = get_data('items').trash_nouns
+    @keep_container = @settings.pick_keep_container
+    @keep_trash_nouns = @settings.pick_trash_nouns || []
 
     @has_glance = DRStats.thief? && DRStats.circle >= 13
     @use_glance = @settings.pick['use_glance'].nil? ? @has_glance : @settings.pick['use_glance']
@@ -248,7 +257,7 @@ class Pick
   def crack_boxes
     @boxes_by_bag.each do |source, boxes|
       boxes.each do |box_noun|
-        break if stop_picking?
+        break if stop_picking? || @held_loot
 
         do_buffs
 
@@ -262,11 +271,23 @@ class Pick
         balance_lockpick_container
         attempt_open(box_noun)
       end
-      break if stop_picking?
+      break if stop_picking? || @held_loot
     end
 
+    report_kept_loot
     DRC.fix_standing
     @equipment_manager.wear_items(@removed_items)
+  end
+
+  # Summarizes what pick_keep_container kept this run, and which boxes were
+  # stowed with refused loot still inside.
+  #
+  # @return [void]
+  def report_kept_loot
+    kept = @kept_loot || []
+    boxes = @boxes_kept_with_loot || []
+    DRC.message("Pick: Kept #{kept.size} item(s) in your #{@keep_container} this run: #{kept.join('; ')}.") unless kept.empty?
+    DRC.message("Pick: Stowed #{boxes.size} box(es) with loot still inside: #{boxes.join('; ')}.") unless boxes.empty?
   end
 
   def balance_lockpick_container
@@ -467,8 +488,15 @@ class Pick
 
     if holding_box?(current_box)
       stow_hands_except(current_box['noun'])
+      @left_in_box = []
       loot(current_box['noun'])
-      dispose_empty_box(current_box)
+      if @left_in_box.empty? && !@held_loot
+        dispose_empty_box(current_box)
+      else
+        # Loot the keep container refused is still inside: never dismantle
+        # or trash the box with it.
+        stow_box_with_loot(current_box)
+      end
     else
       echo "You lost your box somehow." if @debug
     end
@@ -860,7 +888,13 @@ class Pick
       loot_items = box_items.map { |item| DRC.get_noun(item) }
       echo "box items: #{box_items} - loot: #{loot_items}" if @debug
 
-      loot_items.each { |item| loot_item(item, box_noun) }
+      loot_items.each do |item|
+        break if @held_loot
+
+        loot_item(item, box_noun)
+      end
+      # Loot handed back to the box would only be listed again.
+      break if @held_loot || !(@left_in_box || []).empty?
 
       # Continue looping if box had "stuff" (very full box)
       break unless loot_items.last&.match?(/stuff/i)
@@ -926,7 +960,10 @@ class Pick
     loot_specials = @settings.loot_specials || []
     special = loot_specials.find { |x| /\b#{x['name']}\b/i =~ item_long }
     if special
-      DRCI.put_away_item?(item, special['bag'])
+      return if DRCI.put_away_item?(item, special['bag'])
+
+      # A refused special stayed in hand upstream; it is kept like other loot.
+      keep_loot(item, item_long, box) if @keep_container
       return
     end
 
@@ -936,12 +973,61 @@ class Pick
       return
     end
 
+    if @keep_container
+      if (@keep_trash_nouns || []).find { |thing| item_long =~ /\b#{thing}\b/i }
+        DRCI.dispose_trash(item, @worn_trashcan, @worn_trashcan_verb)
+      else
+        keep_loot(item, item_long, box)
+      end
+      return
+    end
+
     trash_nouns = @trash_nouns || []
     if trash_nouns.find { |thing| item_long =~ /\b#{thing}\b/i }
       DRCI.dispose_trash(item, @worn_trashcan, @worn_trashcan_verb)
     else
       DRC.message("Pick: Unrecognized item '#{item_long}' - trashing it.")
       DRCI.dispose_trash(item, @worn_trashcan, @worn_trashcan_verb)
+    end
+  end
+
+  # Keeps a looted item pick.lic has no other route for in
+  # pick_keep_container. If the container refuses it (full, too heavy), the
+  # item goes back into the box and the box is stowed, not dismantled. If even
+  # the box refuses it, it stays in hand and the run stops. Never dropped.
+  #
+  # @param item [String] noun of the item in hand
+  # @param item_long [String] the item as the GET reply named it
+  # @param box [String] noun of the open box in hand
+  # @return [void]
+  def keep_loot(item, item_long, box)
+    if DRCI.put_away_item?(item, @keep_container)
+      (@kept_loot ||= []) << item_long
+      DRC.message("Pick: Kept #{item_long} from the #{box} in your #{@keep_container}.")
+    elsif DRCI.put_away_item?(item, box)
+      (@left_in_box ||= []) << item_long
+      DRC.message("Pick: Your #{@keep_container} refused #{item_long}; left it in the #{box}.")
+    else
+      @held_loot = item_long
+      DRC.message("Pick: Neither your #{@keep_container} nor the #{box} took #{item_long}; holding it and stopping.")
+    end
+  end
+
+  # Stows a box that still holds loot the keep container refused, in the
+  # too-hard container or a box source, instead of dismantling it. If none
+  # takes it, it stays in hand and the run stops. Never dropped or trashed.
+  #
+  # @param box [Hash] box state hash with 'noun' key
+  # @return [void]
+  def stow_box_with_loot(box)
+    inside = (@left_in_box || []).empty? ? 'its remaining contents' : @left_in_box.join(', ')
+    container = [@too_hard_container, *@sources].compact.uniq.find { |bag| DRCI.put_away_item?(box['noun'], bag) }
+    if container
+      (@boxes_kept_with_loot ||= []) << "#{box['noun']} in #{container} (#{inside})"
+      DRC.message("Pick: Stowed the #{box['noun']} in your #{container} instead of dismantling it, with #{inside} inside.")
+    else
+      @held_loot ||= box['noun']
+      DRC.message("Pick: Could not stow the #{box['noun']} with #{inside} inside; holding it and stopping.")
     end
   end
 
