@@ -826,7 +826,11 @@ class Pick
   # @return [void]
   def loot(box_noun)
     echo "Looting #{box_noun}..." if @debug
-    if DRC.bput("open my #{box_noun}", /^In the .* you see .*\./, 'That is already open', 'It is locked') == 'It is locked'
+    # The game may answer only "You open your <box>.", with no "In the ...
+    # you see" line (every box from Grimdur's vault, Lanjefast 2026-10-02),
+    # and waiting for that line cost bput's full 15 seconds on each open.
+    # The bare reply ends the wait too; one alternation keeps bput's arity.
+    if DRC.bput("open my #{box_noun}", /^In the .* you see .*\.|^You open your .*\./, 'That is already open', 'It is locked') == 'It is locked'
       DRC.message("Pick: Bug - tried to loot locked box. Skipping.")
       return
     end
