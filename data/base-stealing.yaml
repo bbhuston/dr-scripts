@@ -601,7 +601,7 @@
   trivial_max: 1750
   trivial_min: 503
 - town: Crossing
-  item: slim lock
+  item: slim lockpick
   item_in: ''
   room: 19125
   pawnable: false
@@ -8002,7 +8002,7 @@
 - exceptionally_max: 9
   exceptionally_min: 7
   id: '736'
-  item: brown feather
+  item: grey-brown feather
   item_in: haversack
   pawnable: false
   room: 19073

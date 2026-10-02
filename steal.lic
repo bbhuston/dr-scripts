@@ -38,6 +38,7 @@ class Steal
     @difficulty_keys = %w[exceptionally very rather acceptable poorly vpoorly nearly trivial]
 
     @bin_items = []
+    @unkept_items = []
   end
 
   def initialize
@@ -288,7 +289,13 @@ class Steal
       end
     end
 
-    DRCI.dispose_trash(item) unless keep_item
+    unless keep_item || DRCI.dispose_trash(item)
+      # Neither the stealing bag nor disposal took it, for example because
+      # the game does not know the item by this name. Stealing more of it
+      # would only leave each one in hand to be stowed with your gear.
+      @unkept_items.push(item)
+      DRC.message("Could not put away or dispose of #{item}; not stealing it again this run.")
+    end
 
     move('go portal') if XMLData.room_title == '[[A Junk Yard]]'
     waitrt?
@@ -401,6 +408,7 @@ class Steal
 
   def steal(target, count = 0)
     return if stop_stealing?
+    return if @unkept_items.include?(target['item'])
 
     if DRCT.walk_to(target['room'], false)
       cooldown(target['room'], 60)
