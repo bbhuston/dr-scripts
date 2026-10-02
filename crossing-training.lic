@@ -74,6 +74,7 @@ class CrossingTraining
     # "The bones is much too damaged to play." replies from 2026-09-26 18:39
     # until a repair kit fixed them 2026-09-27 06:14 (drg-8lm).
     Flags.add('ct-no-instrument', 'Play on what instrument', 'too damaged to play')
+    Flags.add('ct-dirty-instrument', 'dirtiness may affect your performance', /^You really need to drain/)
     Flags.add('research-partial', 'there is still more to learn before you arrive at a breakthrough', 'distracted by combat', 'distracted by your spellcasting', 'You lose your focus on your research project', 'you forget what you were')
     Flags.add('research-complete', '^Breakthrough!')
   end
@@ -901,36 +902,71 @@ class CrossingTraining
   end
 
   def stop_play
-    return unless @did_play
-    return if @no_instrument
+    return true unless @did_play
 
+    # A sent STOP PLAY with no confirming reply has an unknown outcome. Do not
+    # claim that the child settled or send another command into that state.
+    reply = DRC.stop_playing
+    unless reply.to_s.match?(/You stop playing your song|But you're not performing|In the name of/)
+      echo '***COORDINATOR HOLD*** STOP PLAY result unconfirmed; operator reconciliation required'
+      loop { pause 60 }
+    end
     @did_play = false
-    DRC.stop_playing
     Flags['ct-song'] = true
+    true
   end
 
   def play_song?(blocking = false)
+    return true if @stop
     return true if @researching
     return false if @no_instrument
     return true if DRSkill.getxp('Performance') >= 28
 
     is_instrument_worn = @settings.instrument.nil?
     Flags.reset('ct-no-instrument')
+    Flags.reset('ct-dirty-instrument')
+    # Reset before the PLAY write. A short song can finish while play_song?
+    # processes the command result; resetting after it would lose that event.
+    Flags.reset('ct-song')
     @did_play = DRC.play_song?(@settings, @song_list, is_instrument_worn, false)
+
+    # DRC.play_song? returns false when cleaning fails, even though the dirty
+    # instrument reply confirms PLAY started. Stop it and skip this skill for
+    # the pass instead of leaving a song running without any more commands.
+    if !@did_play && Flags['ct-dirty-instrument']
+      @did_play = true
+      @no_instrument = true
+      stop_play
+      return false
+    end
     @no_instrument = Flags['ct-no-instrument'] && !@did_play
 
+    if @stop
+      stop_play
+      return true
+    end
     return false unless @did_play
     return true unless blocking
 
-    Flags.reset('ct-song')
-    pause 1 until Flags['ct-song']
-    true
+    deadline = Time.now + 300
+    pause 1 until Flags['ct-song'] || @stop || Time.now >= deadline
+    if @stop
+      stop_play
+      return true
+    end
+    return true if Flags['ct-song']
+
+    echo '***PERFORMANCE TIMEOUT*** song did not finish in 300 seconds'
+    @no_instrument = true
+    stop_play
+    false
   end
 end
 
 before_dying do
   Flags.delete('ct-song')
   Flags.delete('ct-no-instrument')
+  Flags.delete('ct-dirty-instrument')
   Flags.delete('research-partial')
   Flags.delete('research-complete')
 end
