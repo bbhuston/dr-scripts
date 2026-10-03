@@ -36,6 +36,10 @@ class Athletics
     @skip_magic = args.skip_magic
     @end_exp = 32 if args.max
     DRC.wait_for_script_to_complete('buff', ['athletics']) unless @skip_magic
+    # A stop can arrive while the buff child is running. Keep the normal item
+    # cleanup below, but do not start travel or training after that stop.
+    return stow_athletics_items if done_training?
+
     if args.wyvern || (@settings.climbing_target == 'wyvern')
       climb_wyvern
     elsif args.undergondola || (@settings.climbing_target == 'undergondola')
@@ -96,11 +100,25 @@ class Athletics
   def swim_loop(rooms)
     return unless rooms
 
-    rooms.each { |x| DRCT.walk_to(x) } until done_training?
+    until done_training?
+      rooms.each do |room|
+        # Each walk may take roundtime. Check before every next movement so a
+        # Crossing trainer stop does not commit the rest of a swim lap.
+        break if done_training?
+
+        hold_practice("travel to #{room} was not confirmed") unless DRCT.walk_to(room)
+      end
+    end
+  end
+
+  def crossing_trainer_stopping?
+    Script.running?('crossing-training') && defined?($CROSSING_TRAINER) &&
+      $CROSSING_TRAINER.respond_to?(:stopping?) &&
+      $CROSSING_TRAINER.stopping?
   end
 
   def done_training?
-    @practice_unavailable || DRSkill.getxp('Athletics') >= @end_exp
+    crossing_trainer_stopping? || @practice_unavailable || DRSkill.getxp('Athletics') >= @end_exp
   end
 
   def offset_climbing_song(direction)
@@ -221,9 +239,9 @@ class Athletics
       # before_dying kills performance first, so a climb could end with the
       # gauntlets still stowed (drg-8lm, 2026-09-27). Skip it, as first-aid.lic
       # and crossing-repair.lic already do for a held instrument.
-      unless @settings.instrument
+      unless @settings.instrument || done_training?
         pause @performance_pause # to give performance time to complete before_dying if stopped from the previous script
-        start_script('performance') unless Script.running?('performance')
+        start_script('performance') unless done_training? || Script.running?('performance')
       end
       until done_training?
         @athletics_options['crossing']
@@ -348,8 +366,9 @@ class Athletics
 
   def climb_practice(room, target, to_hide = false)
     return unless target
+    return if done_training?
 
-    DRCT.walk_to(room)
+    hold_practice("travel to #{room} was not confirmed") unless DRCT.walk_to(room)
     practice_deadline = Time.now + 300
     until done_training?
       if Time.now >= practice_deadline
@@ -369,6 +388,8 @@ class Athletics
         start_script('performance', ['noclean']) unless Script.running?('performance')
         pause @performance_pause # make sure you are playing before starting climb practice
       end
+      break if done_training?
+
       Flags.add('ct-climbing-finished', 'You finish practicing your climbing')
       Flags.add('ct-climbing-combat', 'You are engaged in combat')
       Flags.add('ct-climbing-unavailable', 'This climb is too difficult', 'This climb is no challenge at all')
@@ -425,7 +446,9 @@ class Athletics
 
   def climb?(room, targets)
     targets.each do |target|
-      DRCT.walk_to(room)
+      return false if done_training?
+      hold_practice("travel to #{room} was not confirmed") unless DRCT.walk_to(room)
+      return false if done_training?
       return true if DRRoom.npcs.length >= 3
 
       DRC.bput("climb #{target}", '.*')
