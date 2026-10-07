@@ -446,6 +446,7 @@ class SetupProcess
     end
 
     @last_seen_weapon_skill = game_state.weapon_skill
+    (!game_state.respond_to?(:require_combat_hiding) || game_state.require_combat_hiding('after equipping'))
 
     # Invoke Focus
     return unless game_state.weapon_skill == 'Targeted Magic' && game_state.weapon_name
@@ -4367,6 +4368,10 @@ class TrainerProcess
   private
 
   def hide_action(game_state)
+    if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+      (!game_state.respond_to?(:require_combat_hiding) || game_state.require_combat_hiding('stealth training'))
+      return
+    end
     if DRC.hide?(@hide_type) && !@dont_stalk && !game_state.npcs.empty? && @hide_type == 'hide'
       stalked = ['You move into position', 'already stalking'].include?(
         DRC.bput('stalk', 'Stalk what',
@@ -4839,7 +4844,8 @@ class AttackProcess
       return false
     end
 
-    charged_maneuver = game_state.determine_charged_maneuver
+    # Powershot and other maneuvers do not implement the hidden attack policy.
+    charged_maneuver = (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?) ? nil : game_state.determine_charged_maneuver
 
     game_state.reset_barb_whirlwind_flags_if_needed
 
@@ -4867,6 +4873,8 @@ class AttackProcess
   end
 
   def attack_melee(charged_maneuver, game_state)
+    return unless (!game_state.respond_to?(:require_combat_hiding) || game_state.require_combat_hiding('before melee engagement'))
+    charged_maneuver = nil if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
     waitrt?
 
     # BACKSTAB, AMBUSH, and Brawling require an actual target at melee.  A room
@@ -4914,7 +4922,9 @@ class AttackProcess
 
     # If we didn't try a maneuver, or we did but it wasn't successful, then fallback to normal attack.
     unless maneuver_success
-      if game_state.backstab? || game_state.use_stealth_attack? || game_state.ambush? || game_state.ambush_stun_training?
+      if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+        return unless (!game_state.respond_to?(:require_combat_hiding) || game_state.require_combat_hiding('before melee attack'))
+      elsif game_state.backstab? || game_state.use_stealth_attack? || game_state.ambush? || game_state.ambush_stun_training?
         DRC.hide?(@hide_type)
       end
 
@@ -4944,7 +4954,8 @@ class AttackProcess
         end
       end
 
-      unless game_state.dispatch_typed_combo(command) || game_state.dispatch_enemy_combo(command, from_hiding: from_hiding)
+      unless !(game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?) &&
+             (game_state.dispatch_typed_combo(command) || game_state.dispatch_enemy_combo(command, from_hiding: from_hiding))
         if game_state.drbot_attack_ids_required?
           waitrt?
           expected_id = command[/#([1-9]\d*)\z/, 1]
@@ -4958,6 +4969,12 @@ class AttackProcess
     end
 
     waitrt?
+    if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?) && attack_result.to_s.empty?
+      game_state.stop_for_combat_stealth('unconfirmed melee command; reconcile before resuming')
+      return
+    end
+    # Rehide before facing, custody work or the next weapon/target.
+    return unless (!game_state.respond_to?(:require_combat_hiding) || game_state.require_combat_hiding('after melee attack'))
 
     if reget(5, 'flying too high for you to attack')
       case DRC.bput('face next', 'There is nothing', 'You turn to face', 'Face what')
@@ -5080,6 +5097,11 @@ class AttackProcess
   end
 
   def shoot_aimed(command, game_state)
+    return :stealth_stopped unless (!game_state.respond_to?(:require_combat_hiding) || game_state.require_combat_hiding('before firing'))
+    if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?) && !%w[poach snipe].include?(command.split.first)
+      game_state.stop_for_combat_stealth('a hidden ranged attack is required')
+      return :stealth_stopped
+    end
     if game_state.drbot_identity_targets?
       unless game_state.drbot_living_target_current?(@drbot_aim_target)
         drbot_cancel_identity_aim(game_state)
@@ -5101,6 +5123,16 @@ class AttackProcess
     result = DRC.bput(command, /you (fire|poach|snipe)/i, /isn't loaded/i, /There is nothing/i, /already dead|is dead|It's dead/i, /But your/i, /I could not find/i, /with no effect and falls (to the ground|to your feet)/i, /Face what/i, /How can you (poach|snipe)/i, /you don't feel like fighting right now/i, /That weapon must be in your right hand to fire/i, /But you don't have a ranged weapon in your hand to fire with/i)
     waitrt?
 
+    if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+      if result.to_s.empty?
+        game_state.stop_for_combat_stealth('unconfirmed ranged command; reconcile before resuming')
+        return :stealth_stopped
+      end
+      # POACH reveals; failed SNIPE may reveal too. Even a concealed SNIPE
+      # receives an actual redundant HIDE before ammo GET/PUT or switching.
+      return :stealth_stopped unless (!game_state.respond_to?(:require_combat_hiding) || game_state.require_combat_hiding('after ranged attack'))
+    end
+
     case result
     when /I could not find|already dead|is dead|It's dead|Face what/i
       if game_state.drbot_identity_targets?
@@ -5109,6 +5141,10 @@ class AttackProcess
         return :target_lost
       end
     when /How can you (poach|snipe)/i
+      if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+        game_state.stop_for_combat_stealth('hidden ranged attack refused; no ordinary shot fallback')
+        return :stealth_stopped
+      end
       return shoot_aimed('shoot', game_state)
     when /That weapon must be in your right hand to fire|But you don't have a ranged weapon in your hand to fire with/i
       # Explicitly say 'swap right' because if you're holding a swappable weapon (e.g. riste)
@@ -5167,6 +5203,8 @@ class AttackProcess
   end
 
   def attack_aimed(charged_maneuver, game_state)
+    return if (game_state.respond_to?(:combat_stealth_stopped?) && game_state.combat_stealth_stopped?)
+    charged_maneuver = nil if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
     if game_state.drbot_identity_targets? && game_state.loaded && !game_state.drbot_living_target_current?(@drbot_aim_target)
       drbot_cancel_identity_aim(game_state)
       aim(game_state)
@@ -5183,19 +5221,30 @@ class AttackProcess
       echo("Current Time > @firing_timer: #{Time.now >= @firing_timer}") if $debug_mode_ct
       echo("Current Time < @firing_timer: #{Time.now <= @firing_timer}") if $debug_mode_ct
       echo("Flag check: ct-ranged-ready: #{Flags['ct-ranged-ready']}") if $debug_mode_ct
-      command = if game_state.use_stealth_ranged? && DRC.hide?(@hide_type)
+      command = if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+                  @stealth_attack_aimed_action
+                elsif game_state.use_stealth_ranged? && DRC.hide?(@hide_type)
                   @stealth_attack_aimed_action
                 elsif game_state.use_stealth_attack? && DRC.hide?(@hide_type)
                   @stealth_attack_aimed_action
                 else
                   'shoot'
                 end
-      return if shoot_aimed(command, game_state) == :target_lost
+      return if [:target_lost, :stealth_stopped].include?(shoot_aimed(command, game_state))
       game_state.clear_aim_queue
       game_state.loaded = false
       @firing_check = 0
       echo("@firing_check reset normal fire: #{@firing_check}") if $debug_mode_ct
       waitrt?
+    elsif game_state.loaded && (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+      # Keep aim hidden without offensive offhand fillers. Two seconds gives
+      # meaningful recovery checks without flooding already-hidden replies.
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      if !@combat_stealth_aim_hide_at || now >= @combat_stealth_aim_hide_at
+        return unless (!game_state.respond_to?(:require_combat_hiding) || game_state.require_combat_hiding('during aim'))
+        @combat_stealth_aim_hide_at = now + 2.0
+      end
+      pause 0.1
     elsif game_state.loaded && !game_state.aiming_trainables.empty?
       skill = game_state.determine_aiming_skill
       echo "attack_aimed::aiming_trainables:skill: #{skill}" if $debug_mode_ct
@@ -5249,6 +5298,7 @@ class AttackProcess
         waitrt?
       end
     else
+      return unless (!game_state.respond_to?(:require_combat_hiding) || game_state.require_combat_hiding('before loading'))
       load_weapon_success = [
         /You reach into/,
         /You load/,
@@ -5304,7 +5354,11 @@ class AttackProcess
         Flags.reset('ct-using-repeating-crossbow')
 
         load_weapon_result = DRC.bput("load my #{game_state.weapon_name}", { 'timeout' => 1, 'suppress_no_match' => true }, *load_weapon_success, *load_weapon_failure)
-        load_weapon_result = DRC.bput("load my #{game_state.weapon_name}", *load_weapon_success, *load_weapon_failure) unless Flags['ct-ranged-loaded']
+        load_weapon_result = DRC.bput("load my #{game_state.weapon_name}", *load_weapon_success, *load_weapon_failure) unless Flags['ct-ranged-loaded'] || (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+        if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?) && load_weapon_result.to_s.empty?
+          game_state.stop_for_combat_stealth('unconfirmed load; reconcile before resuming')
+          return
+        end
         waitrt?
 
         case load_weapon_result
@@ -5405,6 +5459,7 @@ class AttackProcess
   end
 
   def aim(game_state)
+    return unless (!game_state.respond_to?(:require_combat_hiding) || game_state.require_combat_hiding('before aiming'))
     command = 'aim'
     if game_state.drbot_identity_targets?
       unless game_state.drbot_living_target_current?(@drbot_aim_target)
@@ -5460,12 +5515,18 @@ class AttackProcess
       pause 1
       aim(game_state)
     else
+      game_state.stop_for_combat_stealth('unconfirmed aim; reconcile before resuming') if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
       game_state.loaded = false
       @firing_check = 0
     end
   end
 
   def dance(game_state)
+    if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+      (!game_state.respond_to?(:require_combat_hiding) || game_state.require_combat_hiding('between targets'))
+      pause 1
+      return
+    end
     if game_state.can_engage?
       waitrt?
       game_state.set_dance_queue
@@ -5789,7 +5850,13 @@ class CombatTrainer
         # buffs, optional training, corpse work or attacks in the destination.
         next if @game_state.safety_stopping? && ![SetupProcess, SpellProcess, PetProcess].any? { |type| process.is_a?(type) }
 
-        break if process.execute(@game_state)
+        finished = process.execute(@game_state)
+        # Buffs, looting and equipment changes can expose the character.
+        # Recover before the next process; cleanup stays with its native path.
+        if @game_state.combat_stealth_always? && !@game_state.cleaning_up? && !hiding?
+          break unless @game_state.require_combat_hiding('after combat action')
+        end
+        break if finished
       end
       tick += 1
       # Give plugins a per-iteration seam; any plugin returning :break stops combat.
@@ -6103,6 +6170,7 @@ class GameState
 
   def initialize(settings, equipment_manager)
     @equipment_manager = equipment_manager
+    configure_combat_stealth(settings)
     echo('New GameState') if $debug_mode_ct
     # public
     @mob_died = false
@@ -6598,10 +6666,13 @@ class GameState
   end
 
   def engage
+    return false if respond_to?(:require_combat_hiding) && !require_combat_hiding('before engaging')
     return false unless can_engage?
-    return false if stomp
-    return false if pounce
-    return false if rush
+    unless respond_to?(:combat_stealth_always?) && combat_stealth_always?
+      return false if stomp
+      return false if pounce
+      return false if rush
+    end
 
     observation = fresh_target_selector
     return false unless observation && @target_observation == observation
@@ -6630,6 +6701,7 @@ class GameState
   end
 
   def engage_slow
+    return if respond_to?(:require_combat_hiding) && !require_combat_hiding('before engaging')
     return unless can_engage?
 
     observation = fresh_target_selector
@@ -8378,8 +8450,150 @@ class GameState
     @damaris_weapon_states[group] = weapon_name
   end
 
+  # Missing settings preserve upstream's experience-based training policy.
+  def configure_combat_stealth(settings)
+    @combat_stealth_mode = settings.combat_stealth_mode.nil? ? 'training' : settings.combat_stealth_mode
+    @combat_stealth_skills = settings.combat_stealth_skills.nil? ? ['Small Edged', 'Crossbow'] : settings.combat_stealth_skills
+    @combat_stealth_hide_attempts = settings.combat_stealth_hide_attempts.nil? ? 10 : settings.combat_stealth_hide_attempts
+    valid = %w[training always].include?(@combat_stealth_mode) &&
+            @combat_stealth_skills.is_a?(Array) && !@combat_stealth_skills.empty? &&
+            (@combat_stealth_skills - ['Small Edged', 'Crossbow', 'Bow', 'Slings']).empty? &&
+            @combat_stealth_skills.uniq == @combat_stealth_skills &&
+            @combat_stealth_hide_attempts.is_a?(Integer) && @combat_stealth_hide_attempts >= 10
+    if @combat_stealth_mode == 'always'
+      valid &&= settings.hide_type == 'hide' && !settings.force_unhide &&
+                settings.use_stealth_attacks == true && settings.use_stealth_ranged == true &&
+                %w[poach snipe].include?(settings.stealth_attack_aimed_action)
+    end
+    raise ArgumentError, 'Invalid combat stealth policy settings' unless valid
+
+    @combat_stealth_health_floor = settings.health_threshold
+  end
+
+  def combat_stealth_always?
+    @combat_stealth_mode == 'always' && @combat_stealth_skills.include?(weapon_skill)
+  end
+
+  def combat_stealth_stopped?
+    @combat_stealth_stopped == true
+  end
+
+  def combat_stealth_safe?
+    return false if dead? || @danger || safety_stopping? || cleaning_up?
+    return false unless DRStats.health.is_a?(Numeric)
+    waived = defined?(DrbotHuntingHealthPolicy) && DrbotHuntingHealthPolicy.waived?('active_hunt.health_floor') == true
+    waived || !@combat_stealth_health_floor || DRStats.health >= @combat_stealth_health_floor
+  rescue StandardError
+    false
+  end
+
+  # This observes the existing producer; it never opens or changes its fence.
+  def combat_stealth_producer
+    control = defined?($DRBOT_DIRECT_CONTROL) && $DRBOT_DIRECT_CONTROL
+    return :standalone unless control.is_a?(Hash)
+    return nil unless defined?(Monitor) && control['lock'].is_a?(Monitor)
+
+    control['lock'].synchronize do
+      token = [control, control['session'], control['producer']]
+      combat_stealth_producer_current?(token, idle: true) ? token : nil
+    end
+  end
+
+  def combat_stealth_producer_current?(token, idle: false)
+    return true if token == :standalone && !(defined?($DRBOT_DIRECT_CONTROL) && $DRBOT_DIRECT_CONTROL.is_a?(Hash))
+    return false unless token.is_a?(Array)
+
+    control = token.first
+    control['lock'].synchronize do
+      control.equal?($DRBOT_DIRECT_CONTROL) && control['mode'] == 'B' && control['closed'] == false &&
+        control['confirm_by'].nil? && control['session'] == token[1] && control['producer'] == token[2] &&
+        control['character'].to_s.casecmp?(XMLData.name.to_s) &&
+        (!idle || control['pending_result'] == false)
+    end
+  end
+
+  # One actual HIDE and one confirmed result, including an already-hidden
+  # reply. DRC.hide? skips that write; DRC.bput can retry cooldowns internally.
+  # Neither is appropriate for this bounded policy. Unknown writes are never
+  # replayed: leave pending-result reconciliation to the existing watchdog.
+  def combat_stealth_hide_once(token)
+    expected_write = nil
+    dispatch = proc do
+      return :interrupted unless combat_stealth_safe? && combat_stealth_producer_current?(token, idle: true)
+      clear
+      if token.is_a?(Array)
+        return :unconfirmed unless token.first['write_count'].is_a?(Integer)
+        expected_write = token.first['write_count'] + 1
+      end
+      put 'hide'
+      return :unconfirmed if expected_write && token.first['write_count'] != expected_write
+    end
+    if token.is_a?(Array)
+      token.first['lock'].synchronize { dispatch.call }
+    else
+      dispatch.call
+    end
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15.0
+    result = nil
+    loop do
+      return :interrupted unless combat_stealth_safe? && combat_stealth_producer_current?(token)
+      return :unconfirmed if expected_write && token.first['write_count'] != expected_write
+      line = get?
+      if line.to_s.match?(/Roundtime|already (?:hidden|hiding)|can't see any place to hide|search but find no place|haven't had enough time|too busy performing|^\.?Wait \d+|^You are still stunned|^You can't do that/i)
+        result = line
+      end
+      break if result && combat_stealth_producer_current?(token, idle: true)
+      return :unconfirmed if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      pause 0.1
+    end
+    waitrt?
+    return :interrupted unless combat_stealth_safe? && combat_stealth_producer_current?(token, idle: true)
+    # Cooldown refusals are confirmed, but carry no native roundtime.
+    pause 1 if result.match?(/haven't had enough time|too busy|Wait \d+/i)
+    hiding? ? :hidden : :failed
+  end
+
+  def require_combat_hiding(boundary)
+    return true unless combat_stealth_always?
+    return false if combat_stealth_stopped? || cleaning_up?
+
+    @combat_stealth_hide_attempts.times do
+      waitrt?
+      token = combat_stealth_producer
+      unless combat_stealth_safe? && token
+        return stop_for_combat_stealth('safety or producer interrupted hiding')
+      end
+      case combat_stealth_hide_once(token)
+      when :hidden
+        # Every caller refreshes its room/target after this roundtime. Keep
+        # real redundant HIDE calls at equip/engage/load/aim/fire boundaries.
+        return true
+      when :failed
+        next
+      when :unconfirmed
+        return stop_for_combat_stealth('unconfirmed HIDE; reconcile before resuming')
+      else
+        return stop_for_combat_stealth('safety or producer interrupted hiding')
+      end
+    end
+    stop_for_combat_stealth("could not hide after #{@combat_stealth_hide_attempts} confirmed attempts (#{boundary})")
+  end
+
+  def stop_for_combat_stealth(reason)
+    return false if combat_stealth_stopped?
+
+    @combat_stealth_stopped = true
+    DRC.message("*** combat-trainer: #{reason}. Stopping hunt.")
+    $HUNTING_BUDDY&.stop_hunting
+    $COMBAT_TRAINER&.stop
+    # Same native spell/pet/weapon cleanup as the existing safety stop; skip
+    # last-kill offense, keep custody and the external guardian's Thief escape.
+    begin_safety_cleanup
+    false
+  end
+
   def use_stealth?
-    DRSkill.getxp('Stealth') < @combat_training_abilities_target
+    (@combat_stealth_mode == 'always' && @combat_stealth_skills.include?(weapon_skill)) || DRSkill.getxp('Stealth') < @combat_training_abilities_target
   end
 
   # Given an array of skills, sorts them first by
