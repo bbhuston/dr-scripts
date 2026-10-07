@@ -890,10 +890,21 @@ class Coordinator
       return
     end
 
-    child, failure = run_forging_child
+    rotation = @settings.forging_workorder_disciplines
+    discipline = rotation.nil? ? 'Blacksmithing' : forging_workorder_discipline(rotation)
+    return unless discipline
+
+    child, failure = rotation.nil? ? run_forging_child : run_forging_child(discipline)
     result = child.respond_to?(:drbot_workorders_result) ? child.drbot_workorders_result : nil
     status = result.is_a?(Hash) ? result['status'].to_s : nil
     if failure.nil? && FORGING_BENIGN_RESULTS.include?(status)
+      if !rotation.nil? && status == 'turned_in'
+        next_discipline = rotation[(rotation.index(discipline) + 1) % rotation.length]
+        unless persist_forging_discipline(next_discipline)
+          latch_forging('paid order completed but next discipline persistence is unconfirmed')
+          return
+        end
+      end
       echo("***STATUS*** train_forging: workorders #{status} (#{result['detail']})")
       wait_for_child('sell-loot')
       return
@@ -902,11 +913,47 @@ class Coordinator
     latch_forging(failure || (status ? "workorders #{status}: #{result['detail']}" : 'workorders published no result'))
   end
 
-  def run_forging_child
+  # A shared forging logbook stays assigned to one discipline across restarts.
+  # Advance only after the runner verifies paid turn-in. No offer, mindlock,
+  # short deadline, pending purchase or failed crafting retains this discipline.
+  def forging_workorder_discipline(rotation)
+    valid = rotation.is_a?(Array) && !rotation.empty? && rotation.uniq == rotation &&
+            rotation.all? { |name| %w[Blacksmithing Weaponsmithing Armorsmithing].include?(name) }
+    unless valid
+      latch_forging('invalid forging_workorder_disciplines; no child started')
+      return nil
+    end
+    current = UserVars.drbot_forging_discipline
+    if current && !rotation.include?(current)
+      latch_forging('saved forging discipline is outside configured rotation; reconcile logbook')
+      return nil
+    end
+    current ||= rotation.first
+    unless persist_forging_discipline(current)
+      latch_forging('forging discipline persistence is unconfirmed; no child started')
+      return nil
+    end
+    current
+  end
+
+  def persist_forging_discipline(discipline)
+    UserVars.drbot_forging_discipline = discipline
+    Vars.save
+    persisted = Lich.db_mutex.synchronize do
+      blob = Lich.db.get_first_value('SELECT hash FROM uservars WHERE scope=?;',
+                                    ["#{XMLData.game}:#{XMLData.name}".encode('UTF-8')])
+      blob && Marshal.load(blob)['drbot_forging_discipline']
+    end
+    persisted == discipline
+  rescue StandardError
+    false
+  end
+
+  def run_forging_child(discipline = 'Blacksmithing')
     return [nil, 'workorders was already running; not started'] if Script.running?('workorders')
 
     @child_script = 'workorders'
-    child = start_script('workorders', ['Blacksmithing'])
+    child = start_script('workorders', [discipline])
     return [nil, 'workorders start unconfirmed'] unless child
 
     limit = @settings.train_forging_deadline_seconds
