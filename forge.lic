@@ -346,6 +346,7 @@ class Forge
         { name: 'recipe_name', display: 'recipe name', regex: /^[A-z\s\-\']+$/i, variable: true, description: 'Name of the recipe, wrap in double quotes if this is multiple words.' },
         { name: 'metal', regex: /\w+/i, variable: true, description: 'Type of metal ingot to use.' },
         { name: 'noun', regex: /\w+/i, variable: true, description: 'name of item being crafted' },
+        { name: 'stock', regex: /\Astock=[1-9]\d*:[1-9]\d*\z/, optional: true, variable: true, description: 'Bind a verified purchased ingot ID and usable volume' },
         { name: 'skip', regex: /skip/i, optional: true, description: 'Optional setting to skip restocking consumables if low (oil)' },
         { name: 'debug', regex: /debug/i, optional: true, description: 'displays debug information' }
       ],
@@ -374,6 +375,7 @@ class Forge
     args = parse_args(arg_definitions)
     setup_flags
     load_settings(args)
+    publish_forging_result('status' => 'failed') if @stock_binding
     validate_setup(args)
     execute_workflow(args)
   end
@@ -420,6 +422,7 @@ class Forge
     @info = get_data('crafting')['blacksmithing'][@hometown]
     @recipe_name = resolve_recipe_name(args.recipe_name)
     @metal = args.metal
+    @stock_binding = args.stock
     @next_spin = Time.now
     @debug = args.debug || settings.debug_mode
     @use_private_forge = settings.forge_use_private_forge
@@ -1030,13 +1033,39 @@ class Forge
   # @return [void]
   # @raise [SystemExit] if ingot cannot be found
   def prep_ingot
-    DRCC.get_crafting_item("#{@metal} ingot", @bag, @bag_items, @forging_belt, true)
-    unless DRCI.in_hands?('ingot')
-      cleanup_and_exit("Failed to get #{@metal} ingot.")
+    if @stock_binding
+      binding = @stock_binding.to_s.match(/\Astock=(?<id>[1-9]\d*):(?<volume>[1-9]\d*)\z/)
+      cleanup_and_exit('Invalid purchased-stock binding; no ingot selected.') unless binding
+      DRC.bput("get ##{binding[:id]} from my #{@bag}", GET_SUCCESS_PATTERN, GET_FAILURE_PATTERN, 'I could not find', "You can't")
+      30.times do
+        break if bound_ingot_held?(binding[:id])
+
+        pause 0.1
+      end
+      cleanup_and_exit('Purchased-stock ID is not positively held; no anvil write.') unless bound_ingot_held?(binding[:id])
+      counted = DRC.bput('count my ingot', /About \d+ volumes? of material make up the #{Regexp.escape(@metal)} ingot\./, 'I could not find', 'What were you')
+      unless counted.to_s[/\AAbout (\d+) volumes?/, 1].to_i == binding[:volume].to_i
+        cleanup_and_exit('Purchased-stock usable volume changed; no anvil write.')
+      end
+    else
+      DRCC.get_crafting_item("#{@metal} ingot", @bag, @bag_items, @forging_belt, true)
+      cleanup_and_exit("Failed to get #{@metal} ingot.") unless DRCI.in_hands?('ingot')
     end
-    DRC.bput('put my ingot on anvil', PUT_SUCCESS_PATTERN)
+    if @stock_binding && !bound_ingot_held?(binding[:id])
+      cleanup_and_exit('Purchased-stock custody changed before placement; no anvil write.')
+    end
+    result = DRC.bput('put my ingot on anvil', PUT_SUCCESS_PATTERN, 'I could not find', 'What were you', "You can't")
+    cleanup_and_exit('Owned ingot placement was not confirmed.') unless result.to_s.start_with?(PUT_SUCCESS_PATTERN)
     ready_hammer_with_tongs
     @command = "pound ingot on anvil with my #{@hammer}"
+  end
+
+  def bound_ingot_held?(id)
+    return false unless defined?(GameObj)
+
+    [GameObj.left_hand, GameObj.right_hand].compact.any? do |object|
+      object.id.to_s == id && object.name.to_s.match?(/\b#{Regexp.escape(@metal)} ingot\z/i)
+    end
   end
 
   # @!endgroup
@@ -1592,7 +1621,26 @@ class Forge
     stamp_item if @stamp
     finalize_item
     magic_cleanup
+    if @stock_binding
+      objects = [GameObj.left_hand, GameObj.right_hand].compact.select do |object|
+        object.noun.to_s == @item && object.name.to_s.match?(/\b#{Regexp.escape(@metal)}\b/i) &&
+          !object.name.to_s.match?(/\bunfinished\b/i) && object.id.to_s.match?(/\A[1-9]\d*\z/)
+      end
+      cleanup_and_exit('Finished bound product is not positively held; no completion receipt.') unless objects.length == 1
+
+      publish_forging_result('status' => 'complete', 'stock_binding' => @stock_binding,
+                             'metal' => @metal, 'noun' => @item, 'item_id' => objects.first.id.to_s)
+    end
     exit
+  end
+
+  # The exact child handle carries native completion; an exited Script alone
+  # is never a success result. Only complete_crafting publishes this receipt.
+  def publish_forging_result(result)
+    result = result.freeze
+    script = Script.current if defined?(Script) && Script.respond_to?(:current)
+    script&.define_singleton_method(:drbot_forging_result) { result }
+    result
   end
 
   # Stamp the finished item with maker's mark.

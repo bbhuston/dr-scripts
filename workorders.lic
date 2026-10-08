@@ -116,6 +116,8 @@ class WorkOrders
   # drf (drg-9yh): the same logbook line carries the order's time limit.
   LOGBOOK_TIMED_REMAINING_PATTERN = /You must bundle and deliver (?<remaining>\d+) more within the next (?<left>\d+) rois(?:aen|an)\b/.freeze
   LOGBOOK_ITEM_PATTERN = /This logbook is tracking a work order requiring you to craft (?<item>.+?) from any/i.freeze
+  # Native completed lines omit 'from any material'; retain item identity.
+  LOGBOOK_COMPLETE_PATTERN = /This logbook is tracking a work order requiring you to craft (?<item>.+?)\.\s+This work order appears to be complete\./i.freeze
   LOGBOOK_NO_ORDER_PATTERN = /(?:\AThis logbook is not currently tracking (?:a work order|any work orders)\.\z|This logbook has been used to complete:)/i.freeze
   # drf (drg-v4vt): the whole active-order line in one match. DRC.bput returns
   # only the matched text, and a second read sent before the first read's
@@ -127,6 +129,7 @@ class WorkOrders
   # used to complete:", which must never answer a later read.
   LOGBOOK_NOT_TRACKING_PATTERN = /\AThis logbook is not currently tracking (?:a work order|any work orders)\./i.freeze
   RESUME_LOGBOOK_PATTERNS = [
+    LOGBOOK_COMPLETE_PATTERN,
     LOGBOOK_ACTIVE_PATTERN,
     LOGBOOK_ITEM_PATTERN,
     'This work order appears to be complete.',
@@ -447,7 +450,15 @@ class WorkOrders
   # Pieces forged from one smelted batch; 0 when the recipe cannot be smelted.
   def smelt_batch_pieces(recipe)
     limit = smelt_max_volume
-    limit ? limit / recipe['volume'] : 0
+    return 0 unless limit
+    if exact_forging_stock?
+      stock = current_forging_stock
+      return 0 unless stock
+
+      volume = ((recipe['volume'] + stock['stock-volume'] - 1) / stock['stock-volume']) * stock['stock-volume']
+      return volume <= limit ? 1 : 0
+    end
+    limit / recipe['volume']
   end
 
   # [pieces, ingots] for each smelted batch of a quantity, in order.
@@ -531,9 +542,24 @@ class WorkOrders
       Lich::Messaging.msg('bold', "WorkOrders: Turn-in was not accepted - #{result}. Order preserved")
       return false
     end
+    if rotating_forging? && !paid_forging_logbook_empty?(info['logbook'])
+      stow_tool('logbook')
+      publish_result('paid_logbook_unconfirmed', 'payment received; empty shared logbook not positively confirmed')
+      Lich::Messaging.msg('bold', 'WorkOrders: Paid order logbook state is unconfirmed; no rotation or new request')
+      return false
+    end
     stow_tool('logbook')
     Lich::Messaging.msg('plain', 'WorkOrders: Work order completed and turned in')
     true
+  end
+
+  def paid_forging_logbook_empty?(logbook)
+    return false unless held_logbook?(logbook) || DRCI.get_item?("#{logbook} logbook")
+    return false unless held_logbook?(logbook)
+
+    result = DRC.bput("read my #{logbook} logbook", LOGBOOK_NOT_TRACKING_PATTERN,
+                      LOGBOOK_ACTIVE_PATTERN, LOGBOOK_COMPLETE_PATTERN, 'has expired', 'I could not find', 'What were you')
+    result && LOGBOOK_NOT_TRACKING_PATTERN.match?(result)
   end
 
   def held_item?(noun)
@@ -583,8 +609,22 @@ class WorkOrders
     end
 
     result = DRC.bput("read my #{logbook} logbook", *RESUME_LOGBOOK_PATTERNS)
+    if rotating_forging? && result && !LOGBOOK_NO_ORDER_PATTERN.match?(result)
+      identity = result.match(LOGBOOK_COMPLETE_PATTERN) || result.match(LOGBOOK_ITEM_PATTERN)
+      if result.include?('has expired') || !identity || !same_forging_discipline?(identity[:item], discipline)
+        stow_tool('logbook')
+        publish_result('foreign_or_ambiguous_order', 'preserved logbook; reconcile its discipline, deadline and custody')
+        Lich::Messaging.msg('bold', 'WorkOrders: Existing forging debt is expired, foreign or unidentified; no replacement, purchase or turn-in')
+        exit
+      end
+    end
     if result && result.include?('appears to be complete')
       stow_tool('logbook')
+      if rotating_forging? && !recipes.any? { |candidate| candidate['name'] == identity[:item] }
+        publish_result('unadmitted_complete_order', 'completed item is outside the selected discipline allowlist; custody preserved')
+        Lich::Messaging.msg('bold', 'WorkOrders: Completed unadmitted debt preserved; no turn-in or cursor advance')
+        exit
+      end
       Lich::Messaging.msg('plain', 'WorkOrders: Existing work order is complete and ready for turn-in')
       return [nil, 0]
     end
@@ -604,6 +644,15 @@ class WorkOrders
     recipe = recipes.find { |candidate| candidate['name'] == match[:item] }
     unless recipe
       stow_tool('logbook')
+      if rotating_forging? && own_unspent_forging_offer?(result, discipline, diff)
+        Lich::Messaging.msg('plain', "WorkOrders: Continuing bounded requests for this producer's verified unspent rejected offer")
+        return request_confirmed_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
+      end
+      if rotating_forging?
+        publish_result('unadmitted_active_order', 'existing item is outside this discipline allowlist; custody preserved')
+        Lich::Messaging.msg('bold', 'WorkOrders: Existing unadmitted order preserved; no replacement request')
+        exit
+      end
       if replace_unworkable_orders?
         # drf (drg-4ju): an unadmitted offer used to strand the logbook until
         # it expired (up to 105 roisaen); a diagonal-peen mallet was 10 of
@@ -636,12 +685,23 @@ class WorkOrders
       return [nil, 0]
     end
 
+    # A known recipe can still be a rejected no-spend offer: for example
+    # four faulds exceed the rounded fresh-stock budget. Only our unchanged,
+    # durably verified current-producer receipt permits requesting again.
+    rejected = !remaining.between?(bounded_setting(:workorder_min_items, 1, 1..100),
+                                  bounded_setting(:workorder_max_items, 4, 1..100)) ||
+               !offer_workable?(recipes, recipe['name'], remaining)
+    if rotating_forging? && rejected && own_unspent_forging_offer?(result, discipline, diff)
+      Lich::Messaging.msg('plain', 'WorkOrders: Continuing bounded requests for verified unspent quantity/budget rejection')
+      return request_confirmed_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
+    end
+
     exit unless safe_forging_stock_preflight([recipe], quantity: remaining)
 
     # drf (drg-9yh): a resumed order is bought for only when its time limit
     # covers the remaining pieces and the turn-in.
     if (shortfall = resumed_order_time_shortfall(minutes_left, remaining, recipe))
-      if replace_unworkable_orders? && minutes_left
+      if replace_unworkable_orders? && minutes_left && !rotating_forging?
         Lich::Messaging.msg('plain', "WorkOrders: Active order for #{remaining} #{recipe['name']} has #{shortfall}; asking for a replacement (up to #{max_requests} asks)")
         return request_confirmed_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
       end
@@ -652,6 +712,16 @@ class WorkOrders
 
     Lich::Messaging.msg('plain', "WorkOrders: Resuming active order for #{remaining} #{recipe['name']}")
     [recipe['name'], remaining]
+  end
+
+  def rotating_forging?
+    @settings&.forging_workorder_disciplines.is_a?(Array)
+  end
+
+  def same_forging_discipline?(item, discipline)
+    get_data('recipes').crafting_recipes.any? do |recipe|
+      recipe['name'] == item && recipe['type'].to_s.casecmp?(discipline.to_s)
+    end
   end
 
   # The generic discipline catalog includes high-tier recipes the server may
@@ -685,6 +755,10 @@ class WorkOrders
   # catalog whole-order stock and part cost must fit a separate material budget.
   # The cash-on-hand setting remains a withdrawal minimum, not a spend cap.
   def safe_forging_stock_preflight(recipes, stock = nil, quantity: 1, any_recipe: false, info: @forging_info)
+    if exact_forging_stock? && @retain_crafting_materials != true
+      Lich::Messaging.msg('bold', 'WorkOrders: Exact stock requires retained materials; no request or purchase')
+      return false
+    end
     stock ||= @crafting_stock[@workorders_materials['metal_type']] if @crafting_stock.is_a?(Hash) && @workorders_materials.is_a?(Hash)
     float = @cash_on_hand.nil? ? 5000 : @cash_on_hand
     budget = @material_budget.nil? ? 5000 : @material_budget
@@ -778,8 +852,12 @@ class WorkOrders
     ingots = if recipe['volume'] > stock['stock-volume']
                smelt_batches(recipe, stock, quantity).sum { |_, count| count }
              else
-               per_ingot = stock['stock-volume'] / recipe['volume']
-               (quantity + per_ingot - 1) / per_ingot
+               if exact_forging_stock?
+                 quantity
+               else
+                 per_ingot = stock['stock-volume'] / recipe['volume']
+                 (quantity + per_ingot - 1) / per_ingot
+               end
              end
     parts = (recipe['part'] || []).sum { |part| @crafting_stock.dig(part, 'stock-value') }
     ingots * stock['stock-value'] + quantity * parts
@@ -1353,6 +1431,8 @@ class WorkOrders
 
     recipe = find_recipe(materials_info, item, quantity).first
     remaining_volume = 0
+    @purchased_stock_ids = []
+    @forging_stock_id = nil
 
     info['trash-room'] = nil if @worn_trashcan && @worn_trashcan_verb
 
@@ -1366,7 +1446,7 @@ class WorkOrders
       end
 
       if remaining_volume < recipe['volume']
-        DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive?
+        DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive? && !@retain_crafting_materials
         # Smith checks a 3,000-copper minimum before every piece. Fund the
         # remaining order plus that reserve now, without counting its payout.
         required_cash = [@cash_on_hand || 5000, forging_material_cost(recipe, materials_info, remaining) + 3000].max
@@ -1390,6 +1470,7 @@ class WorkOrders
         else
           return false unless purchase_and_stow_stock(stock_room, materials_info)
           remaining_volume = materials_info['stock-volume']
+          @forging_stock_id = @purchased_stock_ids.pop if exact_forging_stock?
         end
       end
 
@@ -1403,15 +1484,41 @@ class WorkOrders
       # Without `noparts` smith bought another and binned the unused one.
       child_args = [materials_info['stock-name'], item['name']]
       child_args << 'noparts' if Array(recipe['part']).any?
+      if exact_forging_stock?
+        unless @forging_stock_id.to_s.match?(/\A[1-9]\d*\z/)
+          Lich::Messaging.msg('bold', 'WorkOrders: Fresh stock identity is unconfirmed; no smith child')
+          return false
+        end
+        child_args << "stock=#{@forging_stock_id}:#{remaining_volume}"
+      end
       crafted = DRC.wait_for_script_to_complete('smith', child_args)
       unless crafted
         Lich::Messaging.msg('bold', 'WorkOrders: Smith did not complete; preserving custody and stopping before bundle')
         return false
       end
-      return false unless bundle_item(recipe['noun'], info['logbook'], remaining)
+      product_id = nil
+      if exact_forging_stock?
+        receipt = crafted.drbot_forging_result if crafted.respond_to?(:drbot_forging_result)
+        unless receipt.is_a?(Hash) && receipt['status'] == 'complete' &&
+               receipt['stock_binding'] == "stock=#{@forging_stock_id}:#{remaining_volume}" &&
+               receipt['metal'] == materials_info['stock-name'] && receipt['noun'] == recipe['noun'] &&
+               receipt['item_id'].to_s.match?(/\A[1-9]\d*\z/) &&
+               held_forging_product?(receipt['item_id'], recipe['noun'], materials_info['stock-name'])
+          Lich::Messaging.msg('bold', 'WorkOrders: Bound smith child did not confirm its exact completed held product; no bundle or further spend')
+          return false
+        end
+        product_id = receipt['item_id']
+      end
+      return false unless bundle_item(recipe['noun'], info['logbook'], remaining, product_id)
 
       remaining_volume -= recipe['volume']
       attempts += 1
+      if exact_forging_stock?
+        # One positively purchased batch per piece. Splits remain owned in
+        # the bag; an old leftover is never selected as next fresh stock.
+        remaining_volume = 0
+        @forging_stock_id = nil
+      end
     end
 
     unless logbook_remaining(info['logbook']) == 0
@@ -1419,18 +1526,57 @@ class WorkOrders
       return false
     end
 
-    DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive?
+    DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive? && !@retain_crafting_materials
     true
   end
 
   def purchase_and_stow_stock(stock_room, stock)
     ingot = "#{stock['stock-name']} ingot"
     return false unless purchase_forging_stock(stock_room, stock)
+    id = held_forging_stock_id(stock['stock-name']) if exact_forging_stock?
+    if exact_forging_stock? && !id
+      Lich::Messaging.msg('bold', 'WorkOrders: Purchased stock ID is unconfirmed; purchase guard and custody retained')
+      return false
+    end
     unless DRCI.put_away_item?(ingot, @bag) && !DRCI.in_hands?(ingot)
       Lich::Messaging.msg('bold', 'WorkOrders: Material stow was not confirmed; preserving custody before smith')
       return false
     end
-    save_forging_purchase(nil)
+    return false unless save_forging_purchase(nil)
+
+    (@purchased_stock_ids ||= []) << id if exact_forging_stock?
+    true
+  end
+
+  def exact_forging_stock?
+    @settings&.workorders_exact_stock_ids == true
+  end
+
+  def held_forging_stock_id(metal)
+    return nil unless defined?(GameObj)
+
+    held = [GameObj.left_hand, GameObj.right_hand].compact.select do |object|
+      object.name.to_s.match?(/\b#{Regexp.escape(metal.to_s)} ingot\z/i)
+    end
+    return nil unless held.length == 1
+
+    id = held.first.id.to_s
+    id if id.match?(/\A[1-9]\d*\z/)
+  end
+
+  def take_exact_forging_stock(id, metal, volume)
+    return false unless id.to_s.match?(/\A[1-9]\d*\z/) && !DRC.left_hand && !DRC.right_hand
+
+    DRC.bput("get ##{id} from my #{@bag}", 'You get', 'You pick up', 'I could not find', 'What were you', "You can't")
+    30.times do
+      break if held_forging_stock_id(metal) == id.to_s
+
+      pause 0.1
+    end
+    return false unless held_forging_stock_id(metal) == id.to_s
+
+    counted = DRC.bput('count my ingot', /About \d+ volumes? of material make up the #{Regexp.escape(metal)} ingot\./, 'I could not find', 'What were you')
+    counted.to_s[/\AAbout (\d+) volumes?/, 1].to_i == volume
   end
 
   # drf (drg-gut): one part per piece, bought by name where the recipe data
@@ -1462,6 +1608,9 @@ class WorkOrders
   # backpack." (2026-10-01); anything else is not a carried part.
   def carried_part?(part)
     noun = Regexp.escape(part.split.last)
+    if part == 'small padding'
+      return DRCI.tap(part).to_s.match?(/\AYou tap some small cloth padding inside your #{Regexp.escape(@bag.to_s)}\./)
+    end
     DRCI.tap(part).to_s.match?(/\AYou tap (?:an?|some) [^.]*\b#{noun} inside your #{Regexp.escape(@bag.to_s)}\./)
   end
 
@@ -1478,7 +1627,8 @@ class WorkOrders
     return false unless save_forging_purchase({ 'room' => room, 'part' => part, 'price' => price, 'since' => Time.now.to_i })
 
     noun = part.split.last
-    receipt = forging_purchase_write("buy #{part}", room,
+    command = part == 'small padding' && room == 8776 ? 'buy small padding in steel crate' : "buy #{part}"
+    receipt = forging_purchase_write(command, room,
                                      accept: /You decide to purchase|don't have enough coins|can't order|Buy what|What were you/)
     held = receipt == "You decide to purchase the #{noun}, and pay the sales clerk #{price} Kronars." && part_in_hand?(part)
     unless held
@@ -1495,11 +1645,17 @@ class WorkOrders
   # The clerk hands the part over on the line after the receipt.
   def part_in_hand?(part)
     30.times do
-      return true if DRCI.in_hands?(part)
+      return true if purchased_part_held?(part)
 
       pause 0.1
     end
-    DRCI.in_hands?(part)
+    purchased_part_held?(part)
+  end
+
+  def purchased_part_held?(part)
+    return DRCI.in_hands?(part) unless part == 'small padding'
+
+    [DRC.left_hand, DRC.right_hand].compact.any? { |held| held.to_s.match?(/\bsmall cloth padding\z/i) }
   end
 
   # drf (drg-gut): smelt `count` stowed ingots into one at an empty society
@@ -1517,14 +1673,34 @@ class WorkOrders
       Lich::Messaging.msg('bold', "WorkOrders: No empty crucible was found; #{count} #{metal} ingots stay in the #{@bag}")
       return nil
     end
+    if exact_forging_stock? && (!@purchased_stock_ids.is_a?(Array) || @purchased_stock_ids.length != count || @purchased_stock_ids.uniq.length != count)
+      Lich::Messaging.msg('bold', 'WorkOrders: Fresh smelt input identities are incomplete; no crucible loading')
+      return nil
+    end
     count.times do |index|
-      unless DRCI.get_item?("#{metal} ingot", @bag) && DRCI.in_hands?("#{metal} ingot")
+      taken = if exact_forging_stock?
+                take_exact_forging_stock(@purchased_stock_ids.first, metal, stock['stock-volume'])
+              else
+                DRCI.get_item?("#{metal} ingot", @bag) && DRCI.in_hands?("#{metal} ingot")
+              end
+      unless taken
         Lich::Messaging.msg('bold', "WorkOrders: Ingot #{index + 1} of #{count} was not taken for smelting; stopping")
         return nil
       end
       unless DRC.bput('put my ingot in crucible', 'You put your ingot in the', 'I could not find', 'What were you', "You can't", 'too full').to_s.start_with?('You put your ingot in the')
         Lich::Messaging.msg('bold', "WorkOrders: Ingot #{index + 1} of #{count} did not go into the crucible; stopping")
         return nil
+      end
+      if exact_forging_stock?
+        id = @purchased_stock_ids.first
+        30.times do
+          break unless held_forging_stock_id(metal) == id
+
+          pause 0.1
+        end
+        return nil if held_forging_stock_id(metal) == id
+
+        @purchased_stock_ids.shift
       end
     end
     counted = DRC.bput('count crucible', /a #{metal} ingot - \d+/, 'There is nothing', 'I could not find', 'What were you')
@@ -1574,6 +1750,10 @@ class WorkOrders
       Lich::Messaging.msg('bold', "WorkOrders: Could not stow #{held} after smelting; stopping")
       return nil
     end
+    if on_floor && exact_forging_stock?
+      Lich::Messaging.msg('bold', 'WorkOrders: Smelted output is on the floor without a positively bound ID; preserving it for reconciliation, no generic pickup')
+      return nil
+    end
     if on_floor && !DRC.bput("get #{metal} ingot", 'You pick up', 'You get', 'I could not find', 'What were you').to_s.start_with?('You pick up', 'You get')
       Lich::Messaging.msg('bold', "WorkOrders: The smelted #{metal} ingot was not picked up; it is at his feet")
       return nil
@@ -1585,6 +1765,11 @@ class WorkOrders
     volume = DRC.bput('analyze my ingot', /About \d+ volume/, 'I could not find', 'What were you').to_s[/\d+/].to_i
     unless volume == expected
       Lich::Messaging.msg('bold', "WorkOrders: The smelted ingot holds #{volume} volume, not #{expected}; stopping")
+      return nil
+    end
+    @forging_stock_id = held_forging_stock_id(metal) if exact_forging_stock?
+    if exact_forging_stock? && !@forging_stock_id
+      Lich::Messaging.msg('bold', 'WorkOrders: Smelted stock ID is unconfirmed; owned ingot remains held')
       return nil
     end
     unless DRCI.put_away_item?("#{metal} ingot", @bag) && !DRCI.in_hands?("#{metal} ingot")
@@ -1642,6 +1827,48 @@ class WorkOrders
   end
 
   PURCHASE_PENDING_KEY = 'workorders_pending_purchase'.freeze
+  UNSPENT_FORGING_OFFER_KEY = 'workorders_unspent_forging_offer'.freeze
+
+  # This is a no-spend receipt, not gameplay authority. It applies only to
+  # the currently loaded fenced producer. A takeover/restart invalidates it;
+  # an admitted order still resumes from the native logbook and paid cursor.
+  def forging_offer_epoch
+    control = $DRBOT_DIRECT_CONTROL
+    return nil unless control.is_a?(Hash) && control['mode'] == 'B' && !control['closed']
+
+    loaded = control['profile_loaded']
+    return nil unless loaded.is_a?(Hash) && loaded['producer_id'].is_a?(Integer) && loaded['loaded_at'].is_a?(Numeric)
+
+    loaded.slice('producer_id', 'loaded_at')
+  end
+
+  def save_unspent_forging_offer(record)
+    previous = UserVars[UNSPENT_FORGING_OFFER_KEY]
+    UserVars[UNSPENT_FORGING_OFFER_KEY] = record
+    Vars.save
+    persisted = Lich.db_mutex.synchronize do
+      blob = Lich.db.get_first_value('SELECT hash FROM uservars WHERE scope=?;',
+                                     ["#{XMLData.game}:#{XMLData.name}".encode('UTF-8')])
+      blob && Marshal.load(blob)[UNSPENT_FORGING_OFFER_KEY]
+    end
+    raise 'unspent offer was not durably saved' unless persisted == record
+
+    true
+  rescue StandardError
+    UserVars[UNSPENT_FORGING_OFFER_KEY] = record || previous
+    false
+  end
+
+  def own_unspent_forging_offer?(row, discipline, diff)
+    active = row.to_s.match(LOGBOOK_ACTIVE_PATTERN)
+    receipt = UserVars[UNSPENT_FORGING_OFFER_KEY]
+    epoch = forging_offer_epoch
+    return false unless active && receipt.is_a?(Hash) && epoch
+
+    expected = epoch.merge('discipline' => discipline, 'difficulty' => diff,
+                           'item' => active[:item], 'quantity' => active[:remaining].to_i)
+    receipt == expected && save_unspent_forging_offer(receipt)
+  end
 
   def forging_purchase_pending?
     return false if UserVars[PURCHASE_PENDING_KEY].nil?
@@ -1651,6 +1878,9 @@ class WorkOrders
   end
 
   def save_forging_purchase(record)
+    # Invalidate no-spend evidence BEFORE even a quote, part or stock write.
+    return false if record && rotating_forging? && !save_unspent_forging_offer(nil)
+
     previous = UserVars[PURCHASE_PENDING_KEY]
     UserVars[PURCHASE_PENDING_KEY] = record
     Vars.save
@@ -2020,8 +2250,8 @@ class WorkOrders
     end
   end
 
-  def bundle_item(noun, logbook, expected_remaining = nil)
-    return bundle_item_safely(noun, logbook, expected_remaining) if @resume_or_request
+  def bundle_item(noun, logbook, expected_remaining = nil, expected_item_id = nil)
+    return bundle_item_safely(noun, logbook, expected_remaining, expected_item_id) if @resume_or_request
 
     noun = 'fount' if noun == 'small sphere'
     unless DRCI.get_item?("#{logbook} logbook")
@@ -2036,10 +2266,24 @@ class WorkOrders
     DRCI.stow_hands
   end
 
-  def bundle_item_safely(noun, logbook, expected_remaining)
+  def held_forging_product?(id, noun, metal = nil)
+    objects = [GameObj.left_hand, GameObj.right_hand].compact.select do |object|
+      object.id.to_s == id.to_s && object.noun.to_s == noun &&
+        !object.name.to_s.match?(/\bunfinished\b/i) &&
+        (!metal || object.name.to_s.match?(/\b#{Regexp.escape(metal)}\b/i))
+    end
+    id.to_s.match?(/\A[1-9]\d*\z/) && objects.length == 1
+  end
+
+  def bundle_item_safely(noun, logbook, expected_remaining, expected_item_id = nil)
     noun = 'fount' if noun == 'small sphere'
 
-    unless held_item?(noun) || DRCI.get_item?(noun, @settings.default_container)
+    if expected_item_id
+      unless held_forging_product?(expected_item_id, noun)
+        Lich::Messaging.msg('bold', 'WorkOrders: Exact finished product is no longer held; no older same-noun fallback')
+        return false
+      end
+    elsif !(held_item?(noun) || DRCI.get_item?(noun, @settings.default_container))
       Lich::Messaging.msg('bold', "WorkOrders: Failed to get #{noun} for bundling; custody preserved")
       return false
     end
@@ -2054,6 +2298,11 @@ class WorkOrders
     end
     unless held_item?(noun) && held_logbook?(logbook)
       Lich::Messaging.msg('bold', 'WorkOrders: Item and matching logbook are not both held; custody preserved')
+      return false
+    end
+
+    if expected_item_id && !held_forging_product?(expected_item_id, noun)
+      Lich::Messaging.msg('bold', 'WorkOrders: Finished product custody changed while taking the logbook; no bundle')
       return false
     end
 
@@ -2117,6 +2366,10 @@ class WorkOrders
           break
         end
       end
+      if !allow_bundled_cleanup && rotating_forging? && !save_unspent_forging_offer(nil)
+        bounded_stop = 'previous unspent-offer receipt could not be cleared'
+        break
+      end
       result = DRC.bput("ask #{npc} for #{diff} #{discipline} work", *WORK_ORDER_REQUEST_PATTERNS)
       case result
       when /^To whom/
@@ -2133,6 +2386,14 @@ class WorkOrders
         if match
           item = match[:item]
           quantity = match[:quantity].to_i
+          if !allow_bundled_cleanup && rotating_forging?
+            epoch = forging_offer_epoch
+            receipt = epoch && epoch.merge('discipline' => discipline, 'difficulty' => diff, 'item' => item, 'quantity' => quantity)
+            unless receipt && save_unspent_forging_offer(receipt)
+              bounded_stop = 'new unspent-offer receipt was not durably confirmed'
+              break
+            end
+          end
           if @min_items <= quantity && quantity <= @max_items && match_names.include?(item) &&
              (allow_bundled_cleanup || offer_workable?(recipes, item, quantity))
             stow_tool('logbook')

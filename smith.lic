@@ -20,12 +20,15 @@ class Smith
         { name: 'lighten', regex: /^lighten/i, optional: true, description: 'Lightens crafted armor or shield, reducing weight only' },
         { name: 'reinforce', regex: /^reinforce/i, optional: true, description: 'Improves some absorption/protection stats at the cost of increased weight and hinderance' },
         { name: 'buy', regex: /^buy/i, optional: true, description: 'Used to purchase the ingot' },
-        { name: 'noparts', regex: /^noparts$/i, optional: true, description: 'The recipe parts are already carried: neither buy nor dispose of them' }
+        { name: 'noparts', regex: /^noparts$/i, optional: true, description: 'The recipe parts are already carried: neither buy nor dispose of them' },
+        { name: 'stock', regex: /\Astock=[1-9]\d*:[1-9]\d*\z/, optional: true, variable: true, description: 'Bind a verified purchased ingot ID and its usable volume' }
       ]
     ]
 
     args = parse_args(arg_definitions)
 
+    @stock_binding = args.stock
+    publish_forging_result('status' => 'failed') if @stock_binding
     @settings = get_settings
     @hometown = @settings.force_crafting_town || @settings.hometown
     @bag = @settings.crafting_container
@@ -83,13 +86,31 @@ class Smith
     end
     DRCC.check_consumables('oil', discipline['finisher-room'], discipline['finisher-number'], @bag, @bag_items, @belt)
     DRC.wait_for_script_to_complete('buff', ['smith'])
-    DRC.wait_for_script_to_complete('forge', [recipe['type'], recipe['chapter'], recipe['name'], material, recipe['noun'], stay ? 'skip' : nil])
+    forge_args = [recipe['type'], recipe['chapter'], recipe['name'], material, recipe['noun'], stay ? 'skip' : nil]
+    forge_args << @stock_binding if @stock_binding
+    forge_handle = DRC.wait_for_script_to_complete('forge', forge_args)
+    if @stock_binding
+      receipt = forge_handle.drbot_forging_result if forge_handle.respond_to?(:drbot_forging_result)
+      unless receipt.is_a?(Hash) && receipt['status'] == 'complete' && receipt['stock_binding'] == @stock_binding &&
+             receipt['metal'] == material && receipt['noun'] == recipe['noun'] && receipt['item_id'].to_s.match?(/\A[1-9]\d*\z/)
+        Lich::Messaging.msg('bold', 'smith: Bound forge child did not confirm its completed product; preserving custody, no finishing or disposal.')
+        exit
+      end
+    end
     stamp_item(recipe['noun']) if stamp
     [temper, hone, balance, lighten, reinforce].compact.each do |enhancement|
       DRC.wait_for_script_to_complete('forge', [enhancement, recipe['noun'], stay ? 'skip' : nil])
     end
     dispose_scrap(discipline, recipe) if buy
     dispose_parts(discipline, parts) unless stay
+    publish_forging_result(receipt) if @stock_binding
+  end
+
+  def publish_forging_result(result)
+    result = result.freeze
+    script = Script.current if defined?(Script) && Script.respond_to?(:current)
+    script&.define_singleton_method(:drbot_forging_result) { result }
+    result
   end
 
   def buy_parts(parts)

@@ -1892,8 +1892,9 @@ recipe_parts:
       part-number:
   small padding:
     Crossing:
-      part-room: 16667
-      part-number: 11
+      # Native BUY SMALL PADDING IN STEEL CRATE at62 Kronars (drg-lahw).
+      part-room: 8776
+      part-number:
     Leth Deriel:
       part-room: 16667
       part-number: 11
