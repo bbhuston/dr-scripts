@@ -1723,6 +1723,16 @@ class WorkOrders
     Flags.add('workorders-smelt-floor', SMELT_FLOOR_PATTERN)
     command = 'stir crucible with my rod'
     SMELT_ACTIONS.times do
+      # A finished ingot needs a free hand. Fire corrections occupy the left
+      # while the stirring rod stays right; release it before either mixing
+      # action, which can finish the smelt and place the fresh output in hand.
+      if exact_forging_stock? && command.match?(/\A(?:stir|turn) crucible/)
+        held = DRC.left_hand
+        if held && (!DRCI.put_away_item?(held, @bag) || DRC.left_hand)
+          Lich::Messaging.msg('bold', 'WorkOrders: Could not free the left hand before mixing; preserving metal in the crucible')
+          return nil
+        end
+      end
       result = DRC.bput(command, 'clumps of molten metal', 'flickers and is unable to consume', 'needs more fuel',
                         'needs some more fuel', 'Roundtime', "doesn't appear suitable", 'I could not find', 'What were you')
       waitrt?
