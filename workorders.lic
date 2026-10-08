@@ -688,12 +688,21 @@ class WorkOrders
     # A known recipe can still be a rejected no-spend offer: for example
     # four faulds exceed the rounded fresh-stock budget. Only our unchanged,
     # durably verified current-producer receipt permits requesting again.
-    rejected = !remaining.between?(bounded_setting(:workorder_min_items, 1, 1..100),
-                                  bounded_setting(:workorder_max_items, 4, 1..100)) ||
+    rejected = remaining > bounded_setting(:workorder_max_items, 4, 1..100) ||
                !offer_workable?(recipes, recipe['name'], remaining)
-    if rotating_forging? && rejected && own_unspent_forging_offer?(result, discipline, diff)
-      Lich::Messaging.msg('plain', 'WorkOrders: Continuing bounded requests for verified unspent quantity/budget rejection')
-      return request_confirmed_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
+    below_minimum = remaining < bounded_setting(:workorder_min_items, 1, 1..100)
+    if rotating_forging? && (rejected || below_minimum)
+      if own_unspent_forging_offer?(result, discipline, diff)
+        Lich::Messaging.msg('plain', 'WorkOrders: Continuing bounded requests for verified unspent quantity/budget rejection')
+        return request_confirmed_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
+      end
+      if rejected
+        publish_result('unworkable_active_order', 'existing quantity or budget exceeds admission; debt and custody preserved')
+        Lich::Messaging.msg('bold', 'WorkOrders: Existing quantity/budget-rejected debt preserved; no request or purchase')
+        exit
+      end
+      # Remaining one can be partially bundled admitted debt. The request
+      # minimum applies only to positively identified unspent new offers.
     end
 
     exit unless safe_forging_stock_preflight([recipe], quantity: remaining)
