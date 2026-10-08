@@ -1664,7 +1664,12 @@ class WorkOrders
   def purchased_part_held?(part)
     return DRCI.in_hands?(part) unless part == 'small padding'
 
-    [DRC.left_hand, DRC.right_hand].compact.any? { |held| held.to_s.match?(/\bsmall cloth padding\z/i) }
+    return false unless defined?(GameObj)
+
+    [GameObj.left_hand, GameObj.right_hand].compact.any? do |held|
+      held.name.to_s == 'small cloth padding' && held.noun.to_s == 'padding' &&
+        held.id.to_s.match?(/\A[1-9]\d*\z/)
+    end
   end
 
   # drf (drg-gut): smelt `count` stowed ingots into one at an empty society
