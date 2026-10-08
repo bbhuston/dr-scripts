@@ -1622,8 +1622,11 @@ class Forge
     finalize_item
     magic_cleanup
     if @stock_binding
+      # Native hand labels can omit metal (observed finished long drawknife).
+      # The material comes from the exact verified input stock, while the
+      # native completion callback and current server ID prove the product.
       objects = [GameObj.left_hand, GameObj.right_hand].compact.select do |object|
-        object.noun.to_s == @item && object.name.to_s.match?(/\b#{Regexp.escape(@metal)}\b/i) &&
+        object.noun.to_s == @item &&
           !object.name.to_s.match?(/\bunfinished\b/i) && object.id.to_s.match?(/\A[1-9]\d*\z/)
       end
       cleanup_and_exit('Finished bound product is not positively held; no completion receipt.') unless objects.length == 1

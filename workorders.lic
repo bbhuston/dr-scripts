@@ -1512,7 +1512,7 @@ class WorkOrders
                receipt['stock_binding'] == "stock=#{@forging_stock_id}:#{remaining_volume}" &&
                receipt['metal'] == materials_info['stock-name'] && receipt['noun'] == recipe['noun'] &&
                receipt['item_id'].to_s.match?(/\A[1-9]\d*\z/) &&
-               held_forging_product?(receipt['item_id'], recipe['noun'], materials_info['stock-name'])
+               held_forging_product?(receipt['item_id'], recipe['noun'])
           Lich::Messaging.msg('bold', 'WorkOrders: Bound smith child did not confirm its exact completed held product; no bundle or further spend')
           return false
         end
@@ -2275,11 +2275,10 @@ class WorkOrders
     DRCI.stow_hands
   end
 
-  def held_forging_product?(id, noun, metal = nil)
+  def held_forging_product?(id, noun)
     objects = [GameObj.left_hand, GameObj.right_hand].compact.select do |object|
       object.id.to_s == id.to_s && object.noun.to_s == noun &&
-        !object.name.to_s.match?(/\bunfinished\b/i) &&
-        (!metal || object.name.to_s.match?(/\b#{Regexp.escape(metal)}\b/i))
+        !object.name.to_s.match?(/\bunfinished\b/i)
     end
     id.to_s.match?(/\A[1-9]\d*\z/) && objects.length == 1
   end
