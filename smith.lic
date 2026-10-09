@@ -21,6 +21,7 @@ class Smith
         { name: 'reinforce', regex: /^reinforce/i, optional: true, description: 'Improves some absorption/protection stats at the cost of increased weight and hinderance' },
         { name: 'buy', regex: /^buy/i, optional: true, description: 'Used to purchase the ingot' },
         { name: 'noparts', regex: /^noparts$/i, optional: true, description: 'The recipe parts are already carried: neither buy nor dispose of them' },
+        { name: 'book', regex: /\Abook=[1-9]\d*:[1-9]\d*:journeyman:(blacksmithing|weaponsmithing|armorsmithing)\z/, optional: true, variable: true, description: 'Exact preflight instruction-book identity and tier' },
         { name: 'stock', regex: /\Astock=[1-9]\d*:[1-9]\d*\z/, optional: true, variable: true, description: 'Bind a verified purchased ingot ID and its usable volume' }
       ]
     ]
@@ -28,6 +29,7 @@ class Smith
     args = parse_args(arg_definitions)
 
     @stock_binding = args.stock
+    @book_binding = args.book
     publish_forging_result('status' => 'failed') if @stock_binding
     @settings = get_settings
     @hometown = @settings.force_crafting_town || @settings.hometown
@@ -53,6 +55,22 @@ class Smith
       exit
     end
     return unless recipe
+
+    if @book_binding || !@settings.forging_book_tiers.nil?
+      require File.join(SCRIPT_DIR, 'forging-book-binding.rb')
+      begin
+        discipline_name = recipe['type'].to_s.downcase
+        if ForgingBookBinding.tier(@settings, discipline_name) || @book_binding
+          raise ForgingBookBinding::Error, 'Missing workorder book binding' unless @book_binding
+
+          binding = ForgingBookBinding.get(@settings, discipline_name, @book_binding)
+          ForgingBookBinding.stow(@settings, binding)
+        end
+      rescue ForgingBookBinding::Error => e
+        Lich::Messaging.msg('bold', "smith: #{e.message}; no material or part purchase")
+        return
+      end
+    end
 
     DRCM.ensure_copper_on_hand(3000, @settings, @hometown) unless args.here
     DRCM.ensure_copper_on_hand(50_000, @settings, @hometown) if @use_private_forge
@@ -88,10 +106,11 @@ class Smith
     DRC.wait_for_script_to_complete('buff', ['smith'])
     forge_args = [recipe['type'], recipe['chapter'], recipe['name'], material, recipe['noun'], stay ? 'skip' : nil]
     forge_args << @stock_binding if @stock_binding
+    forge_args << @book_binding if @book_binding
     forge_handle = DRC.wait_for_script_to_complete('forge', forge_args)
     if @stock_binding
       receipt = forge_handle.drbot_forging_result if forge_handle.respond_to?(:drbot_forging_result)
-      unless receipt.is_a?(Hash) && receipt['status'] == 'complete' && receipt['stock_binding'] == @stock_binding &&
+      unless receipt.is_a?(Hash) && receipt['status'] == 'complete' && receipt['stock_binding'] == @stock_binding && receipt['book_binding'] == @book_binding &&
              receipt['metal'] == material && receipt['noun'] == recipe['noun'] && receipt['item_id'].to_s.match?(/\A[1-9]\d*\z/)
         Lich::Messaging.msg('bold', 'smith: Bound forge child did not confirm its completed product; preserving custody, no finishing or disposal.')
         exit

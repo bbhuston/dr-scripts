@@ -829,11 +829,34 @@ class WorkOrders
   # container when crafting_items_in_container lists it (and no forging belt
   # does), otherwise anywhere; one already held counts. A tool found once stays
   # found for this run.
+  def forging_books_present?(recipes)
+    return true if @settings.forging_book_tiers.nil?
+
+    require File.join(SCRIPT_DIR, 'forging-book-binding.rb')
+    @forging_book_bindings ||= {}
+    recipes.grep(Hash).map { |recipe| recipe['type'].to_s.downcase }.uniq.each do |discipline|
+      next unless ForgingBookBinding.tier(@settings, discipline)
+
+      binding = ForgingBookBinding.get(@settings, discipline, @forging_book_bindings[discipline])
+      ForgingBookBinding.stow(@settings, binding)
+      @forging_book_bindings[discipline] = binding
+    end
+    true
+  rescue ForgingBookBinding::Error => e
+    Lich::Messaging.msg('bold', "WorkOrders: BLOCKED explicit book preflight: #{e.message}; no request or purchase")
+    false
+  end
+
   def forging_tools_present?(recipes)
+    return false unless forging_books_present?(recipes)
+
     books = if @settings.master_crafting_book
               []
             else
-              recipes.grep(Hash).filter_map { |recipe| "#{recipe['type'].to_s.downcase} book" unless recipe['name'].to_s.include?('temper') }
+              recipes.grep(Hash).filter_map do |recipe|
+                discipline = recipe['type'].to_s.downcase
+                "#{discipline} book" unless recipe['name'].to_s.include?('temper') || @forging_book_bindings&.key?(discipline)
+              end
             end
     bag = @settings.crafting_container
     listed = @settings.crafting_items_in_container.to_a
@@ -1454,6 +1477,7 @@ class WorkOrders
         return false
       end
 
+      return false unless forging_books_present?([recipe])
       if remaining_volume < recipe['volume']
         DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive? && !@retain_crafting_materials
         # Smith checks a 3,000-copper minimum before every piece. Fund the
@@ -1492,6 +1516,8 @@ class WorkOrders
       # drf (drg-2121): the parts are bought above, under the purchase guard.
       # Without `noparts` smith bought another and binned the unused one.
       child_args = [materials_info['stock-name'], item['name']]
+      book_binding = @forging_book_bindings&.[](recipe['type'].to_s.downcase)
+      child_args << book_binding if book_binding
       child_args << 'noparts' if Array(recipe['part']).any?
       if exact_forging_stock?
         unless @forging_stock_id.to_s.match?(/\A[1-9]\d*\z/)
@@ -1510,6 +1536,7 @@ class WorkOrders
         receipt = crafted.drbot_forging_result if crafted.respond_to?(:drbot_forging_result)
         unless receipt.is_a?(Hash) && receipt['status'] == 'complete' &&
                receipt['stock_binding'] == "stock=#{@forging_stock_id}:#{remaining_volume}" &&
+               receipt['book_binding'] == book_binding &&
                receipt['metal'] == materials_info['stock-name'] && receipt['noun'] == recipe['noun'] &&
                receipt['item_id'].to_s.match?(/\A[1-9]\d*\z/) &&
                held_forging_product?(receipt['item_id'], recipe['noun'])
