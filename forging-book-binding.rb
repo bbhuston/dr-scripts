@@ -4,9 +4,9 @@
 # owned instruction tiers. Every binding uses a fresh complete native inventory search.
 module ForgingBookBinding
   class Error < StandardError; end
-  DISCIPLINES = %w[blacksmithing weaponsmithing armorsmithing].freeze
-  TOKEN = /\Abook=([1-9]\d*):([1-9]\d*):journeyman:(blacksmithing|weaponsmithing|armorsmithing)\z/.freeze
-  POLLS = 30
+  DISCIPLINES = %w[blacksmithing weaponsmithing armorsmithing].freeze unless const_defined?(:DISCIPLINES, false)
+  TOKEN = /\Abook=([1-9]\d*):([1-9]\d*):journeyman:(blacksmithing|weaponsmithing|armorsmithing)\z/.freeze unless const_defined?(:TOKEN, false)
+  POLLS = 30 unless const_defined?(:POLLS, false)
 
   def self.tier(settings, discipline)
     tiers = settings.forging_book_tiers
@@ -54,7 +54,9 @@ module ForgingBookBinding
     def feed(raw)
       raw.to_s.each_line do |line|
         line = line.strip
-        if line.start_with?('You rummage about your person, looking for book')
+        # Native inventory search can put its roundTime tag on the header line.
+        # Recognize only that exact optional tag; never strip arbitrary XML.
+        if line.match?(/\A(?:<roundTime value=(["'])\d+\1\/>)?You rummage about your person, looking for book\.\.\.\z/)
           @invalid = true if @started
           @started = true
         elsif @started && !@complete && line.start_with?('<d cmd=')
@@ -147,4 +149,9 @@ module ForgingBookBinding
 
     "book=#{id}:#{owned[:container]}:journeyman:#{discipline}"
   end
+
+  # Set only after all methods loaded. Existing Error and unchanged constants
+  # retain their identity during the one-time resident-process correction.
+  remove_const(:VERSION) if const_defined?(:VERSION, false)
+  VERSION = 2
 end

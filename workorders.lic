@@ -832,7 +832,11 @@ class WorkOrders
   def forging_books_present?(recipes)
     return true if @settings.forging_book_tiers.nil?
 
-    require File.join(SCRIPT_DIR, 'forging-book-binding.rb')
+    book_helper = File.join(SCRIPT_DIR, 'forging-book-binding.rb')
+    require book_helper
+    # require may already cache the prior helper in this resident Lich process.
+    load book_helper unless defined?(ForgingBookBinding::VERSION) && ForgingBookBinding::VERSION == 2
+    raise ForgingBookBinding::Error, 'Instruction-book helper version was not confirmed' unless defined?(ForgingBookBinding::VERSION) && ForgingBookBinding::VERSION == 2
     @forging_book_bindings ||= {}
     recipes.grep(Hash).map { |recipe| recipe['type'].to_s.downcase }.uniq.each do |discipline|
       next unless ForgingBookBinding.tier(@settings, discipline)
