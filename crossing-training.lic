@@ -74,7 +74,9 @@ class CrossingTraining
     # "The bones is much too damaged to play." replies from 2026-09-26 18:39
     # until a repair kit fixed them 2026-09-27 06:14 (drg-8lm).
     Flags.add('ct-no-instrument', 'Play on what instrument', 'too damaged to play')
+    Flags.add('ct-damaged-instrument', 'too damaged to play')
     Flags.add('ct-dirty-instrument', 'dirtiness may affect your performance', /^You really need to drain/)
+    Flags.add('ct-cleaned-instrument', 'not in need of cleaning')
     Flags.add('research-partial', 'there is still more to learn before you arrive at a breakthrough', 'distracted by combat', 'distracted by your spellcasting', 'You lose your focus on your research project', 'you forget what you were')
     Flags.add('research-complete', '^Breakthrough!')
   end
@@ -916,6 +918,55 @@ class CrossingTraining
     true
   end
 
+  def repair_instrument?(worn = false)
+    return false unless defined?(DRCI) && defined?(DRC)
+
+    instrument = worn ? @settings.worn_instrument : @settings.instrument
+    return false if instrument.to_s.strip.empty?
+
+    kit = @settings.respond_to?(:repair_kit) && @settings.repair_kit ? @settings.repair_kit : 'repair kit'
+    unless DRCI.in_hands?(kit) || DRCI.get_item?(kit)
+      DRCI.stow_item?(instrument) if !worn && DRCI.in_hands?(instrument)
+      return false
+    end
+
+    if worn
+      unless DRCI.in_hands?(instrument) || DRCI.remove_item?(instrument)
+        DRCI.stow_item?(kit)
+        return false
+      end
+    elsif !DRCI.in_hands?(instrument) && !DRCI.get_item?(instrument)
+      DRCI.stow_item?(kit)
+      return false
+    end
+
+    repaired = false
+    case DRC.bput("repair my #{instrument}",
+                  'fully repaired',
+                  'not in need of repair',
+                  'Roundtime',
+                  'You lack the proper tools',
+                  'You must be holding',
+                  'What were you referring to')
+    when 'fully repaired', 'not in need of repair', 'Roundtime'
+      repaired = true
+    end
+    waitrt?
+    DRCI.stow_item?(kit)
+    if worn
+      DRCI.wear_item?(instrument) if repaired
+    elsif !repaired && DRCI.in_hands?(instrument)
+      DRCI.stow_item?(instrument)
+    end
+    repaired
+  end
+
+  def clean_instrument?(worn = false)
+    return false unless defined?(DRC) && DRC.respond_to?(:clean_instrument)
+
+    DRC.clean_instrument(@settings, worn)
+  end
+
   def play_song?(blocking = false)
     return true if @stop
     return true if @researching
@@ -924,20 +975,46 @@ class CrossingTraining
 
     is_instrument_worn = @settings.instrument.nil?
     Flags.reset('ct-no-instrument')
+    Flags.reset('ct-damaged-instrument')
     Flags.reset('ct-dirty-instrument')
+    Flags.reset('ct-cleaned-instrument')
     # Reset before the PLAY write. A short song can finish while play_song?
     # processes the command result; resetting after it would lose that event.
     Flags.reset('ct-song')
     @did_play = DRC.play_song?(@settings, @song_list, is_instrument_worn, false)
 
-    # DRC.play_song? returns false when cleaning fails, even though the dirty
-    # instrument reply confirms PLAY started. Stop it and skip this skill for
-    # the pass instead of leaving a song running without any more commands.
-    if !@did_play && Flags['ct-dirty-instrument']
-      @did_play = true
-      @no_instrument = true
-      stop_play
-      return false
+    if !@did_play && Flags['ct-damaged-instrument']
+      if respond_to?(:repair_instrument?, true) && repair_instrument?(is_instrument_worn)
+        Flags.reset('ct-no-instrument')
+        Flags.reset('ct-damaged-instrument')
+        Flags.reset('ct-dirty-instrument')
+        Flags.reset('ct-cleaned-instrument')
+        Flags.reset('ct-song')
+        @did_play = DRC.play_song?(@settings, @song_list, is_instrument_worn, false)
+      else
+        @no_instrument = true
+        return false
+      end
+    end
+
+    # DRC.play_song? skips clean_instrument below rank 20 and still returns
+    # true when clean_instrument fails without a cloth. Clean below rank 20, or
+    # stop the dirty song and skip Performance for the pass when uncleaned.
+    if Flags['ct-dirty-instrument'] && !Flags['ct-cleaned-instrument']
+      if @did_play && DRSkill.respond_to?(:getrank) && DRSkill.getrank('Performance').to_i < 20 &&
+         respond_to?(:clean_instrument?, true) && clean_instrument?(is_instrument_worn)
+        Flags.reset('ct-no-instrument')
+        Flags.reset('ct-damaged-instrument')
+        Flags.reset('ct-dirty-instrument')
+        Flags.reset('ct-cleaned-instrument')
+        Flags.reset('ct-song')
+        @did_play = DRC.play_song?(@settings, @song_list, is_instrument_worn, true)
+      else
+        @did_play = true
+        @no_instrument = true
+        stop_play
+        return false
+      end
     end
     @no_instrument = Flags['ct-no-instrument'] && !@did_play
 
@@ -966,7 +1043,9 @@ end
 before_dying do
   Flags.delete('ct-song')
   Flags.delete('ct-no-instrument')
+  Flags.delete('ct-damaged-instrument')
   Flags.delete('ct-dirty-instrument')
+  Flags.delete('ct-cleaned-instrument')
   Flags.delete('research-partial')
   Flags.delete('research-complete')
 end
