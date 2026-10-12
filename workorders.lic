@@ -2306,7 +2306,8 @@ class WorkOrders
   end
 
   def bundle_item(noun, logbook, expected_remaining = nil, expected_item_id = nil)
-    return bundle_item_safely(noun, logbook, expected_remaining, expected_item_id) if @resume_or_request
+    # drf (drg-999l): an exact product is never bundled, or disposed, by noun.
+    return bundle_item_safely(noun, logbook, expected_remaining, expected_item_id) if @resume_or_request || expected_item_id
 
     noun = 'fount' if noun == 'small sphere'
     unless DRCI.get_item?("#{logbook} logbook")
@@ -2361,8 +2362,12 @@ class WorkOrders
     end
 
     accepted_pattern = /\AYou notate the #{Regexp.escape(noun)} in the logbook then bundle it up for delivery\.\z/i
+    # drf (drg-999l): the bound product by its completion server ID. A carried
+    # tool can share the noun (Khazdar's plain iron pliers); `bundle #<id> with
+    # my logbook` resolved exactly like the noun form live on 2026-10-12.
+    target = expected_item_id ? "##{expected_item_id}" : "my #{noun}"
     result = DRC.bput(
-      "bundle my #{noun} with my #{logbook} logbook",
+      "bundle #{target} with my #{logbook} logbook",
       accepted_pattern,
       *SAFE_BUNDLE_FAILURE_PATTERNS
     )

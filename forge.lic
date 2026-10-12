@@ -257,6 +257,23 @@ class Forge
 
   # @!endgroup
 
+  # @!group Exact Product Patterns
+
+  # drf (drg-999l): tools this script draws by bare noun. A stock-bound piece
+  # sharing one of these nouns, or a forging_tools noun, is named only by its
+  # server ID once held. Khazdar's plain metal pliers and his plain iron
+  # pliers both label as "plain pliers" in the hand XML.
+  # @return [Array<String>]
+  EXACT_PRODUCT_TOOL_NOUNS = %w[tongs shovel bellows pliers oil brush stamp].freeze
+
+  # Replies that refuse an exact-product command. Without them the work loop
+  # resends the refused command forever. `pour my oil on #<absent id>` answered
+  # "You don't know how to do that." live (Khazdar, 2026-10-12).
+  # @return [Array<String>]
+  EXACT_PRODUCT_REFUSAL_PATTERNS = ['You cannot figure out how to do that', "You don't know how to do that", GET_FAILURE_PATTERN].freeze
+
+  # @!endgroup
+
   # @!group Location Patterns
 
   # Pattern indicating anvil has an item on it
@@ -431,6 +448,10 @@ class Forge
     @private_forge_cost = settings.forge_private_forge_cost || DEFAULT_PRIVATE_FORGE_COST
     @show_progress = settings.forge_show_progress
     @settings = settings
+    # drf (drg-999l): see EXACT_PRODUCT_TOOL_NOUNS.
+    tool_nouns = Array(settings.forging_tools).map { |tool| tool.to_s.split.last } + EXACT_PRODUCT_TOOL_NOUNS
+    @exact_product = !@stock_binding.nil? && tool_nouns.include?(@item)
+    @product_id = nil
   end
 
   # Validate required settings and preconditions.
@@ -446,6 +467,7 @@ class Forge
   # @raise [SystemExit] if validation fails
   def validate_setup(args)
     validate_crafting_container
+    validate_exact_product
     validate_hammer
     DRC.wait_for_script_to_complete('buff', ['forge'])
     validate_free_hand
@@ -461,6 +483,21 @@ class Forge
     return if @bag
 
     cleanup_and_exit('No crafting_container configured in your YAML settings.')
+  end
+
+  # drf (drg-999l): an exact product is made only bound, held and unstamped,
+  # from hands that hold nothing of its noun. Finishing, stamping and logging
+  # would name it by the noun the carried tool shares.
+  #
+  # @return [void]
+  # @raise [SystemExit] before any write if the run is not that shape
+  def validate_exact_product
+    return unless @exact_product
+    return if @finish == 'hold' && !@stamp && held_exact_products.empty?
+
+    # Nothing has been touched yet: leave a held tool exactly where it is.
+    error_log("A #{@item} named like a forging tool is made only held, unstamped and from hands without one; nothing was placed or moved.")
+    exit
   end
 
   # Validate that a hammer or mallet is configured in forging_tools.
@@ -581,8 +618,99 @@ class Forge
   #
   # @return [void]
   def stow_both_hands
+    if @exact_product
+      stow_exact_hand(:right)
+      stow_exact_hand(:left)
+      return
+    end
     DRCC.stow_crafting_item(DRC.right_hand, @bag, @forging_belt)
     DRCC.stow_crafting_item(DRC.left_hand, @bag, @forging_belt)
+  end
+
+  # drf (drg-999l): stow one hand of an exact-product run. Anything held with
+  # the product's noun goes into the bag by its server ID, never by a noun
+  # that could resolve to the carried tool. Other items stow as usual.
+  #
+  # @param hand [Symbol] :left or :right
+  # @return [void]
+  def stow_exact_hand(hand)
+    name = hand == :left ? DRC.left_hand : DRC.right_hand
+    return unless name
+
+    object = hand == :left ? GameObj.left_hand : GameObj.right_hand
+    return DRCC.stow_crafting_item(name, @bag, @forging_belt) unless object && object.noun.to_s == @item
+
+    id = object.id.to_s
+    return unless id.match?(/\A[1-9]\d*\z/)
+
+    result = DRC.bput("put ##{id} in my #{@bag}", PUT_SUCCESS_PATTERN, ITEM_NOT_FOUND_PATTERN, GET_FAILURE_PATTERN)
+    # Only a stopped run gets here: the piece now sits beside the tool of its noun.
+    where = result == PUT_SUCCESS_PATTERN ? "is in your #{@bag}" : 'may still be held'
+    error_log("#{@item.capitalize} ##{id} #{where}; it shares its noun with a forging tool, so reconcile it by that ID before clearing the forging hold.")
+  end
+
+  # @return [Array<GameObj>] held objects with the product's noun and a server ID
+  def held_exact_products
+    return [] unless defined?(GameObj)
+
+    [GameObj.left_hand, GameObj.right_hand].compact.select do |object|
+      object.noun.to_s == @item && object.id.to_s.match?(/\A[1-9]\d*\z/)
+    end
+  end
+
+  # @param hand [Symbol] :left or :right
+  # @return [Boolean] true if that hand holds the bound piece by its server ID
+  def product_held_in?(hand)
+    return false unless @product_id && defined?(GameObj)
+
+    object = hand == :left ? GameObj.left_hand : GameObj.right_hand
+    !object.nil? && object.id.to_s == @product_id && object.noun.to_s == @item
+  end
+
+  # drf (drg-999l): take the unfinished piece from its work surface and bind the
+  # server ID it is held by. Both hands are emptied first and the reply must
+  # name the unfinished piece on that surface. A carried tool is never
+  # unfinished, so it can be neither taken nor bound here. Live reply:
+  # "You get some unfinished bronze plain pliers from atop an iron anvil."
+  #
+  # @param context [String] why the piece is needed (for error messages)
+  # @return [void]
+  # @raise [SystemExit] unless exactly that piece is positively in the left hand
+  def take_exact_product(context)
+    stow_both_hands
+    if DRC.left_hand || DRC.right_hand
+      cleanup_and_exit("Hands were not empty before taking the #{@item} for #{context}; custody preserved.")
+    end
+    surface = @location.to_s.split.last.to_s
+    pickup = /\AYou get (?:some |an? )?unfinished (?:[\w'-]+ )*?#{Regexp.escape(@item)} from atop (?:an? |the )?(?:[\w'-]+ )*?#{Regexp.escape(surface)}\./i
+    result = DRC.bput("get #{@item} #{@location}", pickup, GET_SUCCESS_PATTERN, GET_FAILURE_PATTERN, ITEM_NOT_FOUND_PATTERN)
+    unless pickup.match?(result.to_s)
+      cleanup_and_exit("The unfinished #{@item} was not confirmed from the #{surface} for #{context}; custody preserved.")
+    end
+    held = []
+    30.times do
+      held = held_exact_products
+      break if held.length == 1
+
+      pause 0.1
+    end
+    cleanup_and_exit("The #{@item} taken for #{context} has no single server ID; custody preserved.") unless held.length == 1
+
+    @product_id = held.first.id.to_s
+    DRC.bput('swap', *SWAP_PATTERNS) unless product_held_in?(:left)
+    return if product_held_in?(:left)
+
+    cleanup_and_exit("The exact #{@item} is not in the left hand for #{context}; custody preserved.")
+  end
+
+  # drf (drg-999l): steps no supervised exact-product piece has needed. Each
+  # would name the piece or draw a tool by the shared noun. Stop before either.
+  #
+  # @param step [String] the step or cue that was reached
+  # @return [void]
+  # @raise [SystemExit] always
+  def refuse_exact_step(step)
+    cleanup_and_exit("#{step} is not reviewed for a #{@item} named like a forging tool; custody preserved.")
   end
 
   # Ready hammer and tongs for pounding work.
@@ -1136,7 +1264,11 @@ class Forge
   #   - :percent [Integer] completion percentage (0-100), 99 for "final stage"
   #   - :quality [String, nil] current quality assessment
   def analyze_progress
-    location = DRCI.in_hands?(@item) ? "my #{@item}" : "#{@item} #{@location}"
+    location = if @exact_product
+                 product_held_in?(:left) || product_held_in?(:right) ? "##{@product_id}" : "#{@item} #{@location}"
+               else
+                 DRCI.in_hands?(@item) ? "my #{@item}" : "#{@item} #{@location}"
+               end
     result = DRC.bput("analyze #{location}",
                       ANALYZE_PROGRESS_PATTERN,
                       ANALYZE_QUALITY_PATTERN,
@@ -1235,6 +1367,7 @@ class Forge
   # @return [void]
   # @raise [SystemExit] if required part cannot be found
   def assemble_part
+    refuse_exact_step('Assembly') if @exact_product && Flags['forge-assembly']
     while Flags['forge-assembly']
       tool = DRC.right_hand
       DRCC.stow_crafting_item(tool, @bag, @forging_belt)
@@ -1406,7 +1539,17 @@ class Forge
              INGREDIENTS_PATTERN,
              OIL_EMPTY_PATTERN,
              FINAL_TOUCHES_PATTERN,
-             ROUNDTIME_PATTERN)
+             ROUNDTIME_PATTERN,
+             *(@exact_product ? EXACT_PRODUCT_REFUSAL_PATTERNS : []))
+  end
+
+  # drf (drg-999l): work results an exact product stops on rather than handle.
+  #
+  # @return [Array<String>]
+  def exact_product_unreviewed_results
+    [TEMPER_START_PATTERN, TEMPER_CONTINUE_PATTERN, TEMPER_ALREADY_DONE_PATTERN, WIRE_BRUSH_PATTERN,
+     GRINDSTONE_SLOW_PATTERN, *GRINDSTONE_PATTERNS, *PLIERS_PATTERNS, HANDLE_ASSEMBLY_PATTERN,
+     INGREDIENTS_PATTERN, OIL_EMPTY_PATTERN]
   end
 
   # Dispatch work result to appropriate handler.
@@ -1414,6 +1557,13 @@ class Forge
   # @param result [String] the matched pattern from execute_work_command
   # @return [void]
   def handle_work_result(result)
+    if @exact_product
+      refuse_exact_step("The result \"#{result}\"") if exact_product_unreviewed_results.any? { |pattern| pattern === result }
+      # bput returns only the matched text, e.g. "What were you referring to".
+      if EXACT_PRODUCT_REFUSAL_PATTERNS.any? { |pattern| result.to_s.match?(/#{pattern}/i) }
+        cleanup_and_exit("The exact #{@item} command was refused (#{result}); custody preserved.")
+      end
+    end
     case result
     when *TONGS_ERROR_PATTERNS
       DRCC.get_adjust_tongs?('tongs', @bag, @bag_items, @forging_belt, @adjustable_tongs)
@@ -1547,7 +1697,13 @@ class Forge
   #
   # @return [void]
   def handle_pounding
-    DRC.bput("put my #{@item} on anvil", PUT_SUCCESS_PATTERN) if DRCI.in_hands?(@item)
+    if @exact_product
+      # Never `put my <noun>`: a held piece of this noun goes back by ID only
+      # in a reviewed step, and none returns it to the anvil.
+      refuse_exact_step('Returning a held piece to the anvil') unless held_exact_products.empty?
+    elsif DRCI.in_hands?(@item)
+      DRC.bput("put my #{@item} on anvil", PUT_SUCCESS_PATTERN)
+    end
     ready_hammer_with_tongs
     @command = "pound #{@item} on anvil with my #{@hammer}"
   end
@@ -1586,6 +1742,8 @@ class Forge
   # @return [void]
   def handle_oiling
     report_progress_milestone('Oiling')
+    return handle_exact_oiling if @exact_product
+
     if @home_tool == 'tongs' || !DRCI.in_left_hand?(@item)
       # Stow BOTH hands before retrieving the item: if a forging tool shares the
       # item's noun (e.g. a "wide shovel" tool vs. a crafted "wide shovel"),
@@ -1600,6 +1758,18 @@ class Forge
     ensure_item_in_left_hand
     swap_tool('oil', true)
     @command = "pour my oil on my #{@item}"
+  end
+
+  # drf (drg-999l): oil an exact product by the server ID bound when it left the
+  # anvil. `pour my oil on #<id>` answered exactly like the noun form live
+  # (Khazdar, 2026-10-12).
+  #
+  # @return [void]
+  def handle_exact_oiling
+    take_exact_product('oiling') unless product_held_in?(:left)
+    swap_tool('oil', true)
+    cleanup_and_exit("Taking the oil moved the exact #{@item}; custody preserved.") unless product_held_in?(:left)
+    @command = "pour my oil on ##{@product_id}"
   end
 
   # Handle oil container empty.
@@ -1636,6 +1806,9 @@ class Forge
     waitrt?
     debug_log("Work done?                                   :: #{Flags['work-done']}")
     complete_crafting if Flags['work-done']
+    # drf (drg-999l): only the pour holds an exact piece, and every supervised
+    # pour finished it. Never go back to the hammer with the piece in hand.
+    refuse_exact_step('A roundtime without the final touches') if @exact_product && !held_exact_products.empty?
     swap_tool(@home_tool)
     DRCC.get_adjust_tongs?('tongs', @bag, @bag_items, @forging_belt, @adjustable_tongs) if @home_tool == @hammer
     @command = @home_command
@@ -1653,10 +1826,21 @@ class Forge
   # @return [void]
   # @raise [SystemExit] exits after completion
   def complete_crafting
-    DRCC.stow_crafting_item(DRC.right_hand, @bag, @forging_belt)
+    if @exact_product
+      # The oil. The finished piece stays in the left hand under a new server ID
+      # (unfinished 4980610 became 4982562 at the final touches, 2026-10-12).
+      stow_exact_hand(:right)
+    else
+      DRCC.stow_crafting_item(DRC.right_hand, @bag, @forging_belt)
+    end
     stamp_item if @stamp
     finalize_item
     magic_cleanup
+    # drf (drg-999l): an exact piece's hand label never says unfinished, so
+    # only the new server ID it gets at the final touches proves completion.
+    if @exact_product && (product_held_in?(:left) || product_held_in?(:right))
+      cleanup_and_exit("The #{@item} still has its unfinished ID ##{@product_id}; no completion receipt.")
+    end
     if @stock_binding
       # Native hand labels can omit metal (observed finished long drawknife).
       # The material comes from the exact verified input stock, while the
