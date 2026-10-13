@@ -5120,7 +5120,12 @@ class AttackProcess
     # rather than relying on the first message returned from bput.
     Flags.reset('ct-ranged-ammo')
 
-    result = DRC.bput(command, /you (fire|poach|snipe)/i, /isn't loaded/i, /There is nothing/i, /already dead|is dead|It's dead/i, /But your/i, /I could not find/i, /with no effect and falls (to the ground|to your feet)/i, /Face what/i, /How can you (poach|snipe)/i, /you don't feel like fighting right now/i, /That weapon must be in your right hand to fire/i, /But you don't have a ranged weapon in your hand to fire with/i)
+    patterns = [/you (fire|poach|snipe)/i, /isn't loaded/i, /There is nothing/i, /already dead|is dead|It's dead/i, /But your/i, /I could not find/i, /with no effect and falls (to the ground|to your feet)/i, /Face what/i, /How can you (poach|snipe)/i, /you don't feel like fighting right now/i, /That weapon must be in your right hand to fire/i, /But you don't have a ranged weapon in your hand to fire with/i]
+    result = if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+               game_state.combat_stealth_ranged_write(command, patterns)
+             else
+               DRC.bput(command, *patterns)
+             end
     waitrt?
 
     if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
@@ -5147,12 +5152,20 @@ class AttackProcess
       end
       return shoot_aimed('shoot', game_state)
     when /That weapon must be in your right hand to fire|But you don't have a ranged weapon in your hand to fire with/i
+      if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+        game_state.stop_for_combat_stealth('hidden ranged weapon custody refused; no automatic replay')
+        return :stealth_stopped
+      end
       # Explicitly say 'swap right' because if you're holding a swappable weapon (e.g. riste)
       # then just 'swap' will try to switch the weapon mode, not move it to other hand.
       if fput('swap right') =~ /You (swap|move)/i
         return shoot_aimed(command, game_state)
       end
     when /you don't feel like fighting right now/i
+      if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+        game_state.stop_for_combat_stealth('hidden ranged attack refused; no automatic replay')
+        return :stealth_stopped
+      end
       pause 1
       return shoot_aimed(command, game_state)
     when /with no effect and falls (to the ground|to your feet)/i
@@ -5176,7 +5189,15 @@ class AttackProcess
   end
 
   def drbot_cancel_identity_aim(game_state)
-    DRC.bput('aim stop', "But you're not aiming", 'You stop concentrating', 'You are already') if @drbot_aim_target
+    if @drbot_aim_target
+      if game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?
+        return unless game_state.require_combat_hiding('before cancelling aim')
+        result = game_state.combat_stealth_ranged_write('aim stop', [/But you're not aiming/, /You stop concentrating/, /You are already/])
+        return if result.to_s.empty?
+      else
+        DRC.bput('aim stop', "But you're not aiming", 'You stop concentrating', 'You are already')
+      end
+    end
     @drbot_aim_target = nil
     Flags.reset('ct-ranged-ready')
     @firing_check = 0
@@ -5330,13 +5351,21 @@ class AttackProcess
       ]
 
       dual_load = game_state.dual_load?
+      dual_load_attempted = dual_load
 
       if dual_load
         # Occasionally, there may be no game output after loading.
         # To be on the safe side, we do two attempts to get output.
         Flags.reset('ct-ranged-loaded')
-        load_weapon_result = DRC.bput('load arrows', { 'timeout' => 1, 'suppress_no_match' => true }, *load_weapon_success, *load_weapon_failure)
-        load_weapon_result = DRC.bput('load arrows', *load_weapon_success, *load_weapon_failure) unless Flags['ct-ranged-loaded']
+        load_weapon_result = if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+                               game_state.combat_stealth_ranged_write('load arrows', load_weapon_success + load_weapon_failure)
+                             else
+                               DRC.bput('load arrows', { 'timeout' => 1, 'suppress_no_match' => true }, *load_weapon_success, *load_weapon_failure)
+                             end
+        if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?) && load_weapon_result.to_s.empty?
+          return
+        end
+        load_weapon_result = DRC.bput('load arrows', *load_weapon_success, *load_weapon_failure) unless Flags['ct-ranged-loaded'] || (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
         case load_weapon_result
         when *load_weapon_failure
           dual_load = false # fallback to single load
@@ -5353,7 +5382,12 @@ class AttackProcess
         Flags.reset('ct-ranged-loaded')
         Flags.reset('ct-using-repeating-crossbow')
 
-        load_weapon_result = DRC.bput("load my #{game_state.weapon_name}", { 'timeout' => 1, 'suppress_no_match' => true }, *load_weapon_success, *load_weapon_failure)
+        load_weapon_result = if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+                               return unless !dual_load_attempted || game_state.require_combat_hiding('before fallback loading')
+                               game_state.combat_stealth_ranged_write("load my #{game_state.weapon_name}", load_weapon_success + load_weapon_failure)
+                             else
+                               DRC.bput("load my #{game_state.weapon_name}", { 'timeout' => 1, 'suppress_no_match' => true }, *load_weapon_success, *load_weapon_failure)
+                             end
         load_weapon_result = DRC.bput("load my #{game_state.weapon_name}", *load_weapon_success, *load_weapon_failure) unless Flags['ct-ranged-loaded'] || (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
         if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?) && load_weapon_result.to_s.empty?
           game_state.stop_for_combat_stealth('unconfirmed load; reconcile before resuming')
@@ -5368,7 +5402,14 @@ class AttackProcess
         when *load_weapon_success
           # Check if loading a repeating crossbow because we need to then push ammo into the chamber
           if Flags['ct-using-repeating-crossbow']
-            case DRC.bput("push my #{game_state.weapon_name}", *load_weapon_success, *load_weapon_failure)
+            push_result = if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+                            return unless game_state.require_combat_hiding('before chambering')
+                            game_state.combat_stealth_ranged_write("push my #{game_state.weapon_name}", load_weapon_success + load_weapon_failure)
+                          else
+                            DRC.bput("push my #{game_state.weapon_name}", *load_weapon_success, *load_weapon_failure)
+                          end
+            return if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?) && push_result.to_s.empty?
+            case push_result
             when *load_weapon_failure
               abort_attack_aimed(game_state)
               return
@@ -5493,7 +5534,11 @@ class AttackProcess
       /You don't seem to be able to move to do that/
     ]
 
-    result = DRC.bput(command, *aim_success_messages, *unloaded_messages, *no_enemy_messages, *wait_and_retry_messages)
+    result = if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+               game_state.combat_stealth_ranged_write(command, aim_success_messages + unloaded_messages + no_enemy_messages + wait_and_retry_messages)
+             else
+               DRC.bput(command, *aim_success_messages, *unloaded_messages, *no_enemy_messages, *wait_and_retry_messages)
+             end
     case result
     when *aim_success_messages
       if game_state.drbot_identity_targets? && !game_state.drbot_living_target_current?(@drbot_aim_target)
@@ -5512,6 +5557,10 @@ class AttackProcess
       end
       game_state.clear_aim_queue
     when *wait_and_retry_messages
+      if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+        game_state.stop_for_combat_stealth('hidden AIM refused; no automatic replay')
+        return
+      end
       pause 1
       aim(game_state)
     else
@@ -8525,7 +8574,13 @@ class GameState
         return :unconfirmed unless token.first['write_count'].is_a?(Integer)
         expected_write = token.first['write_count'] + 1
       end
-      put 'hide'
+      previous = Thread.current.thread_variable_get(:drbot_combat_stealth_write)
+      begin
+        Thread.current.thread_variable_set(:drbot_combat_stealth_write, token.is_a?(Array) ? token + ['hide'] : [:standalone, 'hide'])
+        put 'hide'
+      ensure
+        Thread.current.thread_variable_set(:drbot_combat_stealth_write, previous)
+      end
       return :unconfirmed if expected_write && token.first['write_count'] != expected_write
     end
     if token.is_a?(Array)
@@ -8552,6 +8607,70 @@ class GameState
     pause 1 if result.match?(/haven't had enough time|too busy|Wait \d+/i)
     return :interrupted unless combat_stealth_safe? && combat_stealth_producer_current?(token, idle: true)
     hiding? ? :hidden : :failed
+  end
+
+  # Strict ranged commands must never inherit bput's automatic UNHIDE, wake,
+  # standing or command replay. One captured producer, one write, one bounded
+  # result; the watchdog checks this same context at its final socket boundary.
+  def combat_stealth_ranged_write(command, patterns)
+    stop = proc do |reason|
+      stop_for_combat_stealth(reason)
+      nil
+    end
+    return stop.call('invalid hidden ranged command') unless combat_stealth_always? &&
+      command.is_a?(String) && command.match?(/\A(?:load|push|aim|poach|snipe)(?:\s|\z)/) &&
+      patterns.is_a?(Array) && !patterns.empty? && patterns.all? { |item| item.is_a?(Regexp) }
+    waitrt?
+    token = combat_stealth_producer
+    return stop.call('hidden ranged producer unavailable') unless token && combat_stealth_safe?
+    expected_write = nil
+    dispatch = proc do
+      return stop.call('hidden ranged dispatch interrupted') unless combat_stealth_safe? &&
+        combat_stealth_producer_current?(token, idle: true) && hiding?
+      clear
+      if token.is_a?(Array)
+        return stop.call('hidden ranged write counter unavailable') unless token.first['write_count'].is_a?(Integer)
+        expected_write = token.first['write_count'] + 1
+      end
+      previous = Thread.current.thread_variable_get(:drbot_combat_stealth_write)
+      begin
+        # Capturing the actual control object prevents a later producer from
+        # inheriting this attempt while the watchdog waits on native roundtime.
+        Thread.current.thread_variable_set(:drbot_combat_stealth_write, token.is_a?(Array) ? token + [command] : [:standalone, command])
+        put command
+      ensure
+        Thread.current.thread_variable_set(:drbot_combat_stealth_write, previous)
+      end
+      return stop.call('unconfirmed hidden ranged write; reconcile before resuming') if expected_write && token.first['write_count'] != expected_write
+      true
+    end
+    dispatched = token.is_a?(Array) ? token.first['lock'].synchronize { dispatch.call } : dispatch.call
+    return nil unless dispatched
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15.0
+    result = nil
+    refusal = false
+    loop do
+      return stop.call('hidden ranged producer changed during result') unless combat_stealth_safe? && combat_stealth_producer_current?(token)
+      return stop.call('hidden ranged write changed during result') if expected_write && token.first['write_count'] != expected_write
+      line = get?
+      if line
+        # These confirmations used to make bput send another command. They
+        # instead stop this hunt; never wake, unhide or replay an attempted shot.
+        if line.match?(/would give away your hiding place|^\.?Wait \d+|Sorry, you may only type ahead|^You are still stunned|^You can't do that|^You must be standing|^You should stand|^You'll need to stand|world somehow seems frozen|too busy performing|stop playing before/i)
+          result = line
+          refusal = true
+        elsif patterns.any? { |pattern| pattern.match?(line) }
+          result ||= line
+        end
+      end
+      break if result && combat_stealth_producer_current?(token, idle: true)
+      return stop.call('unconfirmed hidden ranged result; reconcile before resuming') if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      pause 0.1
+    end
+    waitrt?
+    return stop.call('hidden ranged result interrupted') unless combat_stealth_safe? && combat_stealth_producer_current?(token, idle: true)
+    return stop.call('hidden ranged command refused; no automatic replay or UNHIDE') if refusal
+    result
   end
 
   def require_combat_hiding(boundary)
