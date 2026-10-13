@@ -5121,12 +5121,18 @@ class AttackProcess
     Flags.reset('ct-ranged-ammo')
 
     patterns = [/you (fire|poach|snipe)/i, /isn't loaded/i, /There is nothing/i, /already dead|is dead|It's dead/i, /But your/i, /I could not find/i, /with no effect and falls (to the ground|to your feet)/i, /Face what/i, /How can you (poach|snipe)/i, /you don't feel like fighting right now/i, /That weapon must be in your right hand to fire/i, /But you don't have a ranged weapon in your hand to fire with/i]
+    if game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?
+      # Native own-attack output is direct You or the '<' combat narration.
+      # A question or ambient quotation containing 'you poach' is no shot.
+      patterns[0] = /\A(?:<\s*(?:.*?,\s*)?)?you (?:fire|poach|snipe)\b/i
+    end
     result = if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
                game_state.combat_stealth_ranged_write(command, patterns)
              else
                DRC.bput(command, *patterns)
              end
     waitrt?
+    return :stealth_stopped if result == :deadline_stopped
 
     if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
       if result.to_s.empty?
@@ -5332,6 +5338,20 @@ class AttackProcess
         /You realize readying/,
         /As you draw back the string/
       ]
+      if game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?
+        # A status line or an unrelated inventory sentence is not a load.
+        # Native load/chamber receipts include last ammunition from feet,
+        # quiver or another container.
+        load_weapon_success = [
+          /\AYou reach (?:into .+|down to your feet) to load .+ with .+\.\z/,
+          /\AYou (?:carefully )?load\b.+/,
+          /\A(?:Your|The) .+already loaded[.!]?\z/i,
+          /\AA rapid series of clicks\b.+/,
+          /\AYou push\b.+into firing position[.!]?\z/,
+          /\AYou realize readying\b.+/,
+          /\AAs you draw back the string\b.+/
+        ]
+      end
 
       load_weapon_failure = [
         /As you try to reach/,
@@ -5363,6 +5383,7 @@ class AttackProcess
                              else
                                DRC.bput('load arrows', { 'timeout' => 1, 'suppress_no_match' => true }, *load_weapon_success, *load_weapon_failure)
                              end
+        return if load_weapon_result == :deadline_stopped
         if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?) && load_weapon_result.to_s.empty?
           return
         end
@@ -5390,6 +5411,7 @@ class AttackProcess
                                DRC.bput("load my #{game_state.weapon_name}", { 'timeout' => 1, 'suppress_no_match' => true }, *load_weapon_success, *load_weapon_failure)
                              end
         load_weapon_result = DRC.bput("load my #{game_state.weapon_name}", *load_weapon_success, *load_weapon_failure) unless Flags['ct-ranged-loaded'] || (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+        return if load_weapon_result == :deadline_stopped
         if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?) && load_weapon_result.to_s.empty?
           game_state.stop_for_combat_stealth('unconfirmed load; reconcile before resuming')
           return
@@ -5409,6 +5431,7 @@ class AttackProcess
                           else
                             DRC.bput("push my #{game_state.weapon_name}", *load_weapon_success, *load_weapon_failure)
                           end
+            return if push_result == :deadline_stopped
             return if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?) && push_result.to_s.empty?
             case push_result
             when *load_weapon_failure
@@ -5464,6 +5487,13 @@ class AttackProcess
   end
 
   def abort_attack_aimed(game_state)
+    if game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?
+      game_state.loaded = false
+      @firing_check = 0
+      game_state.clear_aim_queue
+      game_state.stop_for_combat_stealth('hidden LOAD or chambering refused; no automatic replay')
+      return
+    end
     DRC.message("Unable to load #{game_state.weapon_name}, you may be out of ammunition, dancing until can switch to next weapon")
     game_state.loaded = false
     @firing_check = 0
@@ -5518,6 +5548,14 @@ class AttackProcess
       /In one electrifying moment/, # Syamelyo Kuniyo spell effect
       /In one frozen moment/ # Syamelyo Kuniyo spell effect
     ]
+    if game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?
+      aim_success_messages = [
+        /\AYou are already target(?:t)?ing\b.+/,
+        /\AYou begin to target\b.+/,
+        /\AYou shift your target\b.+/,
+        /\AIn one (?:electrifying|frozen) moment\b.+/
+      ]
+    end
 
     unloaded_messages = [
       /isn't loaded/,
@@ -5529,6 +5567,8 @@ class AttackProcess
       /I could not find|already dead|is dead|It's dead/i,
       /Face what/
     ]
+    no_enemy_messages << /\AYou are unable to aim at .+ because you cannot face it\.\z/ if
+      game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?
 
     wait_and_retry_messages = [
       /Strangely, you don't feel like fighting right now/,
@@ -5540,6 +5580,7 @@ class AttackProcess
              else
                DRC.bput(command, *aim_success_messages, *unloaded_messages, *no_enemy_messages, *wait_and_retry_messages)
              end
+    return if result == :deadline_stopped
     case result
     when *aim_success_messages
       if game_state.drbot_identity_targets? && !game_state.drbot_living_target_current?(@drbot_aim_target)
@@ -8518,6 +8559,9 @@ class GameState
     raise ArgumentError, 'Invalid combat stealth policy settings' unless valid
 
     @combat_stealth_health_floor = settings.health_threshold
+    selected = defined?($DRBOT_DIRECT_CONTROL) && $DRBOT_DIRECT_CONTROL
+    @combat_stealth_requires_latch = @combat_stealth_mode == 'always' && XMLData.name.to_s == 'Lanjefast' &&
+      selected.is_a?(Hash) && selected['script'] == 'lifecycle'
     @combat_stealth_reconciliation_binding = combat_stealth_reconciliation_binding
     if XMLData.name.to_s == 'Lanjefast'
       control = defined?($DRBOT_DIRECT_CONTROL) && $DRBOT_DIRECT_CONTROL
@@ -8604,35 +8648,56 @@ class GameState
     return unless binding
 
     control, _, _, _, coordinator = binding
-    prior = record = nil
+    prior = record = memory_vars = nil
+    cache_unconfirmed = false
     owned = control['lock'].synchronize do
       return unless combat_stealth_reconciliation_current?(binding)
 
       text = "strict hidden combat stopped: #{reason}; operator reconciliation required"
       parent_hold = coordinator.instance_variable_get(:@task_hold)
       coordinator.instance_variable_set(:@task_hold, parent_hold || text)
-      prior = UserVars.drbot_custody_hold
-      record = prior.is_a?(Hash) ? prior : { 'reason' => text[0, 300], 'since' => Time.now.to_f, 'source' => 'strict_combat_stealth' }
-      record['prior_hold'] = prior unless prior.nil? || prior.is_a?(Hash)
-      # Latch the actual parent before persistence: a failed SQL save or child
-      # exit cannot become Completed, reset timers, or admit another hunt.
-      coordinator.instance_variable_set(:@task_hold, parent_hold || record['reason'] || text)
-      UserVars.drbot_custody_hold = record
-      # Stop the captured native objects before persistence can wait. A later
-      # same-named/global replacement is never this stop's target.
+      # Retain the already fsynced intent and stop the captured actors BEFORE
+      # any Vars accessor could lazily read SQLite. A lost/unloaded cache is
+      # unknown, never an initializer or permission to wait under this Monitor.
+      retained = begin
+        defined?(DrbotStrictCombatReconciliation) &&
+          DrbotStrictCombatReconciliation.retain(binding, reason.to_s[0, 300]) == true
+      rescue StandardError
+        false
+      end
       trainer = @combat_stealth_native_trainer || $COMBAT_TRAINER
       if trainer && trainer.instance_variable_get(:@game_state).equal?(self)
         @combat_stealth_native_trainer = trainer
         binding.fetch(7).stop_hunting
         trainer.stop
       end
+      unless defined?(Lich::Common::Vars::LoadState::LOADED) &&
+          Vars.class_variables.include?(:@@load_state) &&
+          Vars.class_variable_get(:@@load_state) == Lich::Common::Vars::LoadState::LOADED
+        cache_unconfirmed = true
+        next true
+      end
+      prior = UserVars.drbot_custody_hold
+      record = prior.is_a?(Hash) ? prior : { 'reason' => text[0, 300], 'since' => Time.now.to_f, 'source' => 'strict_combat_stealth' }
+      record['prior_hold'] = prior unless prior.nil? || prior.is_a?(Hash)
+      coordinator.instance_variable_set(:@task_hold, parent_hold || record['reason'] || text)
+      record['reconciliation_intent_unconfirmed'] = true unless retained
+      UserVars.drbot_custody_hold = record
+      # A valid first-use scope need not have a SQLite row. Capture current
+      # native Vars before db_mutex; never Vars.save under its production Mutex.
+      memory_vars = UserVars.list
       true
     end
     return unless owned
+    if cache_unconfirmed
+      DRC.message('*** combat-trainer: Strict combat hold persistence unconfirmed (phase=variables_cache); operator reconciliation required')
+      return
+    end
 
     # Never retry Vars.save's cached blob against a later live character scope.
     # Hold the database mutex while temporarily making SQLite fail immediately;
     # restore its exact busy timeout before any shared database observer resumes.
+    phase = 'database_mutex'
     begin
       require 'timeout'
       Thread.handle_interrupt(Timeout::Error => :never) do
@@ -8646,19 +8711,23 @@ class GameState
                 begin
                   Thread.handle_interrupt(Timeout::Error => :immediate) do
                     database = Lich.db
+                    phase = 'busy_timeout'
                     prior_timeout = database.get_first_value('PRAGMA busy_timeout')
                     raise 'database busy timeout unconfirmed' unless prior_timeout.is_a?(Integer) && prior_timeout >= 0
                     database.busy_timeout = 0
                     scope = binding.fetch(8)
+                    phase = 'stored_variables'
                     blob = database.get_first_value('SELECT hash FROM uservars WHERE scope=?;', [scope])
-                    stored = blob && Marshal.load(blob)
+                    stored = blob.nil? ? memory_vars.dup : Marshal.load(blob)
                     raise 'stored character variables unconfirmed' unless stored.is_a?(Hash)
                     control['lock'].synchronize do
                       return unless combat_stealth_reconciliation_current?(binding) && UserVars.drbot_custody_hold.equal?(record)
                       stored['drbot_custody_hold'] = record
+                      phase = 'write'
                       database.execute('INSERT OR REPLACE INTO uservars(scope,hash) VALUES(?,?);',
                                        [scope, SQLite3::Blob.new(Marshal.dump(stored))])
                     end
+                    phase = 'readback'
                     blob = database.get_first_value('SELECT hash FROM uservars WHERE scope=?;', [scope])
                     persisted = blob && Marshal.load(blob)['drbot_custody_hold']
                     raise 'strict combat hold was not durably saved' unless persisted == record
@@ -8677,10 +8746,17 @@ class GameState
       control['lock'].synchronize do
         if combat_stealth_reconciliation_current?(binding) && !prior.is_a?(Hash) && UserVars.drbot_custody_hold.equal?(record)
           record['persistence_unconfirmed'] = true
+          record['persistence_failure_phase'] = phase
           UserVars.drbot_custody_hold = record
         end
       end
-      DRC.message("*** combat-trainer: Strict combat hold persistence unconfirmed (#{error.class}); operator reconciliation required")
+      begin
+        DrbotStrictCombatReconciliation.retain(binding, reason.to_s[0, 300], { 'persistence_failure_phase' => phase }) if
+          defined?(DrbotStrictCombatReconciliation)
+      rescue StandardError
+        # The original pre-armed file is never cleared on SQL or diagnostic failure.
+      end
+      DRC.message("*** combat-trainer: Strict combat hold persistence unconfirmed (#{error.class}, phase=#{phase}); operator reconciliation required")
     end
   rescue StandardError => error
     DRC.message("*** combat-trainer: Strict combat reconciliation hold failed (#{error.class}); operator reconciliation required")
@@ -8711,9 +8787,17 @@ class GameState
 
     control['lock'].synchronize do
       binding = @combat_stealth_reconciliation_binding
+      return nil if @combat_stealth_requires_latch && !binding
       trainer = defined?($COMBAT_TRAINER) && $COMBAT_TRAINER
       if binding && combat_stealth_reconciliation_current?(binding) && trainer && trainer.instance_variable_get(:@game_state).equal?(self)
         @combat_stealth_native_trainer ||= trainer
+      end
+      if binding
+        # The independent on-disk intent is armed before any combat command.
+        # SQL UserVars and an in-memory parent hold cannot cover a failed SQL
+        # write followed by process restart. A missing helper never admits L.
+        return nil unless defined?(DrbotStrictCombatReconciliation) &&
+          DrbotStrictCombatReconciliation.arm(binding) == true
       end
       token = [control, control['session'], control['producer']]
       combat_stealth_producer_current?(token, idle: true) ? token : nil
@@ -8723,67 +8807,184 @@ class GameState
   def combat_stealth_producer_current?(token, idle: false)
     return true if token == :standalone && !(defined?($DRBOT_DIRECT_CONTROL) && $DRBOT_DIRECT_CONTROL.is_a?(Hash))
     return false unless token.is_a?(Array)
+    return false if @combat_stealth_requires_latch && !@combat_stealth_reconciliation_binding
 
     control = token.first
     control['lock'].synchronize do
-      control.equal?($DRBOT_DIRECT_CONTROL) && control['mode'] == 'B' && control['closed'] == false &&
+      control.equal?($DRBOT_DIRECT_CONTROL) && control['mode'] == 'B' && control['closed'] == false && !control['fenced'] &&
         control['confirm_by'].nil? && control['session'] == token[1] && control['producer'] == token[2] &&
         control['character'].to_s.casecmp?(XMLData.name.to_s) &&
+        (!@combat_stealth_reconciliation_binding ||
+          (defined?(DrbotStrictCombatReconciliation) &&
+           DrbotStrictCombatReconciliation.current?(@combat_stealth_reconciliation_binding) == true)) &&
         (!idle || control['pending_result'] == false)
     end
   end
 
-  # One actual HIDE and one confirmed result, including an already-hidden
-  # reply. DRC.hide? skips that write; DRC.bput can retry cooldowns internally.
-  # Neither is appropriate for this bounded policy. Unknown writes are never
-  # replayed: leave pending-result reconciliation to the existing watchdog.
-  def combat_stealth_hide_once(token)
-    expected_write = nil
-    dispatch = proc do
-      return :interrupted unless combat_stealth_safe? && combat_stealth_producer_current?(token, idle: true)
-      clear
-      if token.is_a?(Array)
-        return :unconfirmed unless token.first['write_count'].is_a?(Integer)
-        expected_write = token.first['write_count'] + 1
-      end
-      previous = Thread.current.thread_variable_get(:drbot_combat_stealth_write)
-      begin
-        Thread.current.thread_variable_set(:drbot_combat_stealth_write, token.is_a?(Array) ? token + ['hide'] : [:standalone, 'hide'])
-        put 'hide'
-      ensure
-        Thread.current.thread_variable_set(:drbot_combat_stealth_write, previous)
-      end
-      return :unconfirmed if expected_write && token.first['write_count'] != expected_write
-    end
-    if token.is_a?(Array)
-      token.first['lock'].synchronize { dispatch.call }
-    else
-      dispatch.call
-    end
-    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15.0
-    result = nil
-    loop do
-      return :interrupted unless combat_stealth_safe? && combat_stealth_producer_current?(token)
-      return :unconfirmed if expected_write && token.first['write_count'] != expected_write
-      line = get?
-      if line.to_s.match?(/Roundtime|already (?:hidden|hiding)|can't see any place to hide|search but find no place|haven't had enough time|too busy performing|^\.?Wait \d+|^You are still stunned|^You can't do that/i)
-        result = line
-      end
-      break if result && combat_stealth_producer_current?(token, idle: true)
-      return :unconfirmed if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
-      pause 0.1
-    end
-    waitrt?
-    return :interrupted unless combat_stealth_safe? && combat_stealth_producer_current?(token, idle: true)
-    # Cooldown refusals are confirmed, but carry no native roundtime.
-    pause 1 if result.match?(/haven't had enough time|too busy|Wait \d+/i)
-    return :interrupted unless combat_stealth_safe? && combat_stealth_producer_current?(token, idle: true)
-    hiding? ? :hidden : :failed
+  # The server's no-action roundtime refusal is distinct from an action's
+  # Roundtime receipt. Match the whole native line, never quoted/ambient text.
+  def combat_stealth_wait_seconds(line)
+    match = line.to_s.match(/\A\.*\s*wait\s+(\d+)\s+(?:seconds?|secs?)\.?\s*\z/i)
+    match && match[1].to_i
   end
 
-  # Strict ranged commands must never inherit bput's automatic UNHIDE, wake,
-  # standing or command replay. One captured producer, one write, one bounded
-  # result; the watchdog checks this same context at its final socket boundary.
+  def combat_stealth_roundtime_reply?(line)
+    line.to_s.match?(/\A\[?Roundtime\s*:?\s*\d+\s+(?:sec|secs|second|seconds)\.?\]?\s*\z/i)
+  end
+
+  def combat_stealth_generic_refusal?(line)
+    line.to_s.match?(/would give away your hiding place|\ASorry, you may only type ahead|\AYou are still stunned|\AYou can't do that|\AYou must be standing|\AYou should stand|\AYou'll need to stand|\AYou should be sitting up|\AYou really should be standing|\AAfter failing to draw a breath|world somehow seems frozen|too busy performing|stop playing before|\AYou don't seem to be able to move to do that/i)
+  end
+
+  def combat_stealth_ambient_reply?(line)
+    line.to_s.match?(/\AYou (?:hear|notice|see)\b|\A.+? (?:whispers|says|asks|tells you|chats),?\s/i)
+  end
+
+  # Consume the complete command burst through the real pending-result/RT
+  # boundary. A WAIT alone proves no action; WAIT mixed with any terminal
+  # action/cost is uncertain and can never authorize replay. Generic RT alone
+  # cannot confirm a load or shot. HIDE additionally verifies IconHIDDEN.
+  def combat_stealth_read_result(token, expected_write, patterns, hide: false)
+    limit = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15.0
+    result = refusal = wait_seconds = nil
+    roundtime = false
+    loop do
+      return { status: :interrupted } unless combat_stealth_safe? && combat_stealth_producer_current?(token)
+      return { status: :unconfirmed } if expected_write && token.first['write_count'] != expected_write
+      line = get?
+      if line
+        seconds = combat_stealth_wait_seconds(line)
+        if seconds
+          wait_seconds = [wait_seconds || 0, seconds].max
+        elsif hide && line.match?(/\AYou haven't had enough time\b/i)
+          wait_seconds = [wait_seconds || 0, 1].max
+        elsif combat_stealth_roundtime_reply?(line)
+          roundtime = true
+        elsif combat_stealth_generic_refusal?(line)
+          refusal ||= line
+        elsif !combat_stealth_ambient_reply?(line) && patterns.any? { |pattern| pattern.match?(line) }
+          result ||= line
+        end
+      end
+      # The script queue is drained after the closing native prompt. This
+      # prevents an early WAIT from winning over a later action in that frame.
+      if line.nil? && combat_stealth_producer_current?(token, idle: true) &&
+          (result || refusal || !wait_seconds.nil? || (hide && roundtime))
+        break
+      end
+      return { status: :unconfirmed } if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= limit
+      pause 0.1
+    end
+    return { status: :interrupted } unless combat_stealth_safe? && combat_stealth_producer_current?(token, idle: true)
+    if !wait_seconds.nil?
+      return { status: :unconfirmed } if result || refusal || roundtime
+      return { status: :wait, seconds: wait_seconds }
+    end
+    return { status: :refused, result: refusal } if refusal
+    { status: :reply, result: result, roundtime: roundtime }
+  end
+
+  def combat_stealth_wait_confirmed(token, expected_write, seconds, retry_limit: nil)
+    # Large/malformed waits never become a detached sleeper. These verified
+    # no-action retries have an explicit bound and observe every safety tick.
+    return false unless seconds.is_a?(Integer) && seconds.between?(0, 60)
+    finish = Process.clock_gettime(Process::CLOCK_MONOTONIC) + seconds + 0.25
+    return false if retry_limit && finish > retry_limit
+    loop do
+      return false unless combat_stealth_safe? && combat_stealth_producer_current?(token, idle: true)
+      return false if expected_write && token.first['write_count'] != expected_write
+      # Only the prior complete no-action WAIT, unchanged captured writer and
+      # settled prompt permit normal cutoff before the next dispatch. Unknown
+      # written results never reach this path; other safety stops retain holds.
+      if @combat_stealth_reconciliation_binding && defined?(DrbotLifecycleDeadline)
+        policy = DrbotLifecycleDeadline.current
+        if policy && policy.bound? && policy.expired? && policy.request_stop
+          return :deadline if combat_stealth_producer_current?(token, idle: true) &&
+            (!expected_write || token.first['write_count'] == expected_write)
+          return false
+        end
+      end
+      break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= finish
+      pause 0.1
+    end
+    true
+  end
+
+  # Chain the existing harvest predicate and recheck this original attempt
+  # at the watchdog's post-wait socket boundary. Only an actual cutoff with
+  # unchanged pre-write count may report a known not-attempted cancellation.
+  def combat_stealth_guarded_put(command, token, before_write)
+    outcome = {}
+    previous = Thread.current.thread_variable_get(:drbot_combat_stealth_write)
+    prior_guard = Thread.current.thread_variable_get(:drbot_final_write_guard)
+    final_guard = proc do |actual|
+      next true if prior_guard.respond_to?(:call) && prior_guard.call(actual)
+      next true unless actual == command && combat_stealth_safe? &&
+        combat_stealth_producer_current?(token, idle: true) &&
+        (!before_write || token.first['write_count'] == before_write)
+      if @combat_stealth_reconciliation_binding && defined?(DrbotLifecycleDeadline)
+        policy = DrbotLifecycleDeadline.current
+        if policy && policy.bound? && policy.expired? && policy.request_stop
+          outcome[:deadline] = true if combat_stealth_producer_current?(token, idle: true) &&
+            (!before_write || token.first['write_count'] == before_write)
+          next true
+        end
+      end
+      false
+    end
+    begin
+      Thread.current.thread_variable_set(:drbot_combat_stealth_write,
+        token.is_a?(Array) ? token + [command] : [:standalone, command])
+      Thread.current.thread_variable_set(:drbot_final_write_guard, final_guard)
+      put command
+    ensure
+      Thread.current.thread_variable_set(:drbot_combat_stealth_write, previous)
+      Thread.current.thread_variable_set(:drbot_final_write_guard, prior_guard)
+    end
+    outcome
+  end
+
+  # One guarded HIDE and one complete native result. Only a confirmed
+  # no-action cooldown permits another HIDE in the outer attempt cap.
+  def combat_stealth_hide_once(token, retry_limit: nil)
+    expected_write = nil
+    dispatch = proc do
+      next :interrupted unless combat_stealth_safe? && combat_stealth_producer_current?(token, idle: true)
+      clear
+      if token.is_a?(Array)
+        next :unconfirmed unless token.first['write_count'].is_a?(Integer)
+        expected_write = token.first['write_count'] + 1
+      end
+      outcome = combat_stealth_guarded_put('hide', token, expected_write && expected_write - 1)
+      next :deadline if outcome[:deadline] && expected_write && token.first['write_count'] == expected_write - 1 &&
+        combat_stealth_producer_current?(token, idle: true)
+      next :unconfirmed if expected_write && token.first['write_count'] != expected_write
+      :written
+    end
+    dispatched = token.is_a?(Array) ? token.first['lock'].synchronize { dispatch.call } : dispatch.call
+    return dispatched unless dispatched == :written
+    patterns = [/\A(?:Eh\?\s+But you're|You are|You're) already (?:hidden|hiding)[.!]?\z/i,
+                /\AYou melt into the background\b.+/,
+                /\AYou (?:can't see any place to hide|search but find no place)\b/i]
+    reply = combat_stealth_read_result(token, expected_write, patterns, hide: true)
+    case reply[:status]
+    when :wait
+      waited = combat_stealth_wait_confirmed(token, expected_write, reply[:seconds], retry_limit: retry_limit)
+      waited == :deadline ? :deadline : (waited ? :failed : :interrupted)
+    when :reply
+      # RT alone never proves a failed hide that may safely be replayed.
+      # A fresh actual HIDDEN icon confirms current state, not a new action.
+      return :unconfirmed unless reply[:result] || hiding?
+      hiding? ? :hidden : :failed
+    else
+      reply[:status]
+    end
+  end
+
+  # Same original producer, guarded native boundary and bounded burst on every
+  # attempt. Only a complete no-action WAIT can retry; never a positive action,
+  # generic RT, mixed frame, missing prompt or unknown result. No UNHIDE/wake,
+  # posture change or DRC.bput replay is inherited.
   def combat_stealth_ranged_write(command, patterns)
     stop = proc do |reason|
       stop_for_combat_stealth(reason)
@@ -8795,75 +8996,82 @@ class GameState
     waitrt?
     token = combat_stealth_producer
     return stop.call('hidden ranged producer unavailable') unless token && combat_stealth_safe?
-    expected_write = nil
-    dispatch = proc do
-      next 'hidden ranged dispatch interrupted' unless combat_stealth_safe? &&
-        combat_stealth_producer_current?(token, idle: true) && hiding?
-      clear
-      if token.is_a?(Array)
-        next 'hidden ranged write counter unavailable' unless token.first['write_count'].is_a?(Integer)
-        expected_write = token.first['write_count'] + 1
-      end
-      previous = Thread.current.thread_variable_get(:drbot_combat_stealth_write)
-      begin
-        # Capturing the actual control object prevents a later producer from
-        # inheriting this attempt while the watchdog waits on native roundtime.
-        Thread.current.thread_variable_set(:drbot_combat_stealth_write, token.is_a?(Array) ? token + [command] : [:standalone, command])
-        put command
-      ensure
-        Thread.current.thread_variable_set(:drbot_combat_stealth_write, previous)
-      end
-      next 'unconfirmed hidden ranged write; reconcile before resuming' if expected_write && token.first['write_count'] != expected_write
-      :written
+    target = nil
+    if drbot_identity_targets? && (id = command[/\s+#(\d+)\z/, 1])
+      context = drbot_target_context
+      return stop.call('hidden ranged target census unavailable') unless context && context[:ids].include?(id)
+      target = { id: id, room: context[:room], generation: context[:room_count], xml_room: context[:xml_room] }.freeze
     end
-    dispatched = token.is_a?(Array) ? token.first['lock'].synchronize { dispatch.call } : dispatch.call
-    # A refused dispatch publishes its hold only after releasing the writer
-    # Monitor; even a busy persistence backend must not block containment.
-    return stop.call(dispatched) unless dispatched == :written
-    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15.0
-    result = nil
-    refusal = false
-    loop do
-      return stop.call('hidden ranged producer changed during result') unless combat_stealth_safe? && combat_stealth_producer_current?(token)
-      return stop.call('hidden ranged write changed during result') if expected_write && token.first['write_count'] != expected_write
-      line = get?
-      if line
-        # These confirmations used to make bput send another command. They
-        # instead stop this hunt; never wake, unhide or replay an attempted shot.
-        if line.match?(/would give away your hiding place|^\.?Wait \d+|Sorry, you may only type ahead|^You are still stunned|^You can't do that|^You must be standing|^You should stand|^You'll need to stand|world somehow seems frozen|too busy performing|stop playing before/i)
-          result = line
-          refusal = true
-        elsif patterns.any? { |pattern| pattern.match?(line) }
-          result ||= line
+    retry_limit = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 60.0
+    3.times do |attempt|
+      return stop.call('confirmed ranged cooldown bounded retry budget exhausted') if
+        attempt.positive? && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= retry_limit
+      if attempt.positive?
+        return stop.call('hidden ranged retry target changed') if target && !drbot_living_target_current?(target)
+        return nil unless require_combat_hiding('after confirmed ranged cooldown', retry_limit: retry_limit)
+      end
+      expected_write = nil
+      dispatch = proc do
+        next 'hidden ranged dispatch interrupted' unless combat_stealth_safe? &&
+          combat_stealth_producer_current?(token, idle: true) && hiding?
+        next 'hidden ranged retry target changed' if target && !drbot_living_target_current?(target)
+        clear
+        if token.is_a?(Array)
+          next 'hidden ranged write counter unavailable' unless token.first['write_count'].is_a?(Integer)
+          expected_write = token.first['write_count'] + 1
         end
+        outcome = combat_stealth_guarded_put(command, token, expected_write && expected_write - 1)
+        next :deadline if outcome[:deadline] && expected_write && token.first['write_count'] == expected_write - 1 &&
+          combat_stealth_producer_current?(token, idle: true)
+        next 'unconfirmed hidden ranged write; reconcile before resuming' if expected_write && token.first['write_count'] != expected_write
+        :written
       end
-      break if result && combat_stealth_producer_current?(token, idle: true)
-      return stop.call('unconfirmed hidden ranged result; reconcile before resuming') if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
-      pause 0.1
+      dispatched = token.is_a?(Array) ? token.first['lock'].synchronize { dispatch.call } : dispatch.call
+      return :deadline_stopped if dispatched == :deadline
+      return stop.call(dispatched) unless dispatched == :written
+      reply = combat_stealth_read_result(token, expected_write, patterns)
+      case reply[:status]
+      when :reply
+        return reply[:result]
+      when :wait
+        return stop.call('confirmed ranged cooldown retry limit; reconcile before resuming') if attempt == 2
+        waited = combat_stealth_wait_confirmed(token, expected_write, reply[:seconds], retry_limit: retry_limit)
+        return :deadline_stopped if waited == :deadline
+        return stop.call('confirmed ranged cooldown interrupted or beyond bounded retry budget') unless waited
+      when :refused
+        return stop.call('hidden ranged command refused; no automatic wake, posture change or UNHIDE')
+      when :interrupted
+        return stop.call('hidden ranged result interrupted')
+      else
+        return stop.call('unconfirmed hidden ranged result; reconcile before resuming')
+      end
     end
-    waitrt?
-    return stop.call('hidden ranged result interrupted') unless combat_stealth_safe? && combat_stealth_producer_current?(token, idle: true)
-    return stop.call('hidden ranged command refused; no automatic replay or UNHIDE') if refusal
-    result
   end
 
-  def require_combat_hiding(boundary)
+  def require_combat_hiding(boundary, retry_limit: nil)
     return true unless combat_stealth_always?
     return false if combat_stealth_stopped? || cleaning_up?
 
-    @combat_stealth_hide_attempts.times do
+    retry_limit ||= Process.clock_gettime(Process::CLOCK_MONOTONIC) + 60.0
+    @combat_stealth_hide_attempts.times do |attempt|
+      return stop_for_combat_stealth('confirmed HIDE cooldown bounded retry budget exhausted') if
+        attempt.positive? && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= retry_limit
       waitrt?
       token = combat_stealth_producer
       unless combat_stealth_safe? && token
         return stop_for_combat_stealth('safety or producer interrupted hiding')
       end
-      case combat_stealth_hide_once(token)
+      case combat_stealth_hide_once(token, retry_limit: retry_limit)
       when :hidden
         # Every caller refreshes its room/target after this roundtime. Keep
         # real redundant HIDE calls at equip/engage/load/aim/fire boundaries.
         return true
       when :failed
         next
+      when :deadline
+        return false
+      when :refused
+        return stop_for_combat_stealth('HIDE refused; no automatic wake, posture change or UNHIDE')
       when :unconfirmed
         return stop_for_combat_stealth('unconfirmed HIDE; reconcile before resuming')
       else
