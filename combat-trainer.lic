@@ -8913,7 +8913,7 @@ class GameState
   # Chain the existing harvest predicate and recheck this original attempt
   # at the watchdog's post-wait socket boundary. Only an actual cutoff with
   # unchanged pre-write count may report a known not-attempted cancellation.
-  def combat_stealth_guarded_put(command, token, before_write)
+  def combat_stealth_guarded_put(command, token, before_write, retry_limit: nil)
     outcome = {}
     previous = Thread.current.thread_variable_get(:drbot_combat_stealth_write)
     prior_guard = Thread.current.thread_variable_get(:drbot_final_write_guard)
@@ -8922,6 +8922,10 @@ class GameState
       next true unless actual == command && combat_stealth_safe? &&
         combat_stealth_producer_current?(token, idle: true) &&
         (!before_write || token.first['write_count'] == before_write)
+      if retry_limit && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= retry_limit
+        outcome[:budget] = true
+        next true
+      end
       if @combat_stealth_reconciliation_binding && defined?(DrbotLifecycleDeadline)
         policy = DrbotLifecycleDeadline.current
         if policy && policy.bound? && policy.expired? && policy.request_stop
@@ -8955,7 +8959,9 @@ class GameState
         next :unconfirmed unless token.first['write_count'].is_a?(Integer)
         expected_write = token.first['write_count'] + 1
       end
-      outcome = combat_stealth_guarded_put('hide', token, expected_write && expected_write - 1)
+      outcome = combat_stealth_guarded_put('hide', token, expected_write && expected_write - 1, retry_limit: retry_limit)
+      next :budget if outcome[:budget] && expected_write && token.first['write_count'] == expected_write - 1 &&
+        combat_stealth_producer_current?(token, idle: true)
       next :deadline if outcome[:deadline] && expected_write && token.first['write_count'] == expected_write - 1 &&
         combat_stealth_producer_current?(token, idle: true)
       next :unconfirmed if expected_write && token.first['write_count'] != expected_write
@@ -9020,7 +9026,9 @@ class GameState
           next 'hidden ranged write counter unavailable' unless token.first['write_count'].is_a?(Integer)
           expected_write = token.first['write_count'] + 1
         end
-        outcome = combat_stealth_guarded_put(command, token, expected_write && expected_write - 1)
+        outcome = combat_stealth_guarded_put(command, token, expected_write && expected_write - 1, retry_limit: retry_limit)
+        next 'confirmed ranged cooldown bounded retry budget exhausted before dispatch' if outcome[:budget] &&
+          expected_write && token.first['write_count'] == expected_write - 1 && combat_stealth_producer_current?(token, idle: true)
         next :deadline if outcome[:deadline] && expected_write && token.first['write_count'] == expected_write - 1 &&
           combat_stealth_producer_current?(token, idle: true)
         next 'unconfirmed hidden ranged write; reconcile before resuming' if expected_write && token.first['write_count'] != expected_write
@@ -9070,6 +9078,8 @@ class GameState
         next
       when :deadline
         return false
+      when :budget
+        return stop_for_combat_stealth('confirmed HIDE cooldown bounded retry budget exhausted before dispatch')
       when :refused
         return stop_for_combat_stealth('HIDE refused; no automatic wake, posture change or UNHIDE')
       when :unconfirmed
