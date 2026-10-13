@@ -5322,6 +5322,7 @@ class AttackProcess
       return unless (!game_state.respond_to?(:require_combat_hiding) || game_state.require_combat_hiding('before loading'))
       load_weapon_success = [
         /You reach into/,
+        /\AYou reach down to your feet to load the light crossbow with your last crossbow bolt\.\z/,
         /You load/,
         /You carefully load/,
         /already loaded/,
@@ -8517,6 +8518,172 @@ class GameState
     raise ArgumentError, 'Invalid combat stealth policy settings' unless valid
 
     @combat_stealth_health_floor = settings.health_threshold
+    @combat_stealth_reconciliation_binding = combat_stealth_reconciliation_binding
+    if XMLData.name.to_s == 'Lanjefast'
+      control = defined?($DRBOT_DIRECT_CONTROL) && $DRBOT_DIRECT_CONTROL
+      @combat_stealth_fallback_stop_context = [control,
+        control.is_a?(Hash) ? control['session']&.dup : nil,
+        control.is_a?(Hash) ? control['producer']&.dup : nil,
+        Script.current, $HUNTING_BUDDY, $COMBAT_TRAINER,
+        control.is_a?(Hash) ? control['lock'] : nil,
+        XMLData.respond_to?(:game) ? XMLData.game.to_s : nil].freeze
+    end
+  end
+
+  # Capture the selected L lifecycle and this trainer before a strict attempt.
+  # Standalone training and a later same-named child cannot inherit this hold.
+  def combat_stealth_reconciliation_binding
+    return nil unless @combat_stealth_mode == 'always' && XMLData.name.to_s == 'Lanjefast' && XMLData.game.to_s == 'DRF'
+    control = defined?($DRBOT_DIRECT_CONTROL) && $DRBOT_DIRECT_CONTROL
+    coordinator = defined?($COORDINATOR) && $COORDINATOR
+    return nil unless control.is_a?(Hash) && defined?(Monitor) && control['lock'].is_a?(Monitor) &&
+      defined?(Coordinator) && coordinator.is_a?(Coordinator)
+
+    control['lock'].synchronize do
+      selection = control['profile_selection']
+      root = Array(control['scripts']).first
+      child = Script.current
+      buddy = defined?($HUNTING_BUDDY) && $HUNTING_BUDDY
+      return nil unless control['mode'] == 'B' && control['script'] == 'lifecycle' &&
+        control['closed'] == false && !control['fenced'] && control['confirm_by'].nil? &&
+        control['character'] == 'Lanjefast' && selection.is_a?(Hash) && selection['character'] == 'Lanjefast' &&
+        %w[session producer].all? { |key| control[key].is_a?(String) && !control[key].empty? } &&
+        root && root.name == 'coordinator' && child && child.name == 'combat-trainer' &&
+        defined?(HuntingBuddy) && buddy.is_a?(HuntingBuddy) &&
+        Script.list.any? { |instance| instance.equal?(root) } && Script.list.any? { |instance| instance.equal?(child) }
+      copied = selection.transform_values { |value| value.is_a?(String) ? value.dup.freeze : value }.freeze
+      [control, control['session'].dup.freeze, control['producer'].dup.freeze, root, coordinator, child, copied, buddy, 'DRF:Lanjefast'.freeze].freeze
+    end
+  rescue StandardError
+    nil
+  end
+
+  # Standalone/demo L trainers have no selected lifecycle hold. They may
+  # still stop their own captured native actors, never a replacement global.
+  def combat_stealth_stop_fallback
+    context = @combat_stealth_fallback_stop_context
+    return unless context
+
+    control, session, producer, script, buddy, prior_trainer, lock, game = context
+    stop = proc do
+      current = defined?($DRBOT_DIRECT_CONTROL) && $DRBOT_DIRECT_CONTROL
+      return unless current.equal?(control) && Script.current.equal?(script) &&
+        XMLData.name.to_s == 'Lanjefast' && (XMLData.respond_to?(:game) ? XMLData.game.to_s : nil) == game &&
+        $HUNTING_BUDDY.equal?(buddy)
+      return if control.is_a?(Hash) && (control['session'] != session || control['producer'] != producer || !control['lock'].equal?(lock))
+      trainer = $COMBAT_TRAINER
+      return unless trainer && (trainer.instance_variable_get(:@game_state).equal?(self) ||
+        (trainer.equal?(prior_trainer) && !trainer.instance_variable_defined?(:@game_state)))
+
+      buddy&.stop_hunting
+      trainer.stop
+    end
+    if control.is_a?(Hash)
+      lock.synchronize { stop.call } if defined?(Monitor) && lock.is_a?(Monitor)
+    else
+      stop.call
+    end
+  end
+
+  def combat_stealth_reconciliation_current?(binding)
+    control, session, producer, root, coordinator, child, selection, buddy = binding
+    control.equal?($DRBOT_DIRECT_CONTROL) && control['mode'] == 'B' &&
+      control['script'] == 'lifecycle' && control['closed'] == false && !control['fenced'] &&
+      control['confirm_by'].nil? && control['session'] == session && control['producer'] == producer &&
+      control['character'] == 'Lanjefast' && XMLData.name.to_s == 'Lanjefast' && XMLData.game.to_s == 'DRF' &&
+      control['profile_selection'] == selection && Array(control['scripts']).first.equal?(root) &&
+      $COORDINATOR.equal?(coordinator) && $HUNTING_BUDDY.equal?(buddy) && Script.current.equal?(child) &&
+      (!@combat_stealth_native_trainer || $COMBAT_TRAINER.equal?(@combat_stealth_native_trainer)) &&
+      Script.list.any? { |instance| instance.equal?(root) } && Script.list.any? { |instance| instance.equal?(child) }
+  end
+
+  # Unknown or refused strict commands require operator reconciliation even
+  # after a later prompt settles transport. Publish no game write or replay.
+  def combat_stealth_hold_reconciliation(reason)
+    binding = @combat_stealth_reconciliation_binding
+    return unless binding
+
+    control, _, _, _, coordinator = binding
+    prior = record = nil
+    owned = control['lock'].synchronize do
+      return unless combat_stealth_reconciliation_current?(binding)
+
+      text = "strict hidden combat stopped: #{reason}; operator reconciliation required"
+      parent_hold = coordinator.instance_variable_get(:@task_hold)
+      coordinator.instance_variable_set(:@task_hold, parent_hold || text)
+      prior = UserVars.drbot_custody_hold
+      record = prior.is_a?(Hash) ? prior : { 'reason' => text[0, 300], 'since' => Time.now.to_f, 'source' => 'strict_combat_stealth' }
+      record['prior_hold'] = prior unless prior.nil? || prior.is_a?(Hash)
+      # Latch the actual parent before persistence: a failed SQL save or child
+      # exit cannot become Completed, reset timers, or admit another hunt.
+      coordinator.instance_variable_set(:@task_hold, parent_hold || record['reason'] || text)
+      UserVars.drbot_custody_hold = record
+      # Stop the captured native objects before persistence can wait. A later
+      # same-named/global replacement is never this stop's target.
+      trainer = @combat_stealth_native_trainer || $COMBAT_TRAINER
+      if trainer && trainer.instance_variable_get(:@game_state).equal?(self)
+        @combat_stealth_native_trainer = trainer
+        binding.fetch(7).stop_hunting
+        trainer.stop
+      end
+      true
+    end
+    return unless owned
+
+    # Never retry Vars.save's cached blob against a later live character scope.
+    # Hold the database mutex while temporarily making SQLite fail immediately;
+    # restore its exact busy timeout before any shared database observer resumes.
+    begin
+      require 'timeout'
+      Thread.handle_interrupt(Timeout::Error => :never) do
+        Timeout.timeout(2.0, Timeout::Error) do
+          # Mutex acquisition remains interruptible. Once owned, install the
+          # cleanup mask before changing any shared connection setting.
+          Thread.handle_interrupt(Timeout::Error => :immediate) do
+            Lich.db_mutex.synchronize do
+              Thread.handle_interrupt(Timeout::Error => :never) do
+                database = prior_timeout = nil
+                begin
+                  Thread.handle_interrupt(Timeout::Error => :immediate) do
+                    database = Lich.db
+                    prior_timeout = database.get_first_value('PRAGMA busy_timeout')
+                    raise 'database busy timeout unconfirmed' unless prior_timeout.is_a?(Integer) && prior_timeout >= 0
+                    database.busy_timeout = 0
+                    scope = binding.fetch(8)
+                    blob = database.get_first_value('SELECT hash FROM uservars WHERE scope=?;', [scope])
+                    stored = blob && Marshal.load(blob)
+                    raise 'stored character variables unconfirmed' unless stored.is_a?(Hash)
+                    control['lock'].synchronize do
+                      return unless combat_stealth_reconciliation_current?(binding) && UserVars.drbot_custody_hold.equal?(record)
+                      stored['drbot_custody_hold'] = record
+                      database.execute('INSERT OR REPLACE INTO uservars(scope,hash) VALUES(?,?);',
+                                       [scope, SQLite3::Blob.new(Marshal.dump(stored))])
+                    end
+                    blob = database.get_first_value('SELECT hash FROM uservars WHERE scope=?;', [scope])
+                    persisted = blob && Marshal.load(blob)['drbot_custody_hold']
+                    raise 'strict combat hold was not durably saved' unless persisted == record
+                  end
+                ensure
+                  # This mask was installed before setup, so even an expiry
+                  # entering ensure cannot release db_mutex with timeout zero.
+                  database.busy_timeout = prior_timeout if database && prior_timeout.is_a?(Integer) && prior_timeout >= 0
+                end
+              end
+            end
+          end
+        end
+      end
+    rescue StandardError => error
+      control['lock'].synchronize do
+        if combat_stealth_reconciliation_current?(binding) && !prior.is_a?(Hash) && UserVars.drbot_custody_hold.equal?(record)
+          record['persistence_unconfirmed'] = true
+          UserVars.drbot_custody_hold = record
+        end
+      end
+      DRC.message("*** combat-trainer: Strict combat hold persistence unconfirmed (#{error.class}); operator reconciliation required")
+    end
+  rescue StandardError => error
+    DRC.message("*** combat-trainer: Strict combat reconciliation hold failed (#{error.class}); operator reconciliation required")
   end
 
   def combat_stealth_always?
@@ -8543,6 +8710,11 @@ class GameState
     return nil unless defined?(Monitor) && control['lock'].is_a?(Monitor)
 
     control['lock'].synchronize do
+      binding = @combat_stealth_reconciliation_binding
+      trainer = defined?($COMBAT_TRAINER) && $COMBAT_TRAINER
+      if binding && combat_stealth_reconciliation_current?(binding) && trainer && trainer.instance_variable_get(:@game_state).equal?(self)
+        @combat_stealth_native_trainer ||= trainer
+      end
       token = [control, control['session'], control['producer']]
       combat_stealth_producer_current?(token, idle: true) ? token : nil
     end
@@ -8625,11 +8797,11 @@ class GameState
     return stop.call('hidden ranged producer unavailable') unless token && combat_stealth_safe?
     expected_write = nil
     dispatch = proc do
-      return stop.call('hidden ranged dispatch interrupted') unless combat_stealth_safe? &&
+      next 'hidden ranged dispatch interrupted' unless combat_stealth_safe? &&
         combat_stealth_producer_current?(token, idle: true) && hiding?
       clear
       if token.is_a?(Array)
-        return stop.call('hidden ranged write counter unavailable') unless token.first['write_count'].is_a?(Integer)
+        next 'hidden ranged write counter unavailable' unless token.first['write_count'].is_a?(Integer)
         expected_write = token.first['write_count'] + 1
       end
       previous = Thread.current.thread_variable_get(:drbot_combat_stealth_write)
@@ -8641,11 +8813,13 @@ class GameState
       ensure
         Thread.current.thread_variable_set(:drbot_combat_stealth_write, previous)
       end
-      return stop.call('unconfirmed hidden ranged write; reconcile before resuming') if expected_write && token.first['write_count'] != expected_write
-      true
+      next 'unconfirmed hidden ranged write; reconcile before resuming' if expected_write && token.first['write_count'] != expected_write
+      :written
     end
     dispatched = token.is_a?(Array) ? token.first['lock'].synchronize { dispatch.call } : dispatch.call
-    return nil unless dispatched
+    # A refused dispatch publishes its hold only after releasing the writer
+    # Monitor; even a busy persistence backend must not block containment.
+    return stop.call(dispatched) unless dispatched == :written
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15.0
     result = nil
     refusal = false
@@ -8703,12 +8877,18 @@ class GameState
     return false if combat_stealth_stopped?
 
     @combat_stealth_stopped = true
-    DRC.message("*** combat-trainer: #{reason}. Stopping hunt.")
-    $HUNTING_BUDDY&.stop_hunting
-    $COMBAT_TRAINER&.stop
     # Same native spell/pet/weapon cleanup as the existing safety stop; skip
     # last-kill offense, keep custody and the external guardian's Thief escape.
     begin_safety_cleanup
+    if @combat_stealth_reconciliation_binding
+      combat_stealth_hold_reconciliation(reason)
+    elsif @combat_stealth_fallback_stop_context
+      combat_stealth_stop_fallback
+    else
+      $HUNTING_BUDDY&.stop_hunting
+      $COMBAT_TRAINER&.stop
+    end
+    DRC.message("*** combat-trainer: #{reason}. Stopping hunt.")
     false
   end
 
