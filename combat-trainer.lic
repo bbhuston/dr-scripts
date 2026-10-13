@@ -8824,12 +8824,12 @@ class GameState
   # The server's no-action roundtime refusal is distinct from an action's
   # Roundtime receipt. Match the whole native line, never quoted/ambient text.
   def combat_stealth_wait_seconds(line)
-    match = line.to_s.match(/\A\.*\s*wait\s+(\d+)\s+(?:seconds?|secs?)\.?\s*\z/i)
+    match = line.to_s.match(/\A\.*\s*wait\s+(\d+)\s+(?:seconds?|secs?)\.*\s*\z/i)
     match && match[1].to_i
   end
 
   def combat_stealth_roundtime_reply?(line)
-    line.to_s.match?(/\A\[?Roundtime\s*:?\s*\d+\s+(?:sec|secs|second|seconds)\.?\]?\s*\z/i)
+    line.to_s.match?(/\A\.*\s*(?:\[\s*\.*\s*Roundtime\s*:?\s*\d+\s+(?:sec|secs|second|seconds)\.*\s*\]\.*|Roundtime\s*:?\s*\d+\s+(?:sec|secs|second|seconds)\.*)\s*\z/i)
   end
 
   def combat_stealth_generic_refusal?(line)
