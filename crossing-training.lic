@@ -24,6 +24,7 @@ class CrossingTraining
   end
 
   def initialize
+    @performance_owner = performance_capture_owner
     @stop = false
     @running = true
     @idling = false
@@ -903,18 +904,776 @@ class CrossingTraining
     end
   end
 
-  def stop_play
-    return true unless @did_play
+  # Reader receipts only refuse stale/unobserved settlement; bytes, native
+  # queue entries and parser/cleaner results retain their original behavior.
+  require 'weakref'
+  class PerformanceArrivalObserver
+    READER = :drbot_performance_reader_receipt
+    PARSER = :drbot_performance_parser_receipt
+    MAX_INPUTS = 4_096
+    MAX_INPUT_AGE = 60
+    @inputs = {}
+    @input_lock = Mutex.new
 
-    # A sent STOP PLAY with no confirming reply has an unknown outcome. Do not
-    # claim that the child settled or send another command into that state.
-    reply = DRC.stop_playing
-    unless reply.to_s.match?(/You stop playing your song|But you're not performing|In the name of/)
-      echo '***COORDINATOR HOLD*** STOP PLAY result unconfirmed; operator reconciliation required'
-      loop { pause 60 }
+    class << self
+      def record_input(string, receipt)
+        @input_lock.synchronize do
+          return unless receipt[:owner].instance_variable_get(:@enabled)
+          now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          @inputs.delete_if { |_id, saved| now - saved[:at] > MAX_INPUT_AGE || !saved[:input].weakref_alive? }
+          @inputs.shift while @inputs.length >= MAX_INPUTS
+          prior = @inputs[string.object_id]
+          ambiguous = prior && prior[:input].weakref_alive? && prior[:input].__getobj__.equal?(string)
+          at = ambiguous ? [prior[:at], receipt[:at]].min : receipt[:at]
+          @inputs[string.object_id] = { input: WeakRef.new(string), owner: receipt[:owner], at: at,
+                                       ambiguous: !!ambiguous }.freeze
+        end
+      end
+
+      def begin_input(string)
+        @input_lock.synchronize do
+          saved = @inputs.delete(string.object_id)
+          context = nil
+          if saved && !saved[:ambiguous] && saved[:owner].instance_variable_get(:@enabled) && saved[:input].__getobj__.equal?(string)
+            age = Process.clock_gettime(Process::CLOCK_MONOTONIC) - saved[:at]
+            context = { owner: saved[:owner], at: saved[:at] } if age.between?(0, MAX_INPUT_AGE)
+          end
+          Thread.current.thread_variable_set(PARSER, context)
+        end
+      rescue StandardError
+        Thread.current.thread_variable_set(PARSER, nil)
+      end
+
+      def restore_context(previous)
+        @input_lock.synchronize do
+          previous = nil if previous.is_a?(Hash) && previous[:owner].is_a?(PerformanceArrivalObserver) &&
+            !previous[:owner].instance_variable_get(:@enabled)
+          Thread.current.thread_variable_set(PARSER, previous)
+        end
+      end
+
+      def reader_receipt(owner, raw, at)
+        @input_lock.synchronize do
+          Thread.current.thread_variable_set(READER, { owner: owner, raw: raw, at: at }) if
+            owner.instance_variable_get(:@enabled)
+        end
+      end
+
+      def buffer_receipt(context)
+        @input_lock.synchronize do
+          yield if context && context[:owner].instance_variable_get(:@enabled)
+        end
+      end
+
+      def clear_inputs(owner)
+        @input_lock.synchronize do
+          @inputs.delete_if { |_id, saved| saved[:owner].equal?(owner) }
+          threads = [Thread.current]
+          threads << Game.reader_thread if Game.respond_to?(:reader_thread)
+          threads << Game.thread if Game.respond_to?(:thread)
+          threads.compact.uniq.each do |thread|
+            [READER, PARSER].each do |key|
+              context = thread.thread_variable_get(key)
+              thread.thread_variable_set(key, nil) if context.is_a?(Hash) && context[:owner].equal?(owner)
+            end
+          end
+          if Game.respond_to?(:game_instance) && (instance = Game.game_instance)
+            context = instance.instance_variable_get(:@drbot_performance_buffer_receipt)
+            instance.instance_variable_set(:@drbot_performance_buffer_receipt, nil) if
+              context.is_a?(Hash) && context[:owner].equal?(owner)
+          end
+        end
+      end
     end
-    @did_play = false
-    Flags['ct-song'] = true
+
+    module QueueObservation
+      def enqueue_server_string(string, enqueued_monotonic_at)
+        receipt = Thread.current.thread_variable_get(PerformanceArrivalObserver::READER)
+        begin
+          PerformanceArrivalObserver.record_input(string, receipt) if receipt.is_a?(Hash) &&
+            receipt[:owner].is_a?(PerformanceArrivalObserver) && receipt[:owner].active? && receipt[:raw] == string
+        rescue StandardError
+          # Missing observational metadata denies treatment later; it must not
+          # change the native queue's success, exception or byte behavior.
+        ensure
+          Thread.current.thread_variable_set(PerformanceArrivalObserver::READER, nil) if receipt.is_a?(Hash) &&
+            receipt[:owner].is_a?(PerformanceArrivalObserver)
+        end
+        super
+      end
+
+      def process_server_string(string)
+        previous = Thread.current.thread_variable_get(PerformanceArrivalObserver::PARSER)
+        PerformanceArrivalObserver.begin_input(string)
+        super
+      ensure
+        begin
+          PerformanceArrivalObserver.restore_context(previous)
+        rescue StandardError
+          Thread.current.thread_variable_set(PerformanceArrivalObserver::PARSER, nil)
+        end
+      end
+    end
+
+    module BufferedObservation
+      def buffer_room_objs(string)
+        context = Thread.current.thread_variable_get(PerformanceArrivalObserver::PARSER)
+        pending = !@pending_room_objs.nil?
+        retained = @drbot_performance_buffer_receipt
+        outcome = super
+        begin
+          if context && context[:owner].active?
+            PerformanceArrivalObserver.buffer_receipt(context) do
+              earliest = if pending
+                           retained && retained[:owner].equal?(context[:owner]) && retained[:at].is_a?(Numeric) &&
+                             context[:at].is_a?(Numeric) ? [retained[:at], context[:at]].min : nil
+                         else
+                           context[:at]
+                         end
+              context[:at] = earliest
+              @drbot_performance_buffer_receipt = outcome[0] ? context.dup.freeze : nil
+            end
+          elsif pending || outcome[0]
+            @drbot_performance_buffer_receipt = nil
+          end
+        rescue StandardError
+          context[:at] = nil if context.is_a?(Hash)
+        end
+        outcome
+      end
+    end
+
+    def initialize(trainer)
+      @trainer, @enabled = WeakRef.new(trainer), false
+      raise 'native Performance arrival protocol unavailable' unless defined?(Lich::Common::SocketReadHook) &&
+        %i[enqueue_server_string unwrap_server_queue_item process_server_string].all? { |name| Game.respond_to?(name) } &&
+        defined?(Lich::GameBase::GameInstance::Base)
+      Game.singleton_class.prepend(QueueObservation) unless Game.singleton_class.ancestors.include?(QueueObservation)
+      base = Lich::GameBase::GameInstance::Base
+      base.prepend(BufferedObservation) unless base.ancestors.include?(BufferedObservation)
+      @enabled = true
+      @hook = "drbot-performance-reader-#{object_id}"
+      Lich::Common::SocketReadHook.add(@hook, proc do |raw, event|
+        if active? && event.is_a?(Lich::Common::SocketReadHook::Event) && event.monotonic_received_at.is_a?(Numeric)
+          self.class.reader_receipt(self, raw, event.monotonic_received_at)
+        end
+      end)
+    end
+
+    def active?
+      @enabled && @trainer.weakref_alive? && @trainer.__getobj__.performance_owner_current?(false)
+    rescue StandardError
+      false
+    end
+
+    def context
+      context = Thread.current.thread_variable_get(PARSER)
+      context if active? && context && context[:owner].equal?(self) && context[:at].is_a?(Numeric)
+    end
+
+    def close
+      @enabled = false
+      Lich::Common::SocketReadHook.remove(@hook) if @hook
+      self.class.clear_inputs(self)
+    rescue StandardError
+      # Disabled metadata cannot settle a command even if cleanup fails.
+      nil
+    end
+  end
+
+  # Capture the actual admitted native family once, before Performance writes.
+  # A replacement root, child, producer or character cannot adopt its result.
+  def performance_capture_owner
+    return nil unless defined?($DRBOT_DIRECT_CONTROL) && $DRBOT_DIRECT_CONTROL
+
+    control = $DRBOT_DIRECT_CONTROL
+    child = Script.current
+    root = control['scripts']&.first
+    return false unless control.is_a?(Hash) && control['lock'].respond_to?(:synchronize) && child && root
+
+    owner = { control: control, child: child, root: root,
+              coordinator: (defined?($COORDINATOR) && $COORDINATOR),
+              character: XMLData.name.to_s.dup.freeze, game: XMLData.game.to_s.dup.freeze }
+    %w[session producer watchdog_epoch fence_epoch].each do |key|
+      value = control[key]
+      owner[key.to_sym] = value.is_a?(String) ? value.dup.freeze : value
+    end
+    ancestor, seen = child, []
+    until ancestor.nil? || seen.any? { |entry| entry.equal?(ancestor) }
+      break if ancestor.equal?(root)
+      seen << ancestor
+      ancestor = ancestor.respond_to?(:__parent_script, true) ? ancestor.__send__(:__parent_script) : nil
+    end
+    return false unless ancestor.equal?(root)
+    owner.freeze
+  rescue StandardError
+    false
+  end
+
+  def performance_owner_current?(require_caller = true)
+    owner = @performance_owner
+    return true if owner.nil? && !(defined?($DRBOT_DIRECT_CONTROL) && $DRBOT_DIRECT_CONTROL)
+    return false unless owner.is_a?(Hash)
+
+    control = owner[:control]
+    $DRBOT_DIRECT_CONTROL.equal?(control) && control['mode'] == 'B' && control['closed'] == false &&
+      !control['fenced'] && control['scripts']&.first.equal?(owner[:root]) &&
+      %w[session producer watchdog_epoch fence_epoch].all? { |key| control[key] == owner[key.to_sym] } &&
+      control['session'].is_a?(String) && !control['session'].empty? &&
+      control['producer'].is_a?(String) && !control['producer'].empty? &&
+      owner[:watchdog_epoch].is_a?(String) && !owner[:watchdog_epoch].empty? &&
+      owner[:fence_epoch].is_a?(Integer) && control['final_write_guard'] == owner[:watchdog_epoch] &&
+      XMLData.name.to_s == owner[:character] && XMLData.game.to_s == owner[:game] &&
+      (defined?($COORDINATOR) && $COORDINATOR).equal?(owner[:coordinator]) &&
+      (!require_caller || Script.current.equal?(owner[:child])) &&
+      [owner[:child], owner[:root]].all? { |entry| Script.list.any? { |resident| resident.equal?(entry) } }
+  rescue StandardError
+    false
+  end
+
+  def performance_prepare_persistence
+    return true if @performance_owner.nil? && performance_owner_current?
+    return performance_persistence_current? if @performance_persistence
+    return false unless performance_owner_current? && defined?(Lich::Common::Vars) &&
+      defined?(Lich::Common::UserVars) && Vars.equal?(Lich::Common::Vars) &&
+      UserVars.equal?(Lich::Common::UserVars) && Vars.class_variable_get(:@@load_state) == :loaded
+    cache = Vars.class_variable_get(:@@vars)
+    db, mutex = Lich.db, Lich.db_mutex
+    filename = db.filename.to_s
+    return false unless cache.is_a?(Hash) && !filename.empty? && filename != ':memory:' &&
+      mutex.is_a?(Mutex) && !File.symlink?(filename) && File.file?(filename)
+    file = File.stat(filename)
+    owner = @performance_owner
+    @performance_persistence = { vars: Vars, cache: cache, db: db, mutex: mutex,
+      filename: File.expand_path(filename).freeze, file_identity: [file.dev, file.ino].freeze,
+      scope: "#{owner[:game]}:#{owner[:character]}".encode('UTF-8').freeze }.freeze
+    performance_persistence_current?
+  rescue StandardError
+    false
+  end
+
+  def performance_persistence_current?
+    state = @performance_persistence
+    return false unless state.is_a?(Hash) && performance_owner_current? &&
+      (!@performance_receipt || performance_visit_current?) &&
+      Lich.db.equal?(state[:db]) && Lich.db_mutex.equal?(state[:mutex]) &&
+      Vars.equal?(state[:vars]) && Vars.class_variable_get(:@@load_state) == :loaded &&
+      Vars.class_variable_get(:@@vars).equal?(state[:cache]) &&
+      File.expand_path(Lich.db.filename.to_s) == state[:filename] && !File.symlink?(state[:filename])
+    file = File.stat(state[:filename])
+    file.file? && [file.dev, file.ino] == state[:file_identity] &&
+      "#{XMLData.game}:#{XMLData.name}" == state[:scope]
+  rescue StandardError
+    false
+  end
+
+  # This is a write-ahead custody receipt, not a new producer authority.
+  # Only this object, its admitted child and the parent's active poll may
+  # recognize it in memory. A restarted scheduler sees an ordinary hold.
+  def performance_visit_current?
+    visit = @performance_visit
+    visit.is_a?(Array) && defined?(Room) && Room.current &&
+      [Room.current.id, XMLData.room_id, XMLData.room_count] == visit &&
+      visit.all? { |entry| entry.is_a?(Integer) && entry >= 0 }
+  rescue StandardError
+    false
+  end
+
+  def performance_receipt_current?(record = @performance_receipt)
+    owner, state = @performance_owner, @performance_persistence
+    record.is_a?(Hash) && record.equal?(@performance_receipt) &&
+      [:preparing, :armed, :settling].include?(@performance_receipt_phase) &&
+      performance_owner_current?(false) && performance_visit_current? && state.is_a?(Hash) &&
+      (state[:cache]['drbot_custody_hold'].equal?(record) ||
+        (@performance_receipt_phase == :preparing && state[:cache]['drbot_custody_hold'].nil?)) &&
+      owner[:coordinator].instance_variable_get(:@performance_pending_child).equal?(self) &&
+      [record['write_floor'], record['write_floor'] + 1].include?(owner[:control]['write_count'])
+  rescue StandardError
+    false
+  end
+
+  def performance_socket_entry_current?
+    @performance_socket_entry_record.equal?(@performance_receipt) &&
+      @performance_socket_entry_receipt && @performance_socket_entry_receipt.entry_at.is_a?(Numeric)
+  rescue StandardError
+    false
+  end
+
+  def performance_pending_exempt?(parent, record)
+    return false unless parent.equal?(@performance_owner&.dig(:coordinator)) &&
+      performance_receipt_current?(record)
+    caller = Script.current
+    poll = Thread.current.thread_variable_get(:drbot_crossing_performance_poll)
+    ticket = Thread.current.thread_variable_get(:drbot_crossing_performance_ticket)
+    (caller.equal?(@performance_owner[:root]) && poll.is_a?(Array) &&
+      poll[0].equal?(parent) && poll[1].equal?(@performance_owner[:child])) ||
+      (caller.equal?(@performance_owner[:child]) && ticket.equal?(@performance_ticket))
+  end
+
+  def performance_parent_unsettled?(parent)
+    parent.equal?(@performance_owner&.dig(:coordinator)) && @performance_receipt &&
+      @performance_receipt_phase != :cleared
+  end
+
+  def performance_socket_refused?(command)
+    return true unless performance_receipt_current? && @performance_receipt_phase == :armed &&
+      performance_owner_current? &&
+      Thread.current.thread_variable_get(:drbot_crossing_performance_ticket).equal?(@performance_ticket)
+    control = @performance_owner[:control]
+    command != @performance_receipt['command'] || control['write_count'] != @performance_receipt['write_floor'] ||
+      control['pending_result'] != false || checkrt != 0 || checkcastrt != 0 ||
+      control['performance_final_write_guard'] != @performance_owner[:watchdog_epoch]
+  rescue StandardError
+    true
+  end
+
+  def performance_persist_hold(record, clear: false)
+    state = @performance_persistence
+    return false unless record.is_a?(Hash) && performance_persistence_current? &&
+      (!clear || performance_socket_entry_current?)
+    require 'timeout'
+    private_db, committed, adopted, before_cache = nil, false, nil, nil
+    Timeout.timeout(2, Timeout::Error) do
+      Thread.handle_interrupt(Exception => :never) do
+        begin
+          private_db = SQLite3::Database.new(state[:filename])
+          Thread.handle_interrupt(Exception => :immediate) do
+            private_db.busy_timeout(0)
+            state[:mutex].synchronize do
+              @performance_owner[:control]['lock'].synchronize do
+                raise 'Performance persistence binding changed' unless performance_persistence_current?
+                raise 'Performance socket entry changed before retirement' if clear && !performance_socket_entry_current?
+                cache = state[:cache]
+                before_blob = Marshal.dump(cache)
+                before_cache = cache.dup
+                private_db.execute('BEGIN IMMEDIATE')
+                blob = private_db.get_first_value('SELECT hash FROM uservars WHERE scope=?;', [state[:scope]])
+                stored = blob ? Marshal.load(blob) : {}
+                raise 'Performance stored Vars malformed' unless stored.is_a?(Hash)
+                raise 'Performance loaded Vars changed' unless Marshal.dump(cache) == before_blob
+                # Newer disk overlaps win; unsaved cache-only keys survive.
+                merged = cache.merge(stored)
+                independent_disk = stored.any? do |key, value|
+                  key.to_s.end_with?('_hold') && !value.nil? &&
+                    !(key == 'drbot_custody_hold' && value == record)
+                end
+                if !clear && @performance_receipt_phase == :preparing && independent_disk
+                  # A loaded nil must not erase a hold found on disk during a
+                  # later ordinary Vars.save. Adopt only unconflicted original
+                  # scope data, without issuing any row update or game write.
+                  stored.each do |key, value|
+                    next unless key.to_s.end_with?('_hold') && !value.nil?
+                    raise 'Performance independent hold conflict' if !cache[key].nil? && cache[key] != value
+                  end
+                  raise 'Performance adoption binding changed' unless performance_persistence_current? &&
+                    Marshal.dump(cache) == before_blob
+                  cache.replace(merged)
+                  raise 'Performance independent stored hold; preparation refused'
+                end
+                (stored.keys | cache.keys).each do |key|
+                  next unless key.to_s.end_with?('_hold')
+                  disk, memory = stored[key], cache[key]
+                  raise 'Performance independent hold conflict' if !disk.nil? && !memory.nil? && disk != memory
+                  merged[key] = memory if disk.nil? && !memory.nil?
+                end
+                memory, disk = cache['drbot_custody_hold'], stored['drbot_custody_hold']
+                owned_memory = memory.equal?(record) || (!clear && memory.nil? && @performance_receipt_phase == :preparing)
+                raise 'Performance custody receipt changed' unless owned_memory &&
+                  (disk.nil? || disk == record) && (!clear || disk == record)
+                raise 'Performance receipt no longer current' unless performance_receipt_current?(record)
+                merged['drbot_custody_hold'] = record
+                written = merged.dup
+                written.delete('drbot_custody_hold') if clear
+                raise 'Performance persistence binding changed' unless performance_persistence_current? &&
+                  Marshal.dump(cache) == before_blob
+                private_db.execute('INSERT OR REPLACE INTO uservars(scope,hash) VALUES(?,?);',
+                  [state[:scope], SQLite3::Blob.new(Marshal.dump(written))])
+                check = private_db.get_first_value('SELECT hash FROM uservars WHERE scope=?;', [state[:scope]])
+                raise 'Performance custody readback unconfirmed' unless check && Marshal.load(check) == written
+                raise 'Performance loaded Vars changed' unless Marshal.dump(cache) == before_blob
+                # Adopt disk overlaps BEFORE COMMIT. Keep the receipt in cache
+                # until clear commits: an interrupted clear cannot erase it.
+                Thread.handle_interrupt(Exception => :never) do
+                  raise 'Performance persistence binding changed' unless performance_persistence_current?
+                  cache.replace(merged)
+                  adopted = Marshal.dump(merged)
+                  raise 'Performance cache adoption changed' unless performance_persistence_current? &&
+                    Marshal.dump(cache) == adopted && cache['drbot_custody_hold'].equal?(record)
+                  # SQLite invokes this private connection's transaction
+                  # authorizer at COMMIT preparation, after any Ruby adapter
+                  # callbacks. Recheck the captured raw visit/cache there too.
+                  private_db.authorizer do |operation, action, *_|
+                    if operation == 22 && action == 'COMMIT' # SQLITE_TRANSACTION
+                      begin
+                        performance_persistence_current? && performance_receipt_current?(record) &&
+                          (!clear || performance_socket_entry_current?) &&
+                          Marshal.dump(cache) == adopted ? 0 : 1
+                      rescue StandardError
+                        1
+                      end
+                    else
+                      0
+                    end
+                  end
+                  private_db.execute('COMMIT')
+                  committed = true
+                  raise 'Performance persistence binding changed' unless performance_persistence_current? &&
+                    (!clear || performance_socket_entry_current?) &&
+                    Marshal.dump(cache) == adopted && cache['drbot_custody_hold'].equal?(record)
+                  cache.delete('drbot_custody_hold') if clear
+                end
+              end
+            end
+          end
+        ensure
+          private_db.execute('ROLLBACK') rescue nil unless committed
+          private_db.close rescue nil
+          # Never restore into a replacement scope/cache. The original receipt
+          # remains protective even if adoption or SQL failed.
+          if !committed && adopted && performance_persistence_current? &&
+              Marshal.dump(state[:cache]) == adopted
+            state[:cache].replace(before_cache)
+          end
+        end
+      end
+    end
+    clear && committed ? :retired : committed && performance_persistence_current?
+  rescue StandardError
+    # A completed COMMIT retires a command whose own positive result and
+    # settled custody were already verified. Subsequent drift is no longer an
+    # unknown command, and it cannot authorize this old child to continue.
+    clear && committed ? :retired : false
+  end
+
+  def performance_prepare_receipt(command)
+    return false unless performance_prepare_persistence && performance_write_admitted?
+    owner, control = @performance_owner, @performance_owner[:control]
+    record = nil
+    control['lock'].synchronize do
+      return false unless performance_persistence_current? && performance_write_admitted? &&
+        control['performance_final_write_guard'] == owner[:watchdog_epoch] &&
+        control['write_count'].is_a?(Integer) && control['pending_result'] == false &&
+        checkrt == 0 && checkcastrt == 0 && @performance_persistence[:cache]['drbot_custody_hold'].nil?
+      @performance_visit = [Room.current.id, XMLData.room_id, XMLData.room_count].freeze
+      return false unless performance_visit_current?
+      record = { 'reason' => 'Performance command pending; operator reconciliation required',
+        'since' => Time.now.to_f, 'command' => command.dup.freeze,
+        'write_floor' => control['write_count'], 'pending_result' => true }.freeze
+      @performance_receipt, @performance_ticket = record, Object.new
+      @performance_receipt_phase = :preparing
+      @performance_receipt_durable = false
+      owner[:coordinator].instance_variable_set(:@performance_pending_child, self)
+      control['performance_write_refusal'] = method(:performance_socket_refused?)
+    end
+    result = performance_persist_hold(record)
+    control['lock'].synchronize do
+      if performance_owner_current?
+        @performance_receipt_phase = result ? :armed : :held
+        @performance_receipt_durable = result == true
+      end
+    end
+    result
+  end
+
+  def performance_clear_receipt
+    record = @performance_receipt
+    return false unless performance_receipt_current?(record) && performance_socket_entry_current?
+    @performance_receipt_phase = :settling
+    return false unless performance_persist_hold(record, clear: true) == :retired
+    @performance_retired_receipt = record
+    owner = @performance_owner
+    owner[:control]['lock'].synchronize do
+      return :retired unless performance_owner_current? && performance_visit_current? &&
+        performance_socket_entry_current? &&
+        owner[:coordinator].instance_variable_get(:@performance_pending_child).equal?(self) &&
+        @performance_persistence[:cache]['drbot_custody_hold'].nil?
+      owner[:control].delete('performance_write_refusal')
+      owner[:coordinator].remove_instance_variable(:@performance_pending_child)
+      @performance_receipt_phase = :cleared
+    end
+    true
+  end
+
+  def performance_stop_hold(reason)
+    # Retain this child before DB work. A SQL failure does not release the
+    # parent/pending stop, and an old child never mutates a successor's cache.
+    owner = @performance_owner
+    if owner.is_a?(Hash)
+      owner[:control]['lock'].synchronize do
+        if performance_owner_current?
+          @performance_receipt_phase = :held if @performance_receipt
+          parent = owner[:coordinator]
+          prior = parent&.instance_variable_get(:@task_hold)
+          parent.instance_variable_set(:@task_hold, "Performance: #{reason}; operator reconciliation required") if parent && !prior
+          @performance_persistence_unconfirmed = true unless @performance_receipt_durable
+        end
+      end
+    end
+    echo "***COORDINATOR HOLD*** #{reason}; operator reconciliation required"
+    loop { pause 60 }
+  end
+
+  def performance_write_admitted?
+    return false unless performance_owner_current?
+    owner = @performance_owner
+    return true unless owner.is_a?(Hash)
+    policy = defined?(DrbotLifecycleDeadline) && DrbotLifecycleDeadline.current
+    return false if policy && !policy.bound?
+    parent = owner[:coordinator]
+    state = @performance_persistence
+    cache = state && state[:cache]
+    return false unless cache.is_a?(Hash)
+    return false unless cache['drbot_weapon_custody_hold'].nil?
+    generic = cache['drbot_custody_hold']
+    return false unless generic.nil? || performance_pending_exempt?(parent, generic)
+    independent = cache['coordinator_safety_hold']
+    return false if !independent.nil? && !(policy && independent.is_a?(Hash) && independent['reason'] == policy.reason)
+    hold = parent.schedule_hold_reason if parent && parent.respond_to?(:schedule_hold_reason)
+    cache['coordinator_safety_hold'] = independent if cache && independent && performance_owner_current?
+    !hold || (policy && hold == policy.reason)
+  end
+
+  def performance_retain_unknown(count)
+    owner = @performance_owner
+    return false unless owner.is_a?(Hash)
+    control = owner[:control]
+    hook = "crossing-performance-unknown-#{owner[:child].object_id}-#{object_id}"
+    control['lock'].synchronize do
+      return false unless performance_owner_current? && control['write_count'] == count
+      control['pending_result'] = true
+      @performance_unknown = count
+      DownstreamHook.add(hook, proc do |raw|
+        control['lock'].synchronize do
+          # Later prompts cannot discharge the original written obligation.
+          # Script death removes this hook; a successor cannot inherit it.
+          control['pending_result'] = true if performance_owner_current?(false) &&
+            @performance_unknown == count && control['write_count'] == count
+        end
+        raw
+      end, persist: false)
+    end
+    true
+  end
+
+  def performance_command_once(command, patterns, reason, refusals = [], settled_custody = nil, &custody)
+    observer = nil
+    entry_receipt = nil
+    @performance_owner = performance_capture_owner unless instance_variable_defined?(:@performance_owner)
+    performance_stop_hold("#{reason}: original producer changed") unless performance_owner_current?
+    # Preserve ordinary standalone Lich usage. Managed lifecycles use the raw
+    # command frame below; this fallback grants no managed producer authority.
+    if @performance_owner.nil?
+      reply = command == 'stop play' ? DRC.stop_playing : DRC.bput(command, *patterns)
+      known = command == 'stop play' ? reply.to_s.match?(/You stop playing your song|But you're not performing|In the name of/) :
+        patterns.any? { |pattern| reply.to_s.match?(pattern) }
+      performance_stop_hold("#{reason} result unconfirmed") unless known
+      waitrt?
+      return true
+    end
+
+    begin
+      raise 'native game socket observation unavailable' unless defined?(DrbotGameSocketEntry)
+      entry_receipt = DrbotGameSocketEntry.capture("#{$cmd_prefix}#{command}")
+      observer = PerformanceArrivalObserver.new(self)
+      before_dying { observer.close; entry_receipt.close } if defined?(before_dying)
+    rescue StandardError
+      observer.close if observer
+      entry_receipt.close if entry_receipt
+      performance_stop_hold("#{reason}: native command observation protocol unavailable")
+    end
+    unless performance_prepare_receipt(command)
+      observer.close
+      performance_stop_hold("#{reason}: custody preparation unconfirmed")
+    end
+    @performance_socket_entry_receipt = entry_receipt
+    @performance_socket_entry_record = @performance_receipt
+    require 'timeout'
+    owner = @performance_owner
+    control = owner[:control]
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 30
+    frame_lock = Mutex.new
+    frame, armed, closed, count = +'', false, false, nil
+    generation, start_generation, closing_generation, recognized, known_refusal = nil, nil, nil, false, false
+    accepted_prompts = []
+    hook = "crossing-performance-#{owner[:child].object_id}-#{object_id}"
+    previous = Thread.current.thread_variable_get(:drbot_final_write_guard)
+    prior_ticket = Thread.current.thread_variable_get(:drbot_crossing_performance_ticket)
+    DownstreamHook.add(hook, proc do |raw|
+      frame_lock.synchronize do
+        arrival = observer.context
+        socket_entry_at = entry_receipt.entry_at
+        if armed && !closed && socket_entry_at && arrival && arrival[:at] > socket_entry_at
+          part = raw.to_s
+          offset = frame.length
+          frame << part
+          current_generation = control['prompt_generation']
+          if current_generation.is_a?(Integer) && current_generation > generation
+            part.to_enum(:scan, /<prompt(?:\s|>)/).each do
+              accepted_prompts << [offset + Regexp.last_match.begin(0), current_generation]
+            end
+          end
+          # Keep raw positions: a prompt before the reply, even in the same
+          # packet, cannot close that reply. XML prompt contents never count
+          # as command prose, and only a complete watchdog-accepted prompt
+          # after the specific reply can settle this once-written command.
+          frame.to_enum(:scan, /<prompt\b[^>]*>.*?<\/prompt>/m).each do
+            prompt = Regexp.last_match
+            receipt = accepted_prompts.find { |position, _| position == prompt.begin(0) }
+            next unless receipt && receipt[1] > start_generation
+            prose = strip_xml(frame[0...prompt.begin(0)]).to_s.gsub(/\r\n?/, "\n").rstrip
+            positive = patterns.any? { |pattern| prose.match?(pattern) }
+            refusal = refusals.any? { |pattern| prose.match?(pattern) }
+            next unless positive || refusal
+            recognized, known_refusal = positive, refusal && !positive
+            closing_generation = receipt[1]
+            frame = frame[0...prompt.end(0)]
+            closed = true
+            break
+          end
+          generation = current_generation
+          closed = true if frame.bytesize > 65_536
+        end
+      end
+      raw
+    end, persist: false)
+    guard = lambda do |actual|
+      refused = previous.respond_to?(:call) && previous.call(actual)
+      refused ||= actual != command || !performance_write_admitted? || !performance_persistence_current? ||
+        control['pending_result'] != false || checkrt != 0 || checkcastrt != 0 ||
+        Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline || (custody && !custody.call)
+      unless refused
+        frame_lock.synchronize do
+          refused = armed
+          unless refused
+            count = control['write_count']
+            generation = start_generation = control['prompt_generation']
+            refused = !count.is_a?(Integer) || !generation.is_a?(Integer)
+            unless refused
+              refused = !entry_receipt.arm(guard)
+              armed = !refused
+            end
+          end
+        end
+      end
+      refused
+    end
+    failure = nil
+    begin
+      Thread.current.thread_variable_set(:drbot_crossing_performance_ticket, @performance_ticket)
+      Thread.current.thread_variable_set(:drbot_final_write_guard, guard)
+      Timeout.timeout(30, Timeout::Error) do
+        entry_receipt.with_active { put(command) } # one socket attempt; no bput retry or recovery fallback
+        raise "#{reason}: write unconfirmed" unless armed && entry_receipt.entry_at && performance_owner_current? &&
+          control['write_count'] == count + 1
+        loop do
+          raise "#{reason}: original producer or command changed" unless performance_owner_current? &&
+            @performance_socket_entry_receipt.equal?(entry_receipt) && performance_socket_entry_current? &&
+            control['write_count'] == count + 1
+          complete, reply = frame_lock.synchronize { [closed, frame.dup] }
+          if complete
+            if known_refusal && !recognized
+              failure = "#{reason}: command refused; custody unresolved"
+              break
+            end
+            raise "#{reason}: result unconfirmed" unless reply.bytesize <= 65_536 &&
+              recognized && closing_generation.is_a?(Integer) &&
+              control['prompt_generation'] >= closing_generation && closing_generation > start_generation
+            if control['pending_result'] == false && checkrt == 0 && checkcastrt == 0
+              raise "#{reason}: settled custody unconfirmed" if settled_custody && !settled_custody.call
+              break
+            end
+          end
+          raise "#{reason}: prompt or roundtime unconfirmed" if
+            Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+          pause 0.05
+        end
+      end
+      unless failure
+        raise "#{reason}: socket entry changed before retirement" unless
+          @performance_socket_entry_receipt.equal?(entry_receipt) && performance_socket_entry_current?
+        retired = performance_clear_receipt
+        raise "#{reason}: custody clear unconfirmed" unless retired
+        if retired == :retired
+          failure = "#{reason}: binding changed after confirmed command retirement"
+        end
+      end
+      true
+    rescue Timeout::Error, StandardError
+      failure = "#{reason}: command settlement unconfirmed"
+    ensure
+      Thread.current.thread_variable_set(:drbot_final_write_guard, previous)
+      Thread.current.thread_variable_set(:drbot_crossing_performance_ticket, prior_ticket)
+      DownstreamHook.remove(hook)
+    end
+    if failure
+      @performance_unknown_command = command.dup.freeze
+      performance_retain_unknown(count + 1) if armed && count.is_a?(Integer) && !known_refusal &&
+        !@performance_retired_receipt.equal?(@performance_receipt)
+      observer.close
+      performance_stop_hold(failure)
+    end
+    true
+  ensure
+    observer.close if observer
+    entry_receipt.close if entry_receipt
+  end
+
+  def performance_capture_instrument
+    return unless defined?(GameObj)
+    instrument = @settings.instrument.to_s
+    return if instrument.empty?
+    held = [GameObj.left_hand, GameObj.right_hand].compact.reject { |item| item.name.to_s == 'Empty' }
+    selected = held.select { |item| item.name.to_s.match?(/\b#{Regexp.escape(instrument)}\z/i) }
+    @performance_instrument ||= [selected.first.id, selected.first.name, selected.first.noun].freeze if selected.length == 1
+  end
+
+  def performance_final_admitted?
+    return false unless performance_owner_current?
+    policy = defined?(DrbotLifecycleDeadline) && DrbotLifecycleDeadline.current
+    return true unless policy && policy.lanjefast?
+
+    policy.respond_to?(:crossing_instrument_admitted?) && policy.crossing_instrument_admitted?(self)
+  end
+
+  def finish_performance_instrument
+    return true unless @running == false && stopping?
+    performance_stop_hold('Performance final owner changed') unless performance_owner_current?
+    instrument = @settings.instrument.to_s
+    held = [GameObj.left_hand, GameObj.right_hand].compact.reject { |item| item.name.to_s == 'Empty' }
+    return true if held.empty?
+    performance_stop_hold('Performance worn instrument has unexpected hand custody') if instrument.empty?
+    performance_stop_hold('crossing instrument stow safety or owner changed') unless performance_final_admitted?
+    storage = Array(@settings.storage_containers).first.to_s
+    safe = /\A[a-zA-Z][a-zA-Z '\-]{0,79}\z/
+    custody = lambda do
+      hands = [GameObj.left_hand, GameObj.right_hand].compact.reject { |item| item.name.to_s == 'Empty' }
+      performance_final_admitted? && hands.length == 1 && @performance_instrument &&
+        [hands.first.id, hands.first.name, hands.first.noun] == @performance_instrument &&
+        hands.first.name.to_s.match?(/\b#{Regexp.escape(instrument)}\z/i)
+    end
+    performance_stop_hold('Performance final held gear is not the captured instrument') unless
+      instrument.match?(safe) && storage.match?(safe) && custody.call
+    performance_stop_hold('Performance instrument stow already attempted') if @performance_stow_attempted
+    @performance_stow_attempted = true
+    receipt = /(?:\A|\n)You put (?:your |some |a |an |the )?[^\n]*\b#{Regexp.escape(instrument)} (?:in|inside) (?:your |a |an |the )?[^\n]*\b#{Regexp.escape(storage)}[.!](?:\n|\z)/i
+    performance_command_once("put my #{instrument} in my #{storage}", [receipt], 'crossing instrument stow',
+      [/(?:\A|\n)(?:You can't put|You cannot put|What were you referring to|That is closed|You aren't holding)[^\n]*(?:\n|\z)/],
+      lambda { [GameObj.left_hand, GameObj.right_hand].compact.all? { |item| item.name.to_s == 'Empty' } }, &custody)
+    performance_stop_hold('crossing instrument stow hands unconfirmed after stow') unless
+      [GameObj.left_hand, GameObj.right_hand].compact.all? { |item| item.name.to_s == 'Empty' }
+    true
+  end
+
+  def stop_play
+    if @did_play
+      patterns = [/(?:\A|\n)You stop playing your song[.!](?:\n|\z)/,
+                  /(?:\A|\n)In the name of love\?(?:\n|\z)/,
+                  /(?:\A|\n)But you're not performing[^\n]*(?:\n|\z)/]
+      performance_command_once('stop play', patterns, 'STOP PLAY')
+      @did_play = false
+      Flags['ct-song'] = true
+    end
+    finish_performance_instrument
     true
   end
 
@@ -973,6 +1732,8 @@ class CrossingTraining
     return false if @no_instrument
     return true if DRSkill.getxp('Performance') >= 28
 
+    @performance_owner = performance_capture_owner unless instance_variable_defined?(:@performance_owner)
+    performance_stop_hold('Performance original producer changed') unless performance_owner_current?
     is_instrument_worn = @settings.instrument.nil?
     Flags.reset('ct-no-instrument')
     Flags.reset('ct-damaged-instrument')
@@ -982,6 +1743,7 @@ class CrossingTraining
     # processes the command result; resetting after it would lose that event.
     Flags.reset('ct-song')
     @did_play = DRC.play_song?(@settings, @song_list, is_instrument_worn, false)
+    performance_capture_instrument
 
     if !@did_play && Flags['ct-damaged-instrument']
       if respond_to?(:repair_instrument?, true) && repair_instrument?(is_instrument_worn)
@@ -1016,6 +1778,7 @@ class CrossingTraining
         return false
       end
     end
+    performance_capture_instrument
     @no_instrument = Flags['ct-no-instrument'] && !@did_play
 
     if @stop

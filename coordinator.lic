@@ -33,6 +33,14 @@ class Coordinator
     @hunting_tasks = task_list('coordinator_hunting_tasks', :hunting)
     @town_tasks = task_list('coordinator_town_tasks', :town)
     @cleanup_tasks = task_list('coordinator_hunting_cleanup', :cleanup)
+    # A retained Performance receipt survives process/child death. Refuse
+    # selected lifecycle preparation before box scans, cyclic release or any
+    # child launch, including malformed non-nil custody evidence.
+    if performance_custody_scope? &&
+        (!UserVars.drbot_custody_hold.nil? || !UserVars.drbot_weapon_custody_hold.nil?)
+      reason = schedule_hold_reason || 'custody unresolved; operator reconciliation required'
+      loop { hold_schedule(reason) }
+    end
     run_box_handoff_test if box_handoff_test_profile?
     @safe_idle = safe_idle_profile?
     # This explicit caretaker retirement role does not prepare inventory,
@@ -202,9 +210,19 @@ class Coordinator
   # The health floor does not latch. Resting in place is how it recovers, and
   # the hold is exactly that, so the schedule resumes on its own once health
   # is back above the profile's threshold.
+  def performance_custody_scope?
+    XMLData.game.to_s == 'DRF' && %w[Lanjefast Vrakk Thargrund].any? { |name| XMLData.name.to_s.casecmp?(name) }
+  rescue StandardError
+    false
+  end
+
   def schedule_hold_reason
     return @task_hold if @task_hold
-    if (custody_hold = UserVars.drbot_weapon_custody_hold).is_a?(Hash)
+    custody_hold = UserVars.drbot_weapon_custody_hold
+    if performance_custody_scope? && !custody_hold.nil? && !custody_hold.is_a?(Hash)
+      return 'weapon custody hold malformed; operator reconciliation required'
+    end
+    if custody_hold.is_a?(Hash)
       UserVars.coordinator_safety_hold = custody_hold
       return custody_hold['reason'] || 'weapon custody unresolved; operator reconciliation required'
     end
@@ -213,7 +231,14 @@ class Coordinator
     # drbot-remedy-restock). It persists in UserVars like the weapon custody
     # hold, so a restarted coordinator holds too, and it is read every tick, so
     # the schedule resumes once an operator has reconciled and cleared it.
-    if (custody_hold = UserVars.drbot_custody_hold).is_a?(Hash)
+    custody_hold = UserVars.drbot_custody_hold
+    if performance_custody_scope? && !custody_hold.nil? && !custody_hold.is_a?(Hash)
+      return 'custody hold malformed; operator reconciliation required'
+    end
+    pending_child = @performance_pending_child
+    owned_pending = pending_child && pending_child.respond_to?(:performance_pending_exempt?) &&
+      pending_child.performance_pending_exempt?(self, custody_hold)
+    if custody_hold.is_a?(Hash) && !owned_pending
       UserVars.coordinator_safety_hold = custody_hold
       return custody_hold['reason'] || 'custody unresolved; operator reconciliation required'
     end
@@ -1017,8 +1042,10 @@ class Coordinator
   end
 
   def crossing_training(task)
+    prior_performance_poll = Thread.current.thread_variable_get(:drbot_crossing_performance_poll)
     @child_script = 'crossing-training'
-    unless start_script('crossing-training')
+    admitted_performance_child = start_script('crossing-training')
+    unless admitted_performance_child
       @task_hold = 'crossing-training did not start; operator reconciliation required'
       return
     end
@@ -1036,6 +1063,19 @@ class Coordinator
         # A prior settle hold is no longer the reason for this hold. The child
         # is still running, so keep the readable state accurate for operators.
         UserVars.coordinator_safety_hold = { 'reason' => @task_hold, 'since' => Time.now.to_f } if settle_hold
+        return
+      end
+      current_child = Script.list.find { |entry| entry.name == 'crossing-training' }
+      unless current_child && current_child.equal?(admitted_performance_child) &&
+          current_child.respond_to?(:__parent_script, true) && current_child.__send__(:__parent_script).equal?(Script.current)
+        @task_hold = 'crossing-training child identity changed; operator reconciliation required'
+        return
+      end
+      Thread.current.thread_variable_set(:drbot_crossing_performance_poll, [self, admitted_performance_child])
+      pending = @performance_pending_child
+      if pending && pending.respond_to?(:performance_parent_unsettled?) &&
+          pending.performance_parent_unsettled?(self) && !pending.performance_receipt_current?
+        @task_hold ||= 'Performance command pending; operator reconciliation required'
         return
       end
       unavailable = target_skills - trainer.training_skills
@@ -1078,12 +1118,18 @@ class Coordinator
       end
       pause 5
     end
+    pending = @performance_pending_child
+    if pending && pending.respond_to?(:performance_parent_unsettled?) && pending.performance_parent_unsettled?(self)
+      @task_hold ||= 'Performance command pending; operator reconciliation required'
+      return
+    end
     if settle_hold
       # The observed exit is the settle evidence; resume like any other stop.
       UserVars.coordinator_safety_hold = nil
       echo "***STATUS*** Crossing training settled #{(Time.now - stop_requested_at).to_i} seconds after stop request; schedule hold cleared"
     end
   ensure
+    Thread.current.thread_variable_set(:drbot_crossing_performance_poll, prior_performance_poll)
     @child_script = nil unless Script.running?('crossing-training')
   end
 
