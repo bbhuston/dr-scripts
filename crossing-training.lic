@@ -1155,7 +1155,11 @@ class CrossingTraining
   def performance_persistence_current?
     state = @performance_persistence
     return false unless state.is_a?(Hash) && performance_owner_current? &&
-      (!@performance_receipt || performance_visit_current?) &&
+      # A confirmed retired receipt has no remaining visit obligation.
+      # Pending/held receipts retain their exact original visit binding.
+      (!@performance_receipt || performance_visit_current? ||
+       (@performance_receipt_phase == :cleared &&
+        @performance_retired_receipt.equal?(@performance_receipt))) &&
       Lich.db.equal?(state[:db]) && Lich.db_mutex.equal?(state[:mutex]) &&
       Vars.equal?(state[:vars]) && Vars.class_variable_get(:@@load_state) == :loaded &&
       Vars.class_variable_get(:@@vars).equal?(state[:cache]) &&
