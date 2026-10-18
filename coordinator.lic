@@ -517,7 +517,25 @@ class Coordinator
     # walk to safe_room, start afk and pause forever without reporting
     # anything wrong. Refuse to start instead.
     raise ArgumentError, "#{key} must be a list of tasks" unless tasks.nil? || tasks.is_a?(Array)
-    Array(tasks).each { |task| task[:type] = type }
+    # A flex selects the native scheduler, not hunting-buddy directly. Keep
+    # shared task definitions in setup, but admit scoped tasks only for the
+    # explicitly selected flex before priority/default/counter handling.
+    Array(tasks).select do |task|
+      next true unless task.key?(:profiles)
+
+      profiles = task[:profiles]
+      unless profiles.is_a?(Array) && !profiles.empty? && profiles.uniq == profiles &&
+             profiles.all? { |profile| profile.is_a?(String) && profile.match?(/\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\z/) }
+        raise ArgumentError, 'task profiles must be a nonempty unique list of profile suffixes'
+      end
+      selected = Array(@args&.flex)
+      selected = ['setup'] if selected.empty? # native no-flex get_settings default
+      unless selected.length == 1 && selected.first.is_a?(String) &&
+             selected.first.match?(/\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\z/)
+        raise ArgumentError, 'scoped task requires one explicitly selected profile'
+      end
+      profiles.include?(selected.first)
+    end.each { |task| task[:type] = type }
   end
 
   # A child started through DRC.wait_for_script_to_complete outlives this
