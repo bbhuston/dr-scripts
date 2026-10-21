@@ -1342,14 +1342,32 @@ class CrossingTraining
       end
     end
     clear && committed ? :retired : committed && performance_persistence_current?
-  rescue StandardError
+  rescue StandardError => error
     # A completed COMMIT retires a command whose own positive result and
     # settled custody were already verified. Subsequent drift is no longer an
     # unknown command, and it cannot authorize this old child to continue.
+    @performance_persist_failure = "#{error.class}: #{error.message}"[0, 120]
     clear && committed ? :retired : false
   end
 
-  def performance_prepare_receipt(command)
+  # drg-tsb8: a refused preparation never reached the socket, so its write
+  # refusal settles nothing. A retry also retires the still-preparing receipt
+  # unless adoption or COMMIT left it in the shared cache. The parent polls
+  # without this lock: clear the receipt before its pending-child reference.
+  # The caller holds the control lock.
+  def performance_release_unwritten_receipt(record, retire)
+    control = @performance_owner[:control]
+    refusal = control['performance_write_refusal']
+    control.delete('performance_write_refusal') if refusal.respond_to?(:receiver) && refusal.receiver.equal?(self)
+    return unless retire && !@performance_persistence[:cache]['drbot_custody_hold'].equal?(record)
+    @performance_receipt = @performance_ticket = @performance_receipt_phase = nil
+    parent = @performance_owner[:coordinator]
+    parent.remove_instance_variable(:@performance_pending_child) if
+      parent.instance_variable_get(:@performance_pending_child).equal?(self)
+  end
+
+  def performance_prepare_receipt(command, retire = false)
+    @performance_persist_failure = nil
     return false unless performance_prepare_persistence && performance_write_admitted?
     owner, control = @performance_owner, @performance_owner[:control]
     record = nil
@@ -1372,8 +1390,14 @@ class CrossingTraining
     result = performance_persist_hold(record)
     control['lock'].synchronize do
       if performance_owner_current?
-        @performance_receipt_phase = result ? :armed : :held
-        @performance_receipt_durable = result == true
+        unless result
+          @performance_persist_failure ||= 'receipt persistence unconfirmed'
+          performance_release_unwritten_receipt(record, retire)
+        end
+        if @performance_receipt.equal?(record)
+          @performance_receipt_phase = result ? :armed : :held
+          @performance_receipt_durable = result == true
+        end
       end
     end
     result
@@ -1485,9 +1509,27 @@ class CrossingTraining
       entry_receipt.close if entry_receipt
       performance_stop_hold("#{reason}: native command observation protocol unavailable")
     end
-    unless performance_prepare_receipt(command)
-      observer.close
-      performance_stop_hold("#{reason}: custody preparation unconfirmed")
+    # drg-tsb8: preparation writes nothing. A refusal while a result or
+    # roundtime settles, or a receipt that failed to persist, retires that
+    # unwritten receipt and prepares again for at most 30 seconds. The last
+    # refusal keeps its receipt for the parent hold, never its write refusal.
+    prepare_until = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 30
+    announced = false
+    loop do
+      retrying = Process.clock_gettime(Process::CLOCK_MONOTONIC) < prepare_until
+      break if performance_prepare_receipt(command, retrying)
+      failure = @performance_persist_failure
+      receipt = @performance_receipt
+      released = receipt.nil? || (@performance_receipt_phase == :cleared && @performance_retired_receipt.equal?(receipt))
+      unless retrying && released && performance_owner_current?
+        observer.close
+        performance_stop_hold("#{reason}: custody preparation unconfirmed#{failure ? " (#{failure})" : ''}")
+      end
+      if failure && !announced
+        announced = true
+        echo "***STATUS*** #{reason}: receipt not persisted (#{failure}); nothing written, retrying for up to 30 seconds"
+      end
+      pause 0.25
     end
     @performance_socket_entry_receipt = entry_receipt
     @performance_socket_entry_record = @performance_receipt
@@ -1668,8 +1710,29 @@ class CrossingTraining
     true
   end
 
+  # drg-tsb8: positive non-execution evidence for STOP PLAY. ct-song holds
+  # the native first-person finish line (play_song? reset it before PLAY) and
+  # the configured held instrument is in neither hand, so no song is playing.
+  def performance_naturally_finished?
+    instrument = @settings.instrument.to_s
+    match = Flags['ct-song']
+    return false if instrument.empty? || !match.is_a?(MatchData) ||
+      !(match.pre_match.empty? || match.pre_match.end_with?("\n"))
+    line = match.string[match.begin(0)..].to_s[/\A[^\r\n]*/]
+    return false unless line.match?(/\AYou finish playing [^\r\n]+ on your [^\r\n]+[.!]\z/)
+    [GameObj.left_hand, GameObj.right_hand].compact.none? do |item|
+      item.name.to_s.match?(/\b#{Regexp.escape(instrument)}\z/i) ||
+        (@performance_instrument && item.respond_to?(:id) && item.id == @performance_instrument[0])
+    end
+  rescue StandardError
+    false
+  end
+
   def stop_play
-    if @did_play
+    if @did_play && performance_naturally_finished?
+      # The finished song needs no STOP PLAY; the normal stow/exit path settles.
+      @did_play = false
+    elsif @did_play
       patterns = [/(?:\A|\n)You stop playing your song[.!](?:\n|\z)/,
                   /(?:\A|\n)In the name of love\?(?:\n|\z)/,
                   /(?:\A|\n)But you're not performing[^\n]*(?:\n|\z)/]
