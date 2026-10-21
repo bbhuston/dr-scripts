@@ -93,7 +93,9 @@ class WorkOrders
 
   WORK_ORDER_REQUEST_PATTERNS = [
     '^To whom',
-    'order for .* I need \d+ ',
+    # drf (drg-gyez): DRC.bput returns only the matched text, so the offer
+    # match runs on through its quality phrase when the offer has one.
+    'order for .* I need \d+ (?:[^,]*, made from any )?',
     'order for .* I need \d+ stacks \(5 uses each\) of .* quality',
     'You realize you have items bundled with the logbook',
     'You want to ask about shadowlings'
@@ -106,6 +108,17 @@ class WorkOrders
 
   WORK_ORDER_ITEM_PATTERN = /order for (?<item>.*)\. I need (?<quantity>\d+) /.freeze
   WORK_ORDER_STACKS_PATTERN = /order for (?<item>.*)\. I need (?<quantity>\d+) stacks \(5 uses each\) of .* quality/.freeze
+  # drf (drg-gyez): the offer's native quality word. Challenging and hard
+  # offers ask "I need 2 of exceptional quality, made from any material",
+  # remedies "I need 3 stacks (5 uses each) of superior quality, made from any
+  # material" and easy ones "I need 4 finely-crafted, made from any leather".
+  # Whatever else fills that slot is captured as well, so a cap refuses it.
+  WORK_ORDER_QUALITY_PATTERN = /\. I need \d+ (?:stacks \(5 uses each\) )?(?:of (?<quality>[^,]+?) quality|(?<bare_quality>[^,]+?)), made from any /.freeze
+  # The native crafting quality words, lowest first, as textsubs.lic numbers
+  # them (dismal 1/12 through masterfully-crafted 12/12).
+  WORK_ORDER_QUALITIES = ['dismal', 'poorly-crafted', 'below-average', 'mediocre', 'about average',
+                          'above-average', 'well-crafted', 'finely-crafted', 'superior', 'exceptional',
+                          'outstanding', 'masterfully-crafted'].freeze
 
   READ_LOGBOOK_PATTERNS = [
     'This work order appears to be complete.',
@@ -485,6 +498,52 @@ class WorkOrders
     false
   end
 
+  # drf (drg-gyez): the native quality word of an offer, or nil when it has no
+  # quality phrase.
+  def offer_quality(text)
+    match = text.to_s.match(WORK_ORDER_QUALITY_PATTERN)
+    match && (match[:quality] || match[:bare_quality])
+  end
+
+  # workorder_max_quality: the highest native quality an admitted offer may
+  # ask for, as one quality word or a map of discipline to word with an
+  # optional 'default'. Unset, or no entry and no default, admits any quality.
+  def max_offer_quality(discipline)
+    cap = begin
+      @settings&.workorder_max_quality
+    rescue NoMethodError
+      nil
+    end
+    cap.is_a?(Hash) ? cap.fetch(discipline.to_s) { cap['default'] } : cap
+  end
+
+  # Why an offer's quality is not admitted, or nil when it is. Under a cap, an
+  # unknown cap or offer word is refused; an offer without a quality phrase is
+  # judged as before. Khazdar's exceptional sha-tai (2026-10-20) was refused
+  # at the bundle only after its stock was bought and forged.
+  def offer_quality_refusal(quality, discipline)
+    cap = max_offer_quality(discipline)
+    return nil if cap.nil?
+
+    limit = WORK_ORDER_QUALITIES.index(cap)
+    return 'workorder_max_quality is not a native quality word' unless limit
+    return nil if quality.nil?
+
+    rank = WORK_ORDER_QUALITIES.index(quality)
+    return 'not a native quality word' unless rank
+
+    rank > limit ? "above the #{cap} quality cap" : nil
+  end
+
+  # The logbook never shows an order's quality, so a resumed order is judged
+  # only by the quality its own unspent offer receipt recorded.
+  def unspent_offer_quality_refusal(discipline)
+    receipt = UserVars[UNSPENT_FORGING_OFFER_KEY]
+    return nil unless receipt.is_a?(Hash) && receipt.key?('quality')
+
+    offer_quality_refusal(receipt['quality'], discipline)
+  end
+
   def complete_work_order(info)
     return complete_work_order_safely(info) if @resume_or_request
 
@@ -691,9 +750,13 @@ class WorkOrders
     rejected = remaining > bounded_setting(:workorder_max_items, 4, 1..100) ||
                !offer_workable?(recipes, recipe['name'], remaining)
     below_minimum = remaining < bounded_setting(:workorder_min_items, 1, 1..100)
-    if rotating_forging? && (rejected || below_minimum)
+    # drf (drg-gyez): an admitted recipe refused for its quality is asked over
+    # like any other verified unspent rejection, never resumed or bought for.
+    quality_refusal = rotating_forging? && unspent_offer_quality_refusal(discipline)
+    if rotating_forging? && (rejected || below_minimum || quality_refusal)
       if own_unspent_forging_offer?(result, discipline, diff)
-        Lich::Messaging.msg('plain', 'WorkOrders: Continuing bounded requests for verified unspent quantity/budget rejection')
+        reason = quality_refusal ? "quality rejection (#{quality_refusal})" : 'quantity/budget rejection'
+        Lich::Messaging.msg('plain', "WorkOrders: Continuing bounded requests for verified unspent #{reason}")
         return request_confirmed_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
       end
       if rejected
@@ -1922,6 +1985,8 @@ class WorkOrders
 
     expected = epoch.merge('discipline' => discipline, 'difficulty' => diff,
                            'item' => active[:item], 'quantity' => active[:remaining].to_i)
+    # drf (drg-gyez): the logbook omits quality; the receipt's own word stays.
+    expected['quality'] = receipt['quality'] if receipt.key?('quality')
     receipt == expected && save_unspent_forging_offer(receipt)
   end
 
@@ -2445,22 +2510,27 @@ class WorkOrders
         if match
           item = match[:item]
           quantity = match[:quantity].to_i
+          quality = offer_quality(result)
           if !allow_bundled_cleanup && rotating_forging?
             epoch = forging_offer_epoch
             receipt = epoch && epoch.merge('discipline' => discipline, 'difficulty' => diff, 'item' => item, 'quantity' => quantity)
+            # drf (drg-gyez): kept for the resume check; the logbook omits it.
+            receipt = receipt.merge('quality' => quality) if receipt && quality
             unless receipt && save_unspent_forging_offer(receipt)
               bounded_stop = 'new unspent-offer receipt was not durably confirmed'
               break
             end
           end
-          if @min_items <= quantity && quantity <= @max_items && match_names.include?(item) &&
+          refusal = offer_quality_refusal(quality, discipline)
+          if refusal.nil? && @min_items <= quantity && quantity <= @max_items && match_names.include?(item) &&
              (allow_bundled_cleanup || offer_workable?(recipes, item, quantity))
             stow_tool('logbook')
             Lich::Messaging.msg('plain', "WorkOrders: Accepted work order for #{quantity} #{item}")
             return [item, quantity]
           end
           unless allow_bundled_cleanup
-            Lich::Messaging.msg('plain', "WorkOrders: Ask #{attempts}/#{max_requests} offered #{quantity} #{item}; not admitted")
+            offered = refusal && quality ? "#{quantity} #{item} of #{quality} quality" : "#{quantity} #{item}"
+            Lich::Messaging.msg('plain', "WorkOrders: Ask #{attempts}/#{max_requests} offered #{offered}; not admitted#{" (#{refusal})" if refusal}")
           end
         end
       when 'You realize you have items bundled with the logbook'
