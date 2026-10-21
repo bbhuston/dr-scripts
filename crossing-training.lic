@@ -1258,7 +1258,7 @@ class CrossingTraining
     return false unless record.is_a?(Hash) && performance_persistence_current? &&
       (!clear || performance_socket_entry_current?)
     require 'timeout'
-    private_db, committed, adopted, before_cache = nil, false, nil, nil
+    private_db, committed, adopted, before_cache, armed = nil, false, nil, nil, false
     Timeout.timeout(2, Timeout::Error) do
       Thread.handle_interrupt(Exception => :never) do
         begin
@@ -1277,6 +1277,17 @@ class CrossingTraining
                 stored = blob ? Marshal.load(blob) : {}
                 raise 'Performance stored Vars malformed' unless stored.is_a?(Hash)
                 raise 'Performance loaded Vars changed' unless Marshal.dump(cache) == before_blob
+                # drg-tsb8: coordinator_safety_hold is only the running
+                # coordinator's readable copy of its in-memory hold: it clears
+                # it at startup, write admission reads and admits this cache
+                # value, and every Vars.save replaces the saved copy with it.
+                # A saved copy outlives a cleared hold until the next save
+                # (Vrakk 2026-10-20: re-arm hold 06:23:15, cleared about a
+                # minute later), and a receipt or autosave saves a live
+                # admitted hold (Lanjefast's lifecycle deadline). The cache
+                # value governs: a saved copy is never independent,
+                # conflicting or restored.
+                stored = stored.reject { |key, _| key.to_s == 'coordinator_safety_hold' }
                 # Newer disk overlaps win; unsaved cache-only keys survive.
                 merged = cache.merge(stored)
                 independent_disk = stored.any? do |key, value|
@@ -1347,6 +1358,7 @@ class CrossingTraining
                     (!clear || performance_socket_entry_current?) &&
                     Marshal.dump(cache) == adopted && cache['drbot_custody_hold'].equal?(record)
                   cache.delete('drbot_custody_hold') if clear
+                  armed = !clear
                 end
               end
             end
@@ -1365,41 +1377,82 @@ class CrossingTraining
     end
     clear && committed ? :retired : committed && performance_persistence_current?
   rescue StandardError => error
+    # drg-tsb8: the 2 s timeout is deferred past the uninterruptible COMMIT
+    # section. Raised after a COMMIT whose binding was verified, it finds the
+    # receipt durable and adopted, the state an on-time COMMIT returns armed;
+    # the unwritten command still passes every final write check.
+    return performance_persistence_current? if armed && error.is_a?(Timeout::Error)
     # A completed COMMIT retires a command whose own positive result and
     # settled custody were already verified. Subsequent drift is no longer an
     # unknown command, and it cannot authorize this old child to continue.
-    @performance_persist_failure = "#{error.class}: #{error.message}"[0, 120]
+    @performance_prepare_refusal = "receipt not persisted, #{error.class}: #{error.message}"[0, 160] unless clear
     clear && committed ? :retired : false
   end
 
-  # drg-tsb8: a refused preparation never reached the socket, so its write
-  # refusal settles nothing. A retry also retires the still-preparing receipt
-  # unless adoption or COMMIT left it in the shared cache. The parent polls
-  # without this lock: clear the receipt before its pending-child reference.
-  # The caller holds the control lock.
+  # drg-tsb8: a refused preparation never reached the socket. A retry retires
+  # the still-preparing receipt and its write refusal unless the receipt is in
+  # the shared cache: adoption precedes COMMIT and is undone only when COMMIT
+  # did not happen, so a durable receipt is always there. A hold keeps both:
+  # the refusal fences every family write while this child holds, so the
+  # watchdog's held keepalive still applies (drg-hmvo), and it ends with this
+  # child (performance_unwritten_hold). The parent polls without this lock:
+  # clear the receipt before its pending-child reference. The caller holds
+  # the control lock.
   def performance_release_unwritten_receipt(record, retire)
+    return unless retire && !@performance_persistence[:cache]['drbot_custody_hold'].equal?(record)
     control = @performance_owner[:control]
     refusal = control['performance_write_refusal']
     control.delete('performance_write_refusal') if refusal.respond_to?(:receiver) && refusal.receiver.equal?(self)
-    return unless retire && !@performance_persistence[:cache]['drbot_custody_hold'].equal?(record)
     @performance_receipt = @performance_ticket = @performance_receipt_phase = nil
     parent = @performance_owner[:coordinator]
     parent.remove_instance_variable(:@performance_pending_child) if
       parent.instance_variable_get(:@performance_pending_child).equal?(self)
   end
 
+  # drg-tsb8: nothing was written under the write refusal a refused
+  # preparation keeps for its hold, so it must not outlive this child and
+  # refuse a later family's writes: it is removed when this held child exits
+  # (a close kills it). A written command's refusal is never released here.
+  def performance_unwritten_hold
+    control = @performance_owner.is_a?(Hash) ? @performance_owner[:control] : nil
+    return unless control && !@performance_unwritten_exit && defined?(before_dying)
+    @performance_unwritten_exit = true
+    before_dying do
+      control['lock'].synchronize do
+        refusal = control['performance_write_refusal']
+        control.delete('performance_write_refusal') if refusal.respond_to?(:receiver) && refusal.receiver.equal?(self)
+      end
+    end
+  end
+
+  # drg-tsb8: the first refused preparation predicate, in the original order,
+  # named for the status and hold text; nil when every predicate holds.
+  def performance_prepare_refusal(owner, control)
+    return 'receipt persistence binding changed' unless performance_persistence_current?
+    return 'write not admitted' unless performance_write_admitted?
+    return 'final write guard unavailable' unless control['performance_final_write_guard'] == owner[:watchdog_epoch]
+    return 'write count unavailable' unless control['write_count'].is_a?(Integer)
+    return 'prior command result pending' unless control['pending_result'] == false
+    return 'roundtime' unless checkrt == 0
+    return 'cast roundtime' unless checkcastrt == 0
+    'custody hold present' unless @performance_persistence[:cache]['drbot_custody_hold'].nil?
+  end
+
   def performance_prepare_receipt(command, retire = false)
-    @performance_persist_failure = nil
-    return false unless performance_prepare_persistence && performance_write_admitted?
+    @performance_prepare_refusal = 'receipt persistence unavailable'
+    return false unless performance_prepare_persistence
+    @performance_prepare_refusal = 'write not admitted'
+    return false unless performance_write_admitted?
+    @performance_prepare_refusal = nil
     owner, control = @performance_owner, @performance_owner[:control]
     record = nil
     control['lock'].synchronize do
-      return false unless performance_persistence_current? && performance_write_admitted? &&
-        control['performance_final_write_guard'] == owner[:watchdog_epoch] &&
-        control['write_count'].is_a?(Integer) && control['pending_result'] == false &&
-        checkrt == 0 && checkcastrt == 0 && @performance_persistence[:cache]['drbot_custody_hold'].nil?
+      @performance_prepare_refusal = performance_prepare_refusal(owner, control)
+      return false if @performance_prepare_refusal
       @performance_visit = [Room.current.id, XMLData.room_id, XMLData.room_count].freeze
+      @performance_prepare_refusal = 'room visit unconfirmed'
       return false unless performance_visit_current?
+      @performance_prepare_refusal = nil
       record = { 'reason' => 'Performance command pending; operator reconciliation required',
         'since' => Time.now.to_f, 'command' => command.dup.freeze,
         'write_floor' => control['write_count'], 'pending_result' => true }.freeze
@@ -1413,7 +1466,7 @@ class CrossingTraining
     control['lock'].synchronize do
       if performance_owner_current?
         unless result
-          @performance_persist_failure ||= 'receipt persistence unconfirmed'
+          @performance_prepare_refusal ||= 'receipt persistence unconfirmed'
           performance_release_unwritten_receipt(record, retire)
         end
         if @performance_receipt.equal?(record)
@@ -1531,25 +1584,29 @@ class CrossingTraining
       entry_receipt.close if entry_receipt
       performance_stop_hold("#{reason}: native command observation protocol unavailable")
     end
-    # drg-tsb8: preparation writes nothing. A refusal while a result or
-    # roundtime settles, or a receipt that failed to persist, retires that
-    # unwritten receipt and prepares again for at most 30 seconds. The last
-    # refusal keeps its receipt for the parent hold, never its write refusal.
+    # drg-tsb8: preparation writes nothing. A refusal while the child's own
+    # last command or roundtime settles, or a receipt that did not persist,
+    # retires that unwritten receipt and prepares again, rechecking every
+    # predicate, for at most 30 seconds. The last refusal holds, naming the
+    # refused predicate; it keeps its receipt for the parent and its write
+    # refusal until this child exits. A receipt that reached the shared cache
+    # always holds.
     prepare_until = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 30
     announced = false
     loop do
       retrying = Process.clock_gettime(Process::CLOCK_MONOTONIC) < prepare_until
       break if performance_prepare_receipt(command, retrying)
-      failure = @performance_persist_failure
+      refusal = @performance_prepare_refusal
       receipt = @performance_receipt
       released = receipt.nil? || (@performance_receipt_phase == :cleared && @performance_retired_receipt.equal?(receipt))
       unless retrying && released && performance_owner_current?
         observer.close
-        performance_stop_hold("#{reason}: custody preparation unconfirmed#{failure ? " (#{failure})" : ''}")
+        performance_unwritten_hold
+        performance_stop_hold("#{reason}: custody preparation unconfirmed#{refusal ? " (#{refusal})" : ''}")
       end
-      if failure && !announced
+      if refusal.to_s.start_with?('receipt not persisted') && !announced
         announced = true
-        echo "***STATUS*** #{reason}: receipt not persisted (#{failure}); nothing written, retrying for up to 30 seconds"
+        echo "***STATUS*** #{reason}: #{refusal}; nothing written, retrying for up to 30 seconds"
       end
       pause 0.25
     end
