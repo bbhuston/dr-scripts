@@ -90,6 +90,9 @@ class WorkOrders
   ].freeze
 
   BUNDLE_FAILURE_PATTERN = /requires items of|Only undamaged enchanted/.freeze
+  # drf (drg-gyez): "The work order requires items of a higher quality, so you
+  # decide against bundling that." The piece stays held and uncounted.
+  BUNDLE_QUALITY_REFUSAL = 'The work order requires items of a higher quality'.freeze
 
   WORK_ORDER_REQUEST_PATTERNS = [
     '^To whom',
@@ -535,11 +538,14 @@ class WorkOrders
     rank > limit ? "above the #{cap} quality cap" : nil
   end
 
-  # The logbook never shows an order's quality, so a resumed order is judged
-  # only by the quality its own unspent offer receipt recorded.
-  def unspent_offer_quality_refusal(discipline)
+  # The logbook never shows an order's quality. An unspent-offer receipt that
+  # names this order's discipline, difficulty, item and count still records
+  # the quality it was offered at, whichever producer saved it: refusing to
+  # spend needs no producer authority, only asking over the order does.
+  def recorded_offer_quality_refusal(item, remaining, discipline, diff)
     receipt = UserVars[UNSPENT_FORGING_OFFER_KEY]
-    return nil unless receipt.is_a?(Hash) && receipt.key?('quality')
+    return nil unless receipt.is_a?(Hash) && receipt.key?('quality') &&
+                      receipt.values_at('discipline', 'difficulty', 'item', 'quantity') == [discipline, diff, item, remaining]
 
     offer_quality_refusal(receipt['quality'], discipline)
   end
@@ -750,9 +756,11 @@ class WorkOrders
     rejected = remaining > bounded_setting(:workorder_max_items, 4, 1..100) ||
                !offer_workable?(recipes, recipe['name'], remaining)
     below_minimum = remaining < bounded_setting(:workorder_min_items, 1, 1..100)
-    # drf (drg-gyez): an admitted recipe refused for its quality is asked over
-    # like any other verified unspent rejection, never resumed or bought for.
-    quality_refusal = rotating_forging? && unspent_offer_quality_refusal(discipline)
+    # drf (drg-gyez): an admitted recipe refused for its quality is never
+    # resumed or bought for. This producer's own verified receipt asks over it
+    # like any other unspent rejection; a matching receipt an earlier producer
+    # saved (a restart or takeover since) preserves it without a request.
+    quality_refusal = rotating_forging? && recorded_offer_quality_refusal(recipe['name'], remaining, discipline, diff)
     if rotating_forging? && (rejected || below_minimum || quality_refusal)
       if own_unspent_forging_offer?(result, discipline, diff)
         reason = quality_refusal ? "quality rejection (#{quality_refusal})" : 'quantity/budget rejection'
@@ -762,6 +770,11 @@ class WorkOrders
       if rejected
         publish_result('unworkable_active_order', 'existing quantity or budget exceeds admission; debt and custody preserved')
         Lich::Messaging.msg('bold', 'WorkOrders: Existing quantity/budget-rejected debt preserved; no request or purchase')
+        exit
+      end
+      if quality_refusal
+        publish_result('unadmitted_active_order', "existing order was offered at a refused quality (#{quality_refusal}); custody preserved")
+        Lich::Messaging.msg('bold', "WorkOrders: Existing order was offered at a refused quality (#{quality_refusal}); preserved without request or purchase")
         exit
       end
       # Remaining one can be partially bundled admitted debt. The request
@@ -1536,6 +1549,7 @@ class WorkOrders
     info['trash-room'] = nil if @worn_trashcan && @worn_trashcan_verb
 
     attempts = 0
+    replacements = 0
     while attempts < quantity
       remaining = logbook_remaining(info['logbook'])
       unless remaining == quantity - attempts
@@ -1612,7 +1626,15 @@ class WorkOrders
         end
         product_id = receipt['item_id']
       end
-      return false unless bundle_item(recipe['noun'], info['logbook'], remaining, product_id)
+      unless bundle_item(recipe['noun'], info['logbook'], remaining, product_id)
+        return false unless replace_quality_refused_piece?(product_id, recipe, info['logbook'], remaining, replacements)
+
+        # The same remaining count is forged again from a fresh batch.
+        replacements += 1
+        remaining_volume = 0
+        @forging_stock_id = nil
+        next
+      end
 
       remaining_volume -= recipe['volume']
       attempts += 1
@@ -1630,6 +1652,42 @@ class WorkOrders
     end
 
     DRCT.dispose("#{materials_info['stock-name']} ingot", info['trash-room'], @worn_trashcan, @worn_trashcan_verb) if remaining_volume.positive? && !@retain_crafting_materials
+    true
+  end
+
+  # drf (drg-gyez): the work order refuses a finished piece below its quality
+  # and leaves the count unchanged. On 2026-10-15 Khazdar's first of five
+  # k'trinni sha-tai was refused (04:50:32); with that piece and the logbook
+  # put away, the same order resumed and five more pieces were paid 19,714.
+  # Up to workorders_quality_replacements times a pass (default 0: stop and
+  # latch as before), the runner puts the refused piece in the bag by its
+  # server ID and forges a replacement from a fresh batch, when the logbook
+  # still shows the same count and its time covers the remaining pieces and
+  # the turn-in. A replacement batch is spent beyond the order's admitted
+  # material estimate; the cash check before each purchase still applies.
+  def replace_quality_refused_piece?(product_id, recipe, logbook, remaining, used)
+    limit = bounded_setting(:workorders_quality_replacements, 0, 0..2)
+    return false unless @bundle_quality_refused && limit.positive?
+
+    if used >= limit
+      Lich::Messaging.msg('bold', "WorkOrders: Quality replacement limit (#{limit} a pass) reached; custody preserved")
+      return false
+    end
+    left = logbook_remaining(logbook)
+    unless left == remaining
+      Lich::Messaging.msg('bold', "WorkOrders: Logbook count after the quality refusal is #{left.inspect}, not #{remaining}; no replacement")
+      return false
+    end
+    if (shortfall = resumed_order_time_shortfall(@logbook_minutes_left, remaining, recipe))
+      Lich::Messaging.msg('bold', "WorkOrders: Quality-refused order has #{shortfall}; no replacement")
+      return false
+    end
+    result = DRC.bput("put ##{product_id} in my #{@bag}", 'You put', 'I could not find what you were referring to', 'What were you referring to?')
+    if result != 'You put' || [GameObj.left_hand, GameObj.right_hand].compact.any? { |held| held.id.to_s == product_id.to_s }
+      Lich::Messaging.msg('bold', "WorkOrders: Refused #{recipe['noun']} ##{product_id} was not confirmed in the #{@bag}; no replacement")
+      return false
+    end
+    Lich::Messaging.msg('plain', "WorkOrders: Refused #{recipe['noun']} ##{product_id} kept in the #{@bag}; forging replacement #{used + 1} of #{limit} for #{remaining} remaining")
     true
   end
 
@@ -2397,6 +2455,7 @@ class WorkOrders
 
   def bundle_item_safely(noun, logbook, expected_remaining, expected_item_id = nil)
     noun = 'fount' if noun == 'small sphere'
+    @bundle_quality_refused = false
 
     if expected_item_id
       unless held_forging_product?(expected_item_id, noun)
@@ -2438,6 +2497,10 @@ class WorkOrders
     )
     unless result && accepted_pattern.match?(result)
       Lich::Messaging.msg('bold', "WorkOrders: Bundle was not accepted - #{result}. Custody preserved")
+      # drf (drg-gyez): the native refusal of the exact bound piece for its
+      # quality, with that piece and the logbook still held.
+      @bundle_quality_refused = !expected_item_id.nil? && result.to_s.start_with?(BUNDLE_QUALITY_REFUSAL) &&
+                                held_forging_product?(expected_item_id, noun) && held_logbook?(logbook)
       return false
     end
 
