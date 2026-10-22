@@ -409,7 +409,7 @@ RSpec.describe GameState do
     it 'needs server-ID targeting as well as the opt-in' do
       expect(id_state(own_kill: true).drbot_own_kills_only?).to be(false)
       expect(id_state(own_kill: true).drbot_corpse_ids?).to be(false)
-      expect(id_state(server_ids: true).drbot_corpse_ids?).to be(false)
+      expect(id_state(server_ids: true).drbot_corpse_ids?).to be(true)
     end
 
     it 'keeps lvt-goblins corpse IDs without own-kill filtering' do
@@ -1692,7 +1692,12 @@ end
 # LootProcess -- bundle tying logic
 # ===================================================================
 RSpec.describe LootProcess do
-  before(:each) { ct_setup }
+  before(:each) do
+    ct_setup
+    # These fixtures supply a known First Aid rank/mindstate. Missing cache
+    # is tested separately and must never count as barren learning.
+    allow(DRSkill).to receive(:include?).with('First Aid').and_return(true)
+  end
 
   def build_loot(**overrides)
     lp = LootProcess.allocate
@@ -1878,14 +1883,14 @@ RSpec.describe LootProcess do
       expect(instance.instance_variable_get(:@skin)).to be(true)
     end
 
-    it 'keeps the knife in hand for the confirming DISSECT after a no-insights warning' do
+    it 'consumes one no-insights harvest choice and returns the knife without confirming' do
       instance = build_dissector
       dissect_reply("You'll gain no insights from this attempt")
       allow(instance).to receive(:fput)
 
-      expect(instance.dissected?('hog', game_state)).to be(false)
+      expect(instance.dissected?('hog', game_state)).to be(true)
       expect(DRCI).to have_received(:get_item?).with('skinning knife', 'backpack').ordered
-      expect(instance).to have_received(:fput).with('dissect').ordered
+      expect(instance).not_to have_received(:fput)
       expect(DRCI).to have_received(:put_away_item?).with('skinning knife', 'backpack').ordered
       expect(equipment_manager).to have_received(:wield_weapon?).with('stout broadsword', 'Large Edged').ordered
       expect(instance.instance_variable_get(:@dissect)).to be(true)
@@ -1999,24 +2004,24 @@ RSpec.describe LootProcess do
         expect(DRC).not_to have_received(:bput).with('dissect hog', any_args)
       end
 
-      it 'confirms a no-insights DISSECT on the same bound corpse' do
+      it 'does not replay a no-insights DISSECT on the bound corpse' do
         instance = build_harvester(dissect: true, dissect_cycle_skills: ['First Aid', 'Skinning'])
         bound_to(instance, '4242')
         allow(DRC).to receive(:bput).with('dissect #4242', any_args).and_return("You'll gain no insights from this attempt")
         allow(instance).to receive(:fput)
 
-        expect(instance.dissected?('hog', game_state)).to be(false)
-        expect(instance).to have_received(:fput).with('dissect #4242')
+        expect(instance.dissected?('hog', game_state)).to be(true)
+        expect(instance).not_to have_received(:fput)
         expect(DRCI).to have_received(:put_away_item?).with('skinning knife', 'backpack')
       end
 
-      it 'keeps DISSECT by noun and the bare confirmation without corpse IDs' do
+      it 'keeps one DISSECT by noun without a bare confirmation' do
         instance = build_harvester(dissect: true, dissect_cycle_skills: ['First Aid', 'Skinning'])
         allow(DRC).to receive(:bput).with('dissect hog', any_args).and_return("You'll gain no insights from this attempt")
         allow(instance).to receive(:fput)
 
-        expect(instance.dissected?('hog', game_state)).to be(false)
-        expect(instance).to have_received(:fput).with('dissect')
+        expect(instance.dissected?('hog', game_state)).to be(true)
+        expect(instance).not_to have_received(:fput)
       end
 
       it 'returns the knife and sends nothing when the bound ID is unusable' do

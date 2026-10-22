@@ -36,6 +36,27 @@ class LevelUp
       exit
     end
 
+    # Load the canonical requirement calculator without executing its CLI.
+    previous_library = Thread.current[:drbot_circlecheck_library]
+    begin
+      Thread.current[:drbot_circlecheck_library] = true
+      load File.join(SCRIPT_DIR, 'circlecheck.lic')
+    ensure
+      Thread.current[:drbot_circlecheck_library] = previous_library
+    end
+    return unless DrbotProgressionCache.refresh
+    begin
+      target = DRStats.circle + 1
+      requirements = all_requirements(target)
+      unless !requirements.empty? && requirements.all? { |requirement| requirement.met_circle >= target }
+        DRC.message('Level-up deferred: fresh requirements are not met; no guildleader travel')
+        return
+      end
+    rescue DrbotProgressionCache::Unknown => e
+      DRC.message("Level-up deferred: #{e.message}; no guildleader travel")
+      return
+    end
+
     DRCT.walk_to(guild_room)
 
     ask_guild_leader_about_circle(guild_leader, guild)
@@ -46,8 +67,9 @@ class LevelUp
   end
 
   def ask_guild_leader_about_circle(guild_leader, guild)
-    loop do
-      case DRC.bput("ask #{guild_leader} about circle",
+    5.times do
+      previous_circle = DRStats.circle
+      case DrbotProgressionCache.ask_once("ask #{guild_leader} about circle",
                     'You are ready to train for your next level',
                     'You\'re ready to move up in the underworld',
                     'To whom are you speaking',
@@ -84,7 +106,19 @@ class LevelUp
       when 'You have some work to do', 'You have a bit more work to do', 'You aren\'t ready yet', 'he shakes his head at you and says', 'you\'re just not quite ready', 'you have some work to do'
         break
       end
+      # A promotion reply alone never changes the cached circle. Observe one
+      # authoritative INFO response, and stop if advancement is unconfirmed.
+      begin
+        break unless DrbotProgressionCache.refresh_info > previous_circle
+      rescue StandardError => e
+        $DRBOT_PROGRESSION_OBSERVATION = nil
+        DRC.message("Level-up stopped: #{e.message}; no ask replay")
+        break
+      end
     end
+  rescue DrbotProgressionCache::Unknown => e
+    $DRBOT_PROGRESSION_OBSERVATION = nil
+    DRC.message("Level-up stopped: #{e.message}; no ask replay")
   end
 end
 

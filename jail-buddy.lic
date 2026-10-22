@@ -60,6 +60,10 @@ def determine_province
 end
 
 def get_out_of_jail(old_loc)
+  burgle_arrest = Script.running?('burgle')
+  if burgle_arrest
+    UserVars.drbot_burglary_hold ||= { 'reason' => 'arrest during burglary; reconcile gear and debt', 'since' => Time.now.to_f }
+  end
   pause 1 until DRC.pause_all
 
   stop_script('go2') if Script.running?('go2')
@@ -90,8 +94,18 @@ def get_out_of_jail(old_loc)
   amount, denom = @settings.sell_loot_money_on_hand.split(' ')
   DRCM.ensure_copper_on_hand(DRCM.convert_to_copper(amount, denom), @settings)
 
-  DRC.wait_for_script_to_complete('go2', [old_loc.to_s], force: true) if old_loc
+  DRC.wait_for_script_to_complete('go2', [old_loc.to_s], force: true) if old_loc && !burgle_arrest
 
+  if burgle_arrest
+    burglar = Script.list.find { |instance| instance.name == 'burgle' }
+    if burglar
+      burglar.kill_sync(context: :runtime, timeout: 5.0)
+      if Script.list.any? { |instance| instance.equal?(burglar) }
+        DRC.message('***STATUS*** Burglary exit unconfirmed after arrest; scripts remain paused')
+        return
+      end
+    end
+  end
   DRC.unpause_all
 end
 

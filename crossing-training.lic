@@ -383,7 +383,12 @@ class CrossingTraining
   def train_locksmithing
     return if @researching
 
-    DRC.wait_for_script_to_complete('burgle', ['start']) if @settings.train_with_burgle
+    if @settings.train_with_burgle && ready_to_use?('Thievery')
+      return unless UserVars.drbot_burglary_hold.nil?
+      update_timer('Thievery')
+      DRC.wait_for_script_to_complete('burgle', ['start'])
+      return unless UserVars.drbot_burglary_hold.nil?
+    end
     return if DRSkill.getxp('Locksmithing') >= 30
 
     if @settings.lockpick_room_id
@@ -670,7 +675,12 @@ class CrossingTraining
   def train_athletics
     return if @researching
 
-    DRC.wait_for_script_to_complete('burgle', ['start']) if @settings.train_with_burgle
+    if @settings.train_with_burgle && ready_to_use?('Thievery')
+      return unless UserVars.drbot_burglary_hold.nil?
+      update_timer('Thievery')
+      DRC.wait_for_script_to_complete('burgle', ['start'])
+      return unless UserVars.drbot_burglary_hold.nil?
+    end
     return if DRSkill.getxp('Athletics') >= 30
 
     child = DRC.wait_for_script_to_complete('athletics')
@@ -730,7 +740,12 @@ class CrossingTraining
   def train_stealth
     return if @researching
 
-    DRC.wait_for_script_to_complete('burgle', ['start']) if @settings.train_with_burgle
+    if @settings.train_with_burgle && ready_to_use?('Thievery')
+      return unless UserVars.drbot_burglary_hold.nil?
+      update_timer('Thievery')
+      DRC.wait_for_script_to_complete('burgle', ['start'])
+      return unless UserVars.drbot_burglary_hold.nil?
+    end
     return if DRSkill.getxp('Stealth') >= 30 || DRSkill.getrank('Stealth') >= 30
 
     hide_in 851
@@ -743,7 +758,12 @@ class CrossingTraining
   def train_thievery
     return if @researching
 
-    DRC.wait_for_script_to_complete('burgle', ['start']) if @settings.train_with_burgle
+    if @settings.train_with_burgle && ready_to_use?('Thievery')
+      return unless UserVars.drbot_burglary_hold.nil?
+      update_timer('Thievery')
+      DRC.wait_for_script_to_complete('burgle', ['start'])
+      return unless UserVars.drbot_burglary_hold.nil?
+    end
     return if DRSkill.getxp('Thievery') >= 30
 
     stop_play if @settings.hide_to_steal

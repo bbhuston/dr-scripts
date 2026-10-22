@@ -3,6 +3,83 @@
   Circle Requirements are matched off of Elanthipedia
 =end
 
+
+# One explicit producer-owned refresh before calculating progression. Never
+# refresh from drbot-snapshot: its RPC is a silent observer, not a producer.
+module DrbotProgressionCache
+  class Unknown < StandardError; end
+
+  def self.query(command, start_pattern)
+    # issue_command(use_fput: false) does not clear its private script queue.
+    # Drop older frames before this sole producer's single guarded write.
+    clear
+    lines = Array(Lich::Util.issue_command(command, start_pattern, /<prompt\b/,
+                                           timeout: 8, quiet: false, use_fput: false))
+    raise Unknown, "#{command} response was not complete" unless lines.any? { |line| line.match?(/<prompt\b/) }
+
+    lines.map { |line| line.gsub(/<[^>]*>/, '').strip }
+  end
+
+  def self.ask_once(command, *patterns)
+    # Match the same reviewed guildleader replies, with one native write.
+    lines = query(command, Regexp.union(patterns.map { |pattern| Regexp.new(Regexp.escape(pattern), Regexp::IGNORECASE) }))
+    patterns.find { |pattern| lines.any? { |line| line.downcase.include?(pattern.downcase) } } ||
+      raise(Unknown, 'guildleader response was not recognized')
+  end
+
+  def self.refresh_info
+    lines = query('info', /\AGender:\s+.+\s+Age:\s+.+\s+Circle:/)
+    values = lines.filter_map { |line| line[/\AGender:\s+.+\s+Age:\s+.+\s+Circle:\s+(\d+)\b/, 1] }
+    raise Unknown, 'INFO circle was not uniquely observed' unless values.length == 1
+
+    circle = values.first.to_i
+    raise Unknown, 'INFO circle was invalid' unless circle.between?(1, 200)
+    until_time = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
+    pause 0.05 while DRStats.circle != circle && Process.clock_gettime(Process::CLOCK_MONOTONIC) < until_time
+    raise Unknown, 'INFO circle did not reach the native parser' unless DRStats.circle == circle
+
+    $DRBOT_PROGRESSION_OBSERVATION = { 'circle' => circle, 'circle_observed_at' => Time.now.to_f }
+    circle
+  end
+
+  def self.refresh
+    refresh_info
+    lines = query('exp all', /\AShowing all skills that you have skill in\./)
+    unless lines.any? { |line| line.match?(/\ATotal Ranks Displayed:\s+\d+\z/) } &&
+           lines.any? { |line| line.match?(/\ATime Development Points:\s+\d+\b/) }
+      raise Unknown, 'EXP ALL rank table footer was not confirmed'
+    end
+    rows = lines.flat_map do |line|
+      line.scan(/(?:\A|\s{2,})([A-Za-z][A-Za-z '\-]+?):\s+(\d+)\s+(\d+(?:\.\d+)?)%/)
+    end
+    raise Unknown, 'EXP ALL contained no skill observations' if rows.empty?
+    names = rows.map { |name, _, _| name.strip }
+    raise Unknown, 'EXP ALL contained duplicate skills' unless names.uniq.length == names.length
+    until_time = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
+    parsed = lambda do
+      rows.all? do |name, rank, percent|
+        DRSkill.include?(name.strip) && DRSkill.getrank(name.strip) == rank.to_i &&
+          DRSkill.getpercent(name.strip) == percent.to_i
+      end
+    end
+    pause 0.05 until parsed.call || Process.clock_gettime(Process::CLOCK_MONOTONIC) >= until_time
+    raise Unknown, 'EXP ALL did not reach the native skill parser' unless parsed.call
+
+    $DRBOT_PROGRESSION_OBSERVATION['skills'] = names
+    $DRBOT_PROGRESSION_OBSERVATION['skills_observed_at'] = Time.now.to_f
+    true
+  rescue StandardError => e
+    $DRBOT_PROGRESSION_OBSERVATION = nil
+    DRC.message("Progression unknown: #{e.message}; no level-up travel")
+    false
+  end
+
+  def self.observed?(name)
+    observation = $DRBOT_PROGRESSION_OBSERVATION
+    observation.is_a?(Hash) && Array(observation['skills']).include?(name)
+  end
+end
+
 $Skills = [
   { name: 'Instinct', type: 'Survival' },
   { name: 'Evasion', type: 'Survival' },
@@ -480,7 +557,7 @@ $GuildReqs = {
   }
 }
 
-CircleReq = Struct.new(:name, :met_circle, :missing_ranks, :ranks, :agg_gained, :agg_gap)
+CircleReq = Struct.new(:name, :met_circle, :missing_ranks, :ranks, :agg_gained, :agg_gap) unless defined?(CircleReq)
 
 def progress_bar(pct, width = 10)
   pct = 0 if pct < 0
@@ -514,6 +591,8 @@ def main
 
   args = parse_args(arg_definitions)
 
+  return unless DrbotProgressionCache.refresh
+
   $debug_mode_cc = args.debug
 
   # Check yaml settings to see if prettyprint is true
@@ -522,6 +601,8 @@ def main
   level_target = [args.target.to_i, DRStats.circle + 1].max
   requirements = all_requirements(level_target)
   display_requirements(requirements, level_target, args.mode, pretty_print)
+rescue DrbotProgressionCache::Unknown => e
+  DRC.message("Progression unknown: #{e.message}")
 end
 
 def display_requirements(requirements, level_target, brief, pretty_print)
@@ -756,7 +837,7 @@ end
 
 def get_skills_by_type(type)
   $Skills
-    .select { |skill| skill[:type] == type }
+    .select { |skill| skill[:type] == type && DrbotProgressionCache.observed?(skill[:name]) }
     .map { |skill| [skill[:name], DRSkill.getrank(skill[:name]), DRSkill.getpercent(skill[:name])] }
     .sort_by { |skill| [skill[1], skill[2]] }
     .reverse
@@ -807,7 +888,8 @@ def calc_requirements(reqs, type, level_target)
   echo(skill_type_info) if $debug_mode_cc
   reqs[:specific_reqs].each do |skill_name, costs|
     unless type_names.include?(skill_name)
-      echo("skipping #{skill_name}") if $debug_mode_cc
+      belongs_here = $Skills.any? { |skill| skill[:name] == skill_name && skill[:type] == type }
+      raise DrbotProgressionCache::Unknown, "unobserved required skill #{skill_name}" if belongs_here
       next
     end
     echo("calcing #{skill_name}") if $debug_mode_cc
@@ -823,9 +905,10 @@ def calc_requirements(reqs, type, level_target)
 
   echo("remaining skills to match: #{skill_type_info}") if $debug_mode_cc
 
-  reqs[:general_reqs][type].each_with_index do |costs, i|
+  Array(reqs[:general_reqs][type]).each_with_index do |costs, i|
     echo("costs #{costs}") if $debug_mode_cc
     best_skill = skill_type_info.shift
+    raise DrbotProgressionCache::Unknown, "unobserved #{type} slot" unless best_skill
     best_skill[0] = "#{$Ordinals[i + 1]} #{type} (#{best_skill[0]})"
     echo("formatted skill info #{best_skill}") if $debug_mode_cc
     requirements << calc_requirement(best_skill, costs, level_target)
@@ -835,4 +918,4 @@ end
 
 $Ordinals = { 1 => '1st', 2 => '2nd', 3 => '3rd', 4 => '4th', 5 => '5th', 6 => '6th', 7 => '7th', 8 => '8th', 9 => '9th' }
 
-main
+main unless Thread.current[:drbot_circlecheck_library]

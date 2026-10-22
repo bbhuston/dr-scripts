@@ -605,7 +605,7 @@ class HuntingBuddy
           DRC.message("***STATUS*** Combat trainer failed during supervised group hold; held in place for operator recovery")
           loop { pause 1 }
         end
-        @hunt_stop_reason = :combat_trainer_failed
+        @hunt_stop_reason = :combat_trainer_failed unless @hunt_stop_reason == :solo_retreat_unverified
         @stop_hunting = true
         DRC.message("***STATUS*** Combat trainer stopped unexpectedly or failed to initialize; ending all hunts without restarting")
         break
@@ -616,6 +616,12 @@ class HuntingBuddy
       break if plugin_break == :break
 
       if stop_for_low_health?
+        if defined?($DRBOT_DIRECT_CONTROL) && $DRBOT_DIRECT_CONTROL.is_a?(Hash)
+          @hunt_stop_reason = :low_health
+          stop_hunting
+          DRC.message("***STATUS*** Stopping hunt because low health: #{DRStats.health} < #{@settings.health_threshold}")
+          break
+        end
         DRC.message("***STATUS*** Exiting because low health: #{DRStats.health} < #{@settings.health_threshold}")
         fput('avoid all')
         fput('exit')
@@ -725,7 +731,9 @@ class HuntingBuddy
     end
     pause 1 while Script.running?('combat-trainer')
     fput('flag description on') if @disable_room_descriptions
-    DRC.retreat
+    # The trainer already attempted RETREAT and retained this exact failed
+    # hunt's obligation. A second parent attempt would replay an unknown write.
+    DRC.retreat unless @hunt_stop_reason == :solo_retreat_unverified
   end
 
   def stop_hunting

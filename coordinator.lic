@@ -30,6 +30,9 @@ class Coordinator
     # with no arguments, so every coordinator_* key had to live in the setup
     # file and `;coordinator lifecycle` could not select an overlay.
     @settings = get_settings(@args.flex)
+    if UserVars.respond_to?(:drbot_burglary_hold) && !UserVars.drbot_burglary_hold.nil?
+      loop { hold_schedule('burglary arrest/exit unresolved; operator reconciliation required') }
+    end
     @hunting_tasks = task_list('coordinator_hunting_tasks', :hunting)
     @town_tasks = task_list('coordinator_town_tasks', :town)
     @cleanup_tasks = task_list('coordinator_hunting_cleanup', :cleanup)
@@ -217,6 +220,7 @@ class Coordinator
   end
 
   def schedule_hold_reason
+    return 'burglary arrest/exit unresolved; operator reconciliation required' if UserVars.respond_to?(:drbot_burglary_hold) && !UserVars.drbot_burglary_hold.nil?
     return @task_hold if @task_hold
     custody_hold = UserVars.drbot_weapon_custody_hold
     if performance_custody_scope? && !custody_hold.nil? && !custody_hold.is_a?(Hash)

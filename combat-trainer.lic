@@ -215,6 +215,17 @@ class SetupProcess
       return
     end
 
+    # A positively refused ammunition load is unavailable for this trainer run.
+    # Keep the original mapping for weapon cleanup, filtering only selection.
+    if game_state.respond_to?(:ammunition_unavailable?)
+      weapon_training = weapon_training.reject { |_skill, name| game_state.ammunition_unavailable?(name) }
+      if weapon_training.empty?
+        DRC.message('***STATUS*** No weapon with available ammunition remains; stopping hunt')
+        $HUNTING_BUDDY&.stop_hunting
+        $COMBAT_TRAINER&.stop
+        return
+      end
+    end
     return unless game_state.skill_done? || !weapon_training[game_state.weapon_skill] || ending_ranged
 
     # skip_all_weapon_max_check is a kludge for a transient condition from blacklisting a skill with
@@ -225,7 +236,7 @@ class SetupProcess
       # through to weapon selection so one gets picked (5b becomes 5a).
       if weapon_training.reject { |skill, _| DRSkill.getxp(skill) == 34 }.empty?
         locked_skills = weapon_training.keys.join(', ')
-        if game_state.weapon_skill
+        if game_state.weapon_skill && weapon_training.key?(game_state.weapon_skill)
           unless @all_locked_warned
             @all_locked_warned = true
             DRC.message("*** combat-trainer: All weapon_training skills mindlocked (#{weapon_training.size}): #{locked_skills}")
@@ -1345,7 +1356,13 @@ class LootProcess
   # creature-type metadata for skin/dissection configuration. Never silently
   # substitute another same-named corpse after decay or another hunter's loot.
   def harvest_corpse_identity?(mob_noun)
-    return DRRoom.dead_npcs.first == mob_noun unless @drbot_harvest_ids
+    unless @drbot_harvest_ids
+      # Bare harvest commands act on the game's corpse order, not Lich's
+      # alphabetical list. A mixed room cannot prove the selected noun.
+      # Defer without touching either corpse until it is unambiguous.
+      corpses = Array(DRRoom.dead_npcs)
+      return corpses.first == mob_noun && corpses.map { |name| name.to_s.split.last }.uniq == [mob_noun.to_s.split.last]
+    end
 
     return false unless defined?(Lich::DragonRealms::Creature)
     room = [Room.current&.id, XMLData.room_id]
@@ -1608,7 +1625,7 @@ class LootProcess
       if @arrange_for_dissect
         arrange_mob(mob_noun, game_state)
         already_arranged = true
-        return if @harvest_corpse_gone
+        return if @harvest_corpse_gone || @drbot_harvest_deferred || @harvest_stopped
       end
 
       if game_state.skinnable?(mob_noun)
@@ -1618,21 +1635,17 @@ class LootProcess
       end
 
       if skill_to_train == 'First Aid' || skill_to_train == 'Thanatology'
-        # A DISSECT that teaches nothing ("You'll gain no insights from this
-        # attempt") returns false, so the corpse still gets its arrange and
-        # skin: upstream's intent since 2023, and that reply has not appeared
-        # in the fleet's retained hunt logs.
         unless dissected?(mob_noun, game_state) || @harvest_corpse_gone
           arrange_mob(mob_noun, game_state) unless already_arranged
-          check_skinning(mob_noun, game_state) if @skin && !@harvest_corpse_gone
+          check_skinning(mob_noun, game_state) if @skin && !@harvest_corpse_gone && !@drbot_harvest_deferred && !@harvest_stopped
         end
       elsif skill_to_train == 'Skinning'
         arrange_mob(mob_noun, game_state) unless already_arranged
-        check_skinning(mob_noun, game_state) if @skin && !@harvest_corpse_gone
+        check_skinning(mob_noun, game_state) if @skin && !@harvest_corpse_gone && !@drbot_harvest_deferred && !@harvest_stopped
       end
     elsif @skin && game_state.skinnable?(mob_noun)
       arrange_mob(mob_noun, game_state) unless already_arranged
-      check_skinning(mob_noun, game_state) unless @harvest_corpse_gone
+      check_skinning(mob_noun, game_state) unless @harvest_corpse_gone || @drbot_harvest_deferred || @harvest_stopped
     else
       return
     end
@@ -1712,13 +1725,6 @@ class LootProcess
                       /(?:You cannot do the delicate work necessary because you )?lack a suitably small, bladed weapon/,
                       'You need at least one free hand',
                       'hard to accomplish while concealed')
-    if result =~ /You'll gain no insights from this attempt/
-      waitrt?
-      if harvest_corpse_present?(mob_noun, game_state)
-        confirm = @drbot_harvest_ids ? dissect_target(mob_noun) : ''
-        fput("dissect #{confirm}".strip) if confirm
-      end
-    end
     recovered = recover_lowered_item(lowered)
     restored = restore_skinning_weapon(game_state)
     return false unless recovered && restored
@@ -1739,7 +1745,9 @@ class LootProcess
       note_dissect_learning(first_aid_before) unless @dissect_for_thanatology
       return true
     when /You'll gain no insights from this attempt/
-      return false
+      # The attempt consumed this corpse's harvest choice; do not confirm or
+      # follow it with SKIN. A new command needs its own observed result.
+      return true
     when /hard to accomplish while concealed/
       # Not performed: concealment began after the check above.
       note_concealed_dissect
@@ -1830,6 +1838,11 @@ class LootProcess
     # pass. Reset the exact native success flag before this attempt so an old
     # bundle message cannot authorize corpse disposal. Final LOOK/ASSESS still
     # checks current custody and engagement before loot.
+    lowered = free_hand_for_dissect
+    if lowered == false
+      restore_skinning_weapon(game_state)
+      return
+    end
     Flags.reset('ct-successful-skin')
     snap = [DRC.left_hand, DRC.right_hand]
     skin_result = DRC.bput("skin #{harvest_corpse_selector}".strip, 'roundtime', 'skin what', 'cannot be skinned', 'carrying far too many items', 'need a more appropriate weapon', 'need to have a bladed instrument to skin', 'You must have one hand free to skin')
@@ -1841,13 +1854,7 @@ class LootProcess
 
     case skin_result
     when 'You must have one hand free to skin'
-      return if hand_retry
-
-      temp_item = DRC.left_hand
-      if DRCI.lower_item?(temp_item)
-        check_skinning(mob_noun, game_state, true)
-        DRCI.get_item?(temp_item)
-      end
+      # Hands changed after the preflight; do not replay this harvest.
       return
     when 'need a more appropriate weapon', 'need to have a bladed instrument to skin'
       DRC.message('BUY A SKINNING KNIFE')
@@ -1895,6 +1902,10 @@ class LootProcess
     end
     DRCI.dispose_trash(DRC.left_hand) if snap.first != DRC.left_hand && !@equipment_manager.is_listed_item?(DRC.left_hand)
     DRCI.dispose_trash(DRC.right_hand) if snap.last != DRC.right_hand && !@equipment_manager.is_listed_item?(DRC.right_hand)
+  ensure
+    # Native skin cleanup consumes/stows the harvest before recovering the
+    # shield. Recovering sooner would need a third hand or misidentify it as loot.
+    recover_lowered_item(lowered) if lowered
   end
 
   def prepare_skinning_knife(game_state, purpose = :skin)
@@ -1984,6 +1995,10 @@ class LootProcess
   # dissect_barren_limit), stop for the run and take the arrange and SKIN
   # path, which gives the configured bones or skins.
   def note_dissect_learning(before)
+    unless DRSkill.respond_to?(:include?) && DRSkill.include?('First Aid')
+      @dissect_barren = 0
+      return
+    end
     if DRSkill.getxp('First Aid').to_i > before.to_i
       @dissect_barren = 0
       return
@@ -5387,9 +5402,14 @@ class AttackProcess
         if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?) && load_weapon_result.to_s.empty?
           return
         end
-        load_weapon_result = DRC.bput('load arrows', *load_weapon_success, *load_weapon_failure) unless Flags['ct-ranged-loaded'] || (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+        load_weapon_result = DRC.bput('load arrows', *load_weapon_success, *load_weapon_failure) if load_weapon_result.to_s.empty? && !Flags['ct-ranged-loaded'] && !(game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
         case load_weapon_result
         when *load_weapon_failure
+          if load_weapon_result.to_s.match?(/You don't have the proper ammunition/)
+            game_state.note_ammunition_unavailable
+            abort_attack_aimed(game_state)
+            return
+          end
           dual_load = false # fallback to single load
           game_state.loaded = false
           @firing_check = 0
@@ -5410,7 +5430,7 @@ class AttackProcess
                              else
                                DRC.bput("load my #{game_state.weapon_name}", { 'timeout' => 1, 'suppress_no_match' => true }, *load_weapon_success, *load_weapon_failure)
                              end
-        load_weapon_result = DRC.bput("load my #{game_state.weapon_name}", *load_weapon_success, *load_weapon_failure) unless Flags['ct-ranged-loaded'] || (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
+        load_weapon_result = DRC.bput("load my #{game_state.weapon_name}", *load_weapon_success, *load_weapon_failure) if load_weapon_result.to_s.empty? && !Flags['ct-ranged-loaded'] && !(game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
         return if load_weapon_result == :deadline_stopped
         if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?) && load_weapon_result.to_s.empty?
           game_state.stop_for_combat_stealth('unconfirmed load; reconcile before resuming')
@@ -5420,6 +5440,7 @@ class AttackProcess
 
         case load_weapon_result
         when *load_weapon_failure
+          game_state.note_ammunition_unavailable if load_weapon_result.to_s.match?(/You don't have the proper ammunition/)
           abort_attack_aimed(game_state)
           return
         when *load_weapon_success
@@ -6773,7 +6794,7 @@ class GameState
     held = drbot_melee_refusal_hold(observation)
     return held unless held.nil?
 
-    result = DRC.bput("engage #{observation.last}", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/, /^You will have to retreat from your current melee first/, /^You had better stand up first/, /^You spin around to face/)
+    result = DRC.bput("engage #{observation.last}", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/, /^You will have to retreat from your current melee first/, /^You had better stand up first/, /^You spin around to face/, /could not find/i)
     case result
     when /You are already (?:stealthily )?at melee/
       drbot_note_melee_target(observation)
@@ -6799,7 +6820,7 @@ class GameState
     return unless observation && @target_observation == observation
     return unless drbot_melee_refusal_hold(observation).nil?
 
-    case (result = DRC.bput("engage #{observation.last}", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/, /^You will have to retreat from your current melee first/, /^You had better stand up first/, /^You spin around to face/))
+    case (result = DRC.bput("engage #{observation.last}", /^You (are already|begin to) (stealthily )?(advanc(e|ing)|at melee)/, /^There is nothing else/, /is already quite dead/, /^What do you want to advance towards/, /^You will have to retreat from your current melee first/, /^You had better stand up first/, /^You spin around to face/, /could not find/i))
     when /You are already advancing/, /You begin to advance/, /You begin to stealthily advance/
       drbot_note_melee_advance(observation) if result.match?(/You begin to/)
       pause 2
@@ -7196,7 +7217,7 @@ class GameState
   # Individual creature identity does not depend on shared group attribution.
   # Roll out strict corpse IDs only where the live ID collector is exercised.
   def drbot_corpse_ids?
-    @drbot_supervised_group == 'lvt-goblins' || (@drbot_own_kill_harvest == true && @drbot_server_id_targeting == true)
+    @drbot_supervised_group == 'lvt-goblins' || @drbot_server_id_targeting == true
   end
 
   def drbot_own_kills_only?
@@ -7392,6 +7413,11 @@ class GameState
       context = drbot_target_context
       return nil unless context && context[:npcs].all? { |name| name.is_a?(String) && name.match?(/\A[a-zA-Z][a-zA-Z '-]*\z/) }
       order, excluded = drbot_melee_target_order(context)
+      # A live ID can still be hidden and unavailable to ENGAGE. Keep it in
+      # the full safety census, excluding it only from this melee selection.
+      excluded |= Lich::DragonRealms::Creature.targets.filter_map do |creature|
+        creature.id.to_s if creature.respond_to?(:crtr_flag?) && creature.crtr_flag?(:hidden)
+      end
       target = drbot_capture_living_target(excluded, order: order)
       return nil unless target && drbot_living_target_current?(target) && context == drbot_target_context
 
@@ -7779,6 +7805,17 @@ class GameState
 
   def weapon_training
     @weapons_to_train
+  end
+
+  # A known missing-ammunition reply is not an unknown command result. Never
+  # select that weapon again in this trainer run, including action-count focus.
+  def note_ammunition_unavailable
+    @ammunition_unavailable ||= []
+    @ammunition_unavailable |= [weapon_name]
+  end
+
+  def ammunition_unavailable?(name)
+    Array(@ammunition_unavailable).include?(name)
   end
 
   def weapon_name
@@ -9238,6 +9275,10 @@ class GameState
   end
 
   def capture_enemy_analyze(train_only: false)
+    # ASSESS from hiding omits opponents. Leave an armed recipe untouched and
+    # do not poison target retry state through an impossible hidden census.
+    return false if respond_to?(:checkhidden, true) && checkhidden
+
     sequence = enemy_analyze_sequence
     return false unless @use_analyze_combos || train_only
     return false unless can_engage?

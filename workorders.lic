@@ -179,6 +179,7 @@ class WorkOrders
   end
 
   def work_order(discipline, repair, turnin)
+    @pass_started ||= Process.clock_gettime(Process::CLOCK_MONOTONIC)
     @settings = get_settings
     @worn_trashcan = @settings.worn_trashcan
     @worn_trashcan_verb = @settings.worn_trashcan_verb
@@ -412,6 +413,8 @@ class WorkOrders
     below = bounded_setting(:workorders_chain_below_mindstate, nil, 1..34)
     return unless below && @orders_turned_in < limit
 
+    return unless next_order_fits_pass?
+
     mindstate = DRSkill.getxp(skill)
     unless mindstate.is_a?(Integer) && mindstate < below
       Lich::Messaging.msg('plain', "WorkOrders: #{skill} mindstate #{mindstate.inspect} is not below #{below}; no further order this pass")
@@ -419,6 +422,31 @@ class WorkOrders
     end
     Lich::Messaging.msg('plain', "WorkOrders: #{skill} mindstate #{mindstate} is below #{below}; requesting order #{@orders_turned_in + 1} of #{limit} this pass")
     work_order(discipline, repair, turnin)
+  end
+
+  # Exact-stock mode smelts one piece per batch. Reserve that worst case
+  # even when ordinary stock could combine two pieces in one crucible load.
+  def next_order_fits_pass?
+    deadline = bounded_setting(:train_forging_deadline_seconds, nil, 1..86_400)
+    per_piece = bounded_setting(:workorders_minutes_per_piece, 6, 1..60)
+    items = bounded_setting(:workorder_max_items, 4, 1..100)
+    estimate = (items * per_piece + items * SMELT_MINUTES +
+                bounded_setting(:workorders_turnin_minutes, 15, 0..60)) * 60
+    started = @pass_started ||= Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    return true if deadline && elapsed + estimate <= deadline
+
+    Lich::Messaging.msg('plain', "WorkOrders: No further order this pass: #{elapsed.ceil}s elapsed plus #{estimate}s next-order reserve exceeds deadline #{deadline.inspect}")
+    false
+  end
+
+  def require_request_pass_budget!
+    return if next_order_fits_pass?
+
+    stow_tool('logbook') if held_logbook?('forging')
+    status = @orders_turned_in.to_i.positive? ? 'turned_in' : 'kept_short_time'
+    publish_result(status, 'pass deadline leaves insufficient whole-order reserve; no request')
+    exit
   end
 
   # Why a resumed order must not be bought for: too few roisaen left (read by
@@ -815,6 +843,16 @@ class WorkOrders
   # nothing until the logbook confirms exactly the accepted order.
   def request_confirmed_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
     exit unless safe_forging_stock_preflight(recipes, any_recipe: true)
+    require_request_pass_budget!
+    # Fund before accepting debt. The material budget bounds the whole order;
+    # smith keeps a separate 3,000-copper reserve after purchasing its stock.
+    required_cash = [@cash_on_hand || 5000, (@material_budget || 5000) + 3000].max
+    unless DRCM.ensure_copper_on_hand(required_cash, @settings, @hometown) == true
+      Lich::Messaging.msg('bold', 'WorkOrders: BLOCKED cannot fund a whole order plus smith reserve; no request')
+      publish_result('no_suitable_offer', 'cannot fund a whole order plus smith reserve; no request')
+      exit
+    end
+    require_request_pass_budget!
     requested = request_work_order(
       recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff,
       max_requests: max_requests, allow_bundled_cleanup: false
@@ -2557,6 +2595,9 @@ class WorkOrders
         bounded_stop = 'previous unspent-offer receipt could not be cleared'
         break
       end
+      # Roaming, funding and durable receipt writes can consume the reserve;
+      # recheck immediately beside every bounded ASK, including replacements.
+      require_request_pass_budget! unless allow_bundled_cleanup
       result = DRC.bput("ask #{npc} for #{diff} #{discipline} work", *WORK_ORDER_REQUEST_PATTERNS)
       case result
       when /^To whom/
