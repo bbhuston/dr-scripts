@@ -69,13 +69,87 @@ class Burgle
     # Capture this exact child's pause list. On normal exits and early returns
     # unpause it once; an unknown/inside-house exit must retain the pause.
     paused_scripts = @scripts_to_unpause
+    pause_script = Script.current
+    pause_identity = [XMLData.name.to_s.dup.freeze, XMLData.game.to_s.dup.freeze].freeze
+    pause_control_present = defined?($DRBOT_DIRECT_CONTROL) ? true : false
+    pause_control = pause_control_present ? $DRBOT_DIRECT_CONTROL : nil
+    pause_lock = defined?($safe_pause_lock) && $safe_pause_lock
+    pause_root = pause_control.is_a?(Hash) && Array(pause_control['scripts']).first
+    pause_binding = pause_control.is_a?(Hash) && pause_control.values_at('session', 'producer', 'watchdog_epoch', 'fence_epoch').map do |value|
+      value.is_a?(String) ? value.dup.freeze : value
+    end.freeze
+    # safe_pause_list returns names; retain their exact current instances so a
+    # later same-name script cannot inherit another child's release.
+    pause_names_valid = paused_scripts.is_a?(Array) && paused_scripts.uniq == paused_scripts &&
+      paused_scripts.all? { |name| name.is_a?(String) && !name.empty? }
+    paused_instances = Array(paused_scripts).map do |name|
+      matches = Script.list.select { |instance| instance.name == name }
+      matches.one? ? matches.first : nil
+    end.freeze
     before_dying do
-      title = XMLData.room_title
-      if title.is_a?(String) && !title.empty? && !title.match?(ROOM_TITLE_PATTERN)
-        DRC.safe_unpause_list(paused_scripts)
+      @drbot_burglary_release_pause.call if @drbot_burglary_release_pause
+    end
+    @drbot_burglary_release_pause = lambda do
+      next true if @drbot_burglary_pause_released
+      release = lambda do
+        current_control_present = defined?($DRBOT_DIRECT_CONTROL) ? true : false
+        current_control = current_control_present ? $DRBOT_DIRECT_CONTROL : nil
+        current_control = nil unless current_control.is_a?(Hash)
+        ancestry, ancestor = [], pause_script
+        while ancestor && !ancestry.any? { |instance| instance.equal?(ancestor) }
+          ancestry << ancestor
+          break if ancestor.equal?(pause_root)
+          ancestor = ancestor.respond_to?(:__parent_script, true) ? ancestor.__send__(:__parent_script) : nil
+        end
+        same_owner = pause_identity.all? { |value| !value.empty? } &&
+          [XMLData.name.to_s, XMLData.game.to_s] == pause_identity && Script.current.equal?(pause_script) &&
+          Script.list.any? { |instance| instance.equal?(pause_script) } &&
+          if pause_control.is_a?(Hash)
+            pause_binding[0, 3].all? { |value| value.is_a?(String) && !value.empty? } &&
+              pause_binding[3].is_a?(Integer) && pause_binding[3].positive? && current_control.equal?(pause_control) &&
+              pause_control.values_at('session', 'producer', 'watchdog_epoch', 'fence_epoch') == pause_binding &&
+              Array(pause_control['scripts']).first.equal?(pause_root) && ancestor.equal?(pause_root) &&
+              ancestry.all? { |entry| Script.list.any? { |resident| resident.equal?(entry) } }
+          else
+            !pause_control_present && !current_control_present
+          end
+        live_owner = same_owner && (!pause_control_present || (pause_control.is_a?(Hash) && pause_control['mode'] == 'B' && pause_control['script'] == 'lifecycle' &&
+          pause_control['closed'] == false && pause_control['fenced'] == false && pause_control['guardian_recovering'] != true &&
+          [nil, 'SAFE', 'ARMED'].include?(pause_control['safety_state']) &&
+          pause_control['pending_result'] == false && pause_control['confirm_by'].nil?))
+        same_parents = pause_names_valid && paused_instances.none?(&:nil?) &&
+          paused_scripts.zip(paused_instances).all? do |name, instance|
+            matches = Script.list.select { |resident| resident.name == name }
+            matches.one? && matches.first.equal?(instance) && instance.paused? && !instance.stopping?
+          end
+        custody_settled = UserVars.drbot_burglary_hold.nil? && UserVars.drbot_custody_hold.nil? && UserVars.drbot_weapon_custody_hold.nil?
+        policy = defined?(DrbotLifecycleDeadline) && DrbotLifecycleDeadline.current
+        settled = checkrt == 0 && checkcastrt == 0 && (!policy || policy.command_settled?)
+        title = XMLData.room_title
+        lock_owned = defined?($safe_pause_lock) && $safe_pause_lock.equal?(pause_lock) && pause_lock.respond_to?(:owned?) && pause_lock.owned?
+        if title.is_a?(String) && !title.empty? && !title.match?(ROOM_TITLE_PATTERN) && live_owner && same_parents && custody_settled && settled && lock_owned
+          # Existing helper releases its own lock. Never transfer lock ownership
+          # or directly unpause scripts from Lich's separate cleanup thread.
+          begin
+            DRC.safe_unpause_list(paused_scripts)
+          ensure
+            @drbot_burglary_pause_released = !pause_lock.owned? && paused_instances.none?(&:paused?)
+          end
+        else
+          if same_owner && UserVars.drbot_burglary_hold.nil?
+            UserVars.drbot_burglary_hold = { 'reason' => 'burgle exit room, custody or producer unresolved', 'since' => Time.now.to_f }
+          end
+          DRC.message('***STATUS*** Burglary exit unverified; paused scripts retained')
+          false
+        end
+      end
+      if pause_control.is_a?(Hash) && pause_control['lock'].respond_to?(:synchronize)
+        pause_control['lock'].synchronize { release.call }
+      elsif !pause_control_present
+        release.call
       else
-        UserVars.drbot_burglary_hold ||= { 'reason' => 'burgle exited inside or without a confirmed room', 'since' => Time.now.to_f }
-        DRC.message('***STATUS*** Burglary stranded; paused scripts retained')
+        DRC.message('***STATUS*** Burglary cleanup lock unavailable; paused scripts retained')
+        false
       end
     end
 
@@ -442,7 +516,9 @@ class Burgle
   end
 
   def end_burgle
-    # The instance-bound before_dying hook owns the single release.
+    # Natural completion still owns the native pause mutex. The cleanup-thread
+    # callback invokes the same guarded closure and never repeats a release.
+    @drbot_burglary_release_pause.call if @drbot_burglary_release_pause
     exit
   end
 

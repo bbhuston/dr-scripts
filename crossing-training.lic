@@ -758,9 +758,10 @@ class CrossingTraining
   def train_thievery
     return if @researching
 
-    if @settings.train_with_burgle && ready_to_use?('Thievery')
+    # event_loop already consumed this selected skill's timer before dispatch.
+    # The other skills may borrow a ready Thievery turn, but this is that turn.
+    if @settings.train_with_burgle
       return unless UserVars.drbot_burglary_hold.nil?
-      update_timer('Thievery')
       DRC.wait_for_script_to_complete('burgle', ['start'])
       return unless UserVars.drbot_burglary_hold.nil?
     end

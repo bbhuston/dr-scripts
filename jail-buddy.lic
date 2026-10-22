@@ -62,7 +62,7 @@ end
 def get_out_of_jail(old_loc)
   burgle_arrest = Script.running?('burgle')
   if burgle_arrest
-    UserVars.drbot_burglary_hold ||= { 'reason' => 'arrest during burglary; reconcile gear and debt', 'since' => Time.now.to_f }
+    UserVars.drbot_burglary_hold = { 'reason' => 'arrest during burglary; reconcile gear and debt', 'since' => Time.now.to_f } if UserVars.drbot_burglary_hold.nil?
   end
   pause 1 until DRC.pause_all
 
@@ -105,6 +105,10 @@ def get_out_of_jail(old_loc)
         return
       end
     end
+  end
+  if !UserVars.drbot_burglary_hold.nil? || !UserVars.drbot_custody_hold.nil? || !UserVars.drbot_weapon_custody_hold.nil?
+    DRC.message('***STATUS*** Arrest custody unresolved; scripts remain paused for operator reconciliation')
+    return
   end
   DRC.unpause_all
 end
