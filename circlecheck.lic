@@ -50,7 +50,7 @@ module DrbotProgressionCache
       raise Unknown, 'EXP ALL rank table footer was not confirmed'
     end
     rows = lines.flat_map do |line|
-      line.scan(/(?:\A|\s{2,})([A-Za-z][A-Za-z '\-]+?):\s+(\d+)\s+(\d+(?:\.\d+)?)%/)
+      line.scan(/(?:\A|\s+)([A-Za-z][A-Za-z '\-]+?):\s+(\d+)\s+(\d+(?:\.\d+)?)%/)
     end
     raise Unknown, 'EXP ALL contained no skill observations' if rows.empty?
     names = rows.map { |name, _, _| name.strip }
