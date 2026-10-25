@@ -136,11 +136,12 @@ class CrossingTraining
     rescue NoMethodError
       {}
     end
-    skill = @settings.crossing_training
+    eligible_skills = @settings.crossing_training
                      .select { |s| ready_to_use?(s) }
                      .select { |s| not_research_blocked?(s) }
                      .reject { |s| @settings.crossing_training_stationary_skills_only && @skills_requiring_movement.include?(s) }
-                     .min_by { |s| [DRSkill.getxp(s), (timers[s] || Time.at(0)).to_f] }
+    skill = eligible_skills.min_by { |s| [DRSkill.getxp(s), (timers[s] || Time.at(0)).to_f] }
+    skill = DrbotLifecycleEntry.training_skill(self, skill, eligible_skills) if defined?(DrbotLifecycleEntry)
 
     check_tithe
     check_chadatru
