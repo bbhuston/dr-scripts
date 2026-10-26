@@ -1961,7 +1961,10 @@ class LootProcess
     end
     Flags.reset('ct-successful-skin')
     snap = [DRC.left_hand, DRC.right_hand]
-    skin_result = DRC.bput("skin #{harvest_corpse_selector}".strip,
+    skin_command = "skin #{harvest_corpse_selector}".strip
+    interruption = defined?(DrbotSoloPresenceCorpseContext) && DrbotSoloPresenceCorpseContext.current
+    previous_receipt = interruption && interruption[:command_receipt]
+    skin_result = DRC.bput(skin_command,
       /already been skinned/i, 'cannot be skinned', 'Some unfortunate mistakes',
       'You bumble the attempt', 'You claw wildly', 'You hack clumsily',
       'roundtime', 'skin what', 'carrying far too many items', 'need a more appropriate weapon',
@@ -1974,6 +1977,33 @@ class LootProcess
     @drbot_skin_failed = !@drbot_skin_succeeded && skin_result.to_s.match?(/cannot be skinned|Some unfortunate mistakes|You bumble the attempt|You claw wildly|You hack clumsily/i)
     recognized_refusal = skin_result.to_s.match?(/skin what|carrying far too many items|need a more appropriate weapon|need to have a bladed instrument to skin|You must have one hand free to skin/i)
     unless @drbot_skin_succeeded || @drbot_skin_failed || recognized_refusal
+      receipt = interruption && interruption[:command_receipt]
+      control = defined?($DRBOT_DIRECT_CONTROL) && $DRBOT_DIRECT_CONTROL
+      # An empty native bput also represents a command refused by the final
+      # safety gate. Restore only from a fresh receipt proving this invocation
+      # sent nothing, or every preceding retry was explicitly not executed.
+      # Deadline/empty result/pending=false alone cannot establish that fact.
+      cancelled = skin_result.to_s.empty? && interruption &&
+        DrbotSoloPresenceCorpseContext.current.equal?(interruption) &&
+        interruption[:process].equal?(self) && interruption[:state].equal?(game_state) &&
+        receipt.is_a?(Hash) && !receipt.equal?(previous_receipt) &&
+        receipt[:context].equal?(interruption) && receipt[:process].equal?(self) &&
+        receipt[:state].equal?(game_state) && receipt[:command] == skin_command &&
+        receipt[:cancelled_without_effect] == true && game_state.safety_stopping? &&
+        control.is_a?(Hash) && control.equal?(receipt[:control]) &&
+        control.values_at('session', 'producer') == receipt[:producer] &&
+        control['pending_result'] == false && control['confirm_by'].nil? &&
+        control['closed'] != true && control['fenced'] != true
+      if cancelled
+        @drbot_harvest_deferred = true
+        recovery_item = lowered
+        lowered = nil # Native recovery is attempted once, even on refusal.
+        return unless recover_lowered_item(recovery_item)
+
+        restore_skinning_weapon(game_state)
+        return
+      end
+      lowered = nil # An unknown written SKIN cannot authorize even the ensure's recovery write.
       return stop_for_skinning_knife('SKIN outcome could not be verified')
     end
     @drbot_harvest_corpse[:skinned] = true if @drbot_skin_succeeded && @drbot_harvest_ids && @drbot_harvest_corpse
