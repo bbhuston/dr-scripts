@@ -85,12 +85,45 @@ class CrossingFavor
       echo('Somehow you lost your primer, exiting.')
       exit
     end
-    DRC.bput("put my #{@aspect} primer on #{@altar_noun} altar", 'You reverently')
+    unless offer_primer
+      DRCI.stow_hands
+      DRC.message("The #{@altar_noun} altar did not take the primer; it is stowed and no prayer was started.")
+      exit
+    end
+    Flags.add('favor-contentment', 'An overwhelming sense of contentment')
     DRC.bput('pray', 'You begin')
-    waitfor('An overwhelming sense of contentment')
+    contented = false
+    360.times do
+      break if (contented = Flags['favor-contentment'])
+
+      pause 0.5
+    end
+    Flags.delete('favor-contentment')
+    unless contented
+      DRC.message("No orb appeared on the #{@altar_noun} altar within three minutes; leaving it.")
+      DRCI.stow_hands
+      exit
+    end
     DRC.bput("get orb from #{@altar_noun} altar", 'You get')
     DRC.fix_standing
     DRCI.stow_hands
+  end
+
+  # Another character's offering can already be on the altar ("You stop as
+  # you realize there is already an offering on the altar."). Wait for it to
+  # finish instead of praying over an empty altar and waiting forever.
+  def offer_primer
+    6.times do
+      case DRC.bput("put my #{@aspect} primer on #{@altar_noun} altar", 'You reverently', 'already an offering on the altar')
+      when 'You reverently'
+        return true
+      when 'already an offering on the altar'
+        pause 15
+      else
+        return false
+      end
+    end
+    false
   end
 
   def clean_altar
