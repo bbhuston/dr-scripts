@@ -931,7 +931,9 @@ class LootProcess
         break if @harvest_stopped
 
         stow_loot(item, game_state)
+        break if @drbot_box_stow_deferred
       end
+      @drbot_box_stow_deferred = false
       game_state.wield_whirlwind_offhand unless @harvest_stopped
     end
     return if @harvest_stopped
@@ -993,6 +995,15 @@ class LootProcess
         if line.match?(/\AYou put your #{Regexp.escape(item.split.last)} (?:in|into) your .+\.\z/i)
           stored = true
           break
+        end
+        # Full hands/stun/cooldown can prove no pickup happened. Leave the
+        # box on the floor for a later native tick, with no custody latch and
+        # no second attempt in this tick. A full pack or unknown result below
+        # still requires retention/reconciliation.
+        if line.match?(/\A(?:You need a free hand|You are still stunned|You are too busy|You don't seem to be able to move|Wait \d+|Sorry, you may only type ahead)/i) &&
+            [DRC.left_hand, DRC.right_hand].compact.none? { |name| loot_box?(name) }
+          @drbot_box_stow_deferred = true
+          return false
         end
         # A known nonexecution leaves floor items untouched. No retarget/retry.
         return if line.match?(/already in your inventory|Stow what|That can't be picked up|is not yours|rapidly decays away|cracks and rots away/i) &&
