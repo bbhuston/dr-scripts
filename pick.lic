@@ -234,8 +234,11 @@ class Pick
 
     @removed_items = @equipment_manager.remove_gear_by(&:hinders_lockpicking)
 
-    if DRC.left_hand || DRC.right_hand
-      DRC.message('Pick: Items are still in hands after removing hindering gear. Exiting.')
+    # A full pack can make EquipmentManager re-wear an unstorable piece.
+    # Empty hands then do not prove that the armor removal succeeded.
+    remaining = @equipment_manager.desc_to_items(@equipment_manager.get_combat_items).any?(&:hinders_lockpicking)
+    if DRC.left_hand || DRC.right_hand || remaining
+      DRC.message('Pick: Hindering gear removal/storage incomplete; restoring gear and retaining boxes. Exiting.')
       @equipment_manager.wear_items(@removed_items)
       exit
     end

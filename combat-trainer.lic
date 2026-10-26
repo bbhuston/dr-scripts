@@ -719,7 +719,7 @@ class LootProcess
     @autoloot_fill_gem_pouch_timer = Time.now
     echo("  @autoloot_fill_gem_pouch_timer: #{@autoloot_fill_gem_pouch_timer}") if $debug_mode_ct
 
-    @loot_delay = settings.loot_delay
+    @loot_delay = 0 # Harvest immediately; bput/final writer still pace results and roundtime.
     echo("  @loot_delay: #{@loot_delay}") if $debug_mode_ct
 
     @loot_timer = Time.now - @loot_delay
@@ -743,8 +743,8 @@ class LootProcess
     echo("  @last_rites: #{@last_rites}") if $debug_mode_ct
     @last_rites_timer = Time.now - 600
 
+    @box_nouns = get_data('items').box_nouns
     if settings.box_loot_limit
-      @box_nouns = get_data('items').box_nouns
       @box_loot_limit = settings.box_loot_limit
       @current_box_count = DRCI.count_all_boxes(settings)
       echo("  @current_box_count: #{@current_box_count}") if $debug_mode_ct
@@ -845,6 +845,9 @@ class LootProcess
   end
 
   def stow_loot(item, game_state)
+    return if @harvest_stopped
+    return stow_hunt_box(item, game_state) if loot_box?(item)
+
     Flags.reset('pouch-full')
     Flags.reset('pouch-needs-tie')
     Flags.reset('container-full')
@@ -906,6 +909,9 @@ class LootProcess
 
   def stow_lootables(game_state)
     return unless @loot_bodies
+    return if @harvest_stopped
+    held_box = [DRC.left_hand, DRC.right_hand].compact.find { |item| loot_box?(item) }
+    return stop_for_loot_storage(held_box, game_state) if held_box
 
     pair = [DRC.left_hand, DRC.right_hand]
     tried_loot = false
@@ -921,9 +927,14 @@ class LootProcess
       end
     if items_to_loot.any?
       game_state.sheath_whirlwind_offhand
-      items_to_loot.each { |item| stow_loot(item, game_state) }
-      game_state.wield_whirlwind_offhand
+      items_to_loot.each do |item|
+        break if @harvest_stopped
+
+        stow_loot(item, game_state)
+      end
+      game_state.wield_whirlwind_offhand unless @harvest_stopped
     end
+    return if @harvest_stopped
     return unless tried_loot
 
     pause 1
@@ -936,15 +947,84 @@ class LootProcess
       DRC.bput('glance', 'You glance .*')
     end
     if DRC.left_hand != pair.first && !@equipment_manager.is_listed_item?(DRC.left_hand)
+      return stop_for_loot_storage(DRC.left_hand, game_state) if loot_box?(DRC.left_hand)
+
       DRC.message("Out of room, failed to store: #{DRC.left_hand}")
       game_state.unlootable(DRC.left_hand_noun.downcase)
       DRCI.dispose_trash(DRC.left_hand)
     end
     if DRC.right_hand != pair.last && !@equipment_manager.is_listed_item?(DRC.right_hand)
+      return stop_for_loot_storage(DRC.right_hand, game_state) if loot_box?(DRC.right_hand)
+
       DRC.message("Out of room, failed to store: #{DRC.right_hand}")
       game_state.unlootable(DRC.right_hand_noun.downcase)
       DRCI.dispose_trash(DRC.right_hand)
     end
+  end
+
+  def loot_box?(item)
+    Array(@box_nouns).include?(item.to_s.split.last.to_s.downcase)
+  end
+
+  def stow_hunt_box(item, game_state)
+    held = [DRC.left_hand, DRC.right_hand].compact.any? { |name| loot_box?(name) }
+    return stop_for_loot_storage(item, game_state) if held
+    return if at_box_limit?
+
+    special = @loot_specials.find { |entry| entry['name'] == item }
+    if special
+      return stop_for_loot_storage(item, game_state) unless DRCI.get_item_unsafe(item) && DRCI.put_away_item?(item, special['bag'])
+    else
+      Flags.reset('container-full')
+      # One command, no blind BPUT retries. The pickup line (including fading
+      # from invisibility) is intermediate: only the final PUT confirms STOW.
+      waitrt?
+      clear
+      put "stow #{item}"
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 8.0
+      stored = false
+      while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+        line = get?
+        unless line
+          pause 0.05
+          next
+        end
+        line = line.gsub(/<[^>]*>/, '').strip
+        if line.match?(/\AYou put your #{Regexp.escape(item.split.last)} (?:in|into) your .+\.\z/i)
+          stored = true
+          break
+        end
+        # A known nonexecution leaves floor items untouched. No retarget/retry.
+        return if line.match?(/already in your inventory|Stow what|That can't be picked up|is not yours|rapidly decays away|cracks and rots away/i) &&
+          [DRC.left_hand, DRC.right_hand].compact.none? { |name| loot_box?(name) }
+        break if line.match?(/There isn't any more room|You just can't|push you over the item limit|You need a free hand|not designed to carry anything/i)
+      end
+      return stop_for_loot_storage(item, game_state) unless stored
+    end
+    pause 0.25
+    return stop_for_loot_storage(item, game_state) if [DRC.left_hand, DRC.right_hand].compact.any? { |name| loot_box?(name) }
+
+    @current_box_count += 1 if @box_loot_limit
+    true
+  end
+
+  def stop_for_loot_storage(item, game_state)
+    @harvest_stopped = true
+    record = { 'reason' => "combat-trainer box storage unconfirmed for #{item}; retain held items and reconcile before resuming", 'since' => Time.now.to_f }
+    begin
+      if defined?(UserVars)
+        UserVars.drbot_custody_hold ||= record
+        UserVars.save
+      end
+    rescue StandardError
+      DRC.message('*** combat-trainer: custody hold persistence unconfirmed')
+    ensure
+      game_state.begin_safety_cleanup if game_state.respond_to?(:begin_safety_cleanup)
+      $HUNTING_BUDDY&.stop_hunting
+      $COMBAT_TRAINER&.stop
+      DRC.message("***COORDINATOR HOLD*** #{record['reason']}")
+    end
+    false
   end
 
   def at_box_limit?
@@ -1228,8 +1308,6 @@ class LootProcess
       @searched_corpses = nil
       return
     end
-    return if Time.now - @loot_timer < @loot_delay
-    return if @drbot_harvest_retry_at && Time.now < @drbot_harvest_retry_at
     @drbot_harvest_deferred = false
     return unless DRRoom.npcs.is_a?(Array)
     # Operator direction 2026-09-25: harvest every corpse as soon as it drops,
@@ -1237,10 +1315,11 @@ class LootProcess
 
     waitrt?
     @drbot_harvest_corpse = nil
+    @drbot_harvest_ids = game_state.respond_to?(:drbot_corpse_ids?) && game_state.drbot_corpse_ids?
     return if searched_corpses_only?
     corpse = harvest_corpse_candidate(game_state)
     return unless harvest_corpse_present?(corpse, game_state)
-    return if harvest_peer_busy?
+    return if !@drbot_harvest_ids && harvest_peer_busy?
     game_state.mob_died = true
 
     if (Time.now - @last_rites_timer > 600) && @last_rites && game_state.blessed_room
@@ -1283,6 +1362,7 @@ class LootProcess
     return if @drbot_harvest_ids && @drbot_harvest_corpse && @drbot_harvest_corpse[:skinned]
     return if @harvest_stopped
 
+    @drbot_arrange_ruined = false
     arranges = 0
     type = @arrange_types[mob_noun] || 'skin'
     # "That creature cannot produce bones." is a property of the creature:
@@ -1305,8 +1385,9 @@ class LootProcess
       return unless harvest_corpse_present?(mob_noun, game_state)
 
       arranges += 1 # rubocop:disable Lint/UselessAssignment
-      case DRC.bput(arrange_message.squeeze(' '), 'You begin to arrange', 'You continue arranging', 'You make a mistake', 'You complete arranging', 'That creature cannot', 'That has already been arranged', 'Arrange what', 'cannot be skinned', 'You make a serious mistake in the arranging process', 'The .* is currently being arranged to produce', /already been skinned, there's no point/i)
+      case DRC.bput(arrange_message.squeeze(' '), 'You begin to arrange', 'You continue arranging', 'You make a mistake', 'You complete arranging', 'That creature cannot', 'That has already been arranged', 'Arrange what', 'cannot be skinned', 'You make a serious mistake in the arranging process', 'The .* is currently being arranged to produce', /already been skinned, there's no point/i, /You (?:do not|don.t) (?:know|have).*?(?:arrange all|technique|expertise)/i)
       when /already been skinned, there's no point/i
+        @drbot_skin_succeeded = true
         @drbot_harvest_corpse[:skinned] = true if @drbot_harvest_ids && @drbot_harvest_corpse
         return
       when 'Arrange what'
@@ -1315,12 +1396,24 @@ class LootProcess
         # refused the same way, so the pass goes straight to LOOT.
         @harvest_corpse_gone = true
         return
-      when 'You complete arranging', 'You make a serious mistake in the arranging process'
+      when 'You make a serious mistake in the arranging process'
+        @drbot_arrange_ruined = true
+        break
+      when 'You complete arranging'
         @arrange_part_accepted[mob_noun] = type if !plain && harvest_corpse_certain?(mob_noun)
         break
+      when /You (?:do not|don.t) (?:know|have).*?(?:arrange all|technique|expertise)/i
+        # Confirmed unsupported ALL: one downgrade per run, no timeout retry.
+        break unless @arrange_all
+
+        @arrange_all = false
+        @arrange_count = 5
+        arranges = 0
+        arrange_message = plain ? "arrange #{harvest_corpse_selector}" : "arrange #{harvest_corpse_selector} for #{type}"
       when 'That has already been arranged'
         break
       when 'cannot be skinned'
+        @drbot_skin_failed = true
         game_state.unskinnable(mob_noun)
         # This is a property of this creature type, not the whole hunt.
         break
@@ -1337,6 +1430,10 @@ class LootProcess
         arrange_message = @arrange_all ? "arrange #{harvest_corpse_selector} all" : "arrange #{harvest_corpse_selector}"
       when 'You begin to arrange', 'You continue arranging', 'You make a mistake'
         @arrange_part_accepted[mob_noun] = type if !plain && harvest_corpse_certain?(mob_noun)
+      else
+        # No recognized result: do not retry the corpse or advance to SKIN,
+        # DISSECT or LOOT on the assumption that nothing happened.
+        return stop_for_skinning_knife('ARRANGE outcome could not be verified')
       end
     end
   end
@@ -1413,9 +1510,8 @@ class LootProcess
     return false if mob_noun.nil? || mob_noun.empty?
 
     waitrt?
-    if harvest_peer_busy?
+    if !@drbot_harvest_ids && harvest_peer_busy?
       @drbot_harvest_deferred = true
-      @drbot_harvest_retry_at = Time.now + 2
       return false
     end
     # Refresh corpse custody after roundtime. Live enemies in the room do not
@@ -1425,16 +1521,14 @@ class LootProcess
     looked = result.to_s.match?(/^Obvious (?:paths|exits):/) && DRRoom.npcs.is_a?(Array)
     identified = looked && harvest_corpse_identity?(mob_noun)
     note_own_kill_miss if looked && !identified
-    ready = identified && !harvest_peer_busy?
+    ready = identified && (@drbot_harvest_ids || !harvest_peer_busy?)
     unless ready
       @drbot_harvest_deferred = true
-      @drbot_harvest_retry_at = Time.now + 2
     end
     !!ready
   rescue StandardError
     # Older or unavailable collectors cannot authorize group harvesting.
     @drbot_harvest_deferred = true
-    @drbot_harvest_retry_at = Time.now + 2
     false
   end
 
@@ -1570,7 +1664,19 @@ class LootProcess
     forget_searched_corpses(room, counts)
     return false unless room && !counts.empty?
 
+    if @drbot_harvest_ids && defined?(Lich::DragonRealms::Creature)
+      # A searched corpse can decay while a new same-named kill replaces it:
+      # equal noun counts are not evidence that this new server ID was looted.
+      corpses = Lich::DragonRealms::Creature.in_room.select { |entry| entry.crtr_flag?(:dead) }
+      return false unless corpses.length == Array(DRRoom.dead_npcs).length
+      return false unless corpses.all? { |entry| entry.id.to_s.match?(/\A[1-9]\d*\z/) }
+      return false unless corpses.map { |entry| entry.id.to_s }.uniq.length == corpses.length
+
+      return !corpses.empty? && corpses.all? { |entry| (@searched_corpse_ids || {}).key?(entry.id.to_s) }
+    end
     counts.all? { |noun, count| @searched_corpses[noun] && count <= @searched_corpses[noun][:count] }
+  rescue StandardError
+    false
   end
 
   def remember_searched_corpse(result)
@@ -1615,40 +1721,34 @@ class LootProcess
 
   def skin_or_dissect(mob_noun, game_state)
     @harvest_corpse_gone = false
+    @drbot_arrange_ruined = false
+    @drbot_skin_succeeded = false
+    @drbot_skin_failed = false
     return unless harvest_corpse_present?(mob_noun, game_state)
-    return unless (game_state.dissectable?(mob_noun) || game_state.skinnable?(mob_noun))
-    return unless (@dissect || @skin)
+    return unless @dissect || @skin
+    return if @drbot_harvest_ids && @drbot_harvest_corpse && @drbot_harvest_corpse[:skinned]
 
-    already_arranged = false
-
-    if @dissect && game_state.dissectable?(mob_noun)
-      if @arrange_for_dissect
-        arrange_mob(mob_noun, game_state)
-        already_arranged = true
-        return if @harvest_corpse_gone || @drbot_harvest_deferred || @harvest_stopped
-      end
-
-      if game_state.skinnable?(mob_noun)
-        skill_to_train = game_state.sort_by_rate_then_rank(@dissect_cycle_skills, @dissect_priority).first
-      else
-        skill_to_train = 'First Aid'
-      end
-
-      if skill_to_train == 'First Aid' || skill_to_train == 'Thanatology'
-        unless dissected?(mob_noun, game_state) || @harvest_corpse_gone
-          arrange_mob(mob_noun, game_state) unless already_arranged
-          check_skinning(mob_noun, game_state) if @skin && !@harvest_corpse_gone && !@drbot_harvest_deferred && !@harvest_stopped
-        end
-      elsif skill_to_train == 'Skinning'
-        arrange_mob(mob_noun, game_state) unless already_arranged
-        check_skinning(mob_noun, game_state) if @skin && !@harvest_corpse_gone && !@drbot_harvest_deferred && !@harvest_stopped
-      end
-    elsif @skin && game_state.skinnable?(mob_noun)
-      arrange_mob(mob_noun, game_state) unless already_arranged
-      check_skinning(mob_noun, game_state) unless @harvest_corpse_gone || @drbot_harvest_deferred || @harvest_stopped
-    else
-      return
+    # Skin before dissecting: a dissection consumes the skin. When Skinning
+    # is locked but First Aid can learn, prefer the existing dissection path.
+    dissect_eligible = @dissect && game_state.dissectable?(mob_noun) && !checkinvisible && !checkhidden
+    skin_first = @skin && game_state.skinnable?(mob_noun) &&
+      (!dissect_eligible || DRSkill.getxp('Skinning') < 34 || first_aid_locked?)
+    if skin_first || (@arrange_for_dissect && dissect_eligible)
+      arrange_mob(mob_noun, game_state)
+      return if @harvest_corpse_gone || @drbot_harvest_deferred || @harvest_stopped || @drbot_skin_succeeded
     end
+
+    if skin_first && game_state.skinnable?(mob_noun) && !@drbot_arrange_ruined
+      check_skinning(mob_noun, game_state)
+      return if @harvest_corpse_gone || @drbot_harvest_deferred || @harvest_stopped || @drbot_skin_succeeded
+      # Missing success is not failure proof. A timeout, a knife/capacity
+      # problem or an unrecognized reply must never authorize another harvest.
+      return unless @drbot_skin_failed
+    end
+    return if @harvest_corpse_gone || @drbot_harvest_deferred || @harvest_stopped
+    return if @drbot_harvest_ids && @drbot_harvest_corpse && @drbot_harvest_corpse[:skinned]
+
+    dissected?(mob_noun, game_state) if dissect_eligible && game_state.dissectable?(mob_noun)
   end
 
   def dissected?(mob_noun, game_state)
@@ -1792,9 +1892,14 @@ class LootProcess
   end
 
   def check_skinning(mob_noun, game_state, hand_retry = false)
+    @drbot_skin_succeeded = false
+    @drbot_skin_failed = false
     return unless game_state.skinnable?(mob_noun)
     return unless harvest_corpse_present?(mob_noun, game_state)
-    return if @drbot_harvest_ids && @drbot_harvest_corpse && @drbot_harvest_corpse[:skinned]
+    if @drbot_harvest_ids && @drbot_harvest_corpse && @drbot_harvest_corpse[:skinned]
+      @drbot_skin_succeeded = true
+      return
+    end
 
     if game_state.need_bundle
       case DRC.bput('tap my bundle', 'You tap a \w+ bundle\b.*that you are wearing', 'I could not find what you were referring to', 'You tap a tight bundle inside')
@@ -1845,9 +1950,24 @@ class LootProcess
     end
     Flags.reset('ct-successful-skin')
     snap = [DRC.left_hand, DRC.right_hand]
-    skin_result = DRC.bput("skin #{harvest_corpse_selector}".strip, 'roundtime', 'skin what', 'cannot be skinned', 'carrying far too many items', 'need a more appropriate weapon', 'need to have a bladed instrument to skin', 'You must have one hand free to skin')
+    skin_result = DRC.bput("skin #{harvest_corpse_selector}".strip,
+      /already been skinned/i, 'cannot be skinned', 'Some unfortunate mistakes',
+      'You bumble the attempt', 'You claw wildly', 'You hack clumsily',
+      'roundtime', 'skin what', 'carrying far too many items', 'need a more appropriate weapon',
+      'need to have a bladed instrument to skin', 'You must have one hand free to skin')
+    # Inspect hands before restore changes the weapon. The only newly held,
+    # unlisted item after this bound SKIN is its product. A roundtime line
+    # alone proves neither a successful skin nor a botch.
+    products = ([DRC.left_hand, DRC.right_hand].compact - snap.compact).reject { |item| @equipment_manager.is_listed_item?(item) }
+    @drbot_skin_succeeded = !!Flags['ct-successful-skin'] || !products.empty? || skin_result.to_s.match?(/already been skinned/i)
+    @drbot_skin_failed = !@drbot_skin_succeeded && skin_result.to_s.match?(/cannot be skinned|Some unfortunate mistakes|You bumble the attempt|You claw wildly|You hack clumsily/i)
+    recognized_refusal = skin_result.to_s.match?(/skin what|carrying far too many items|need a more appropriate weapon|need to have a bladed instrument to skin|You must have one hand free to skin/i)
+    unless @drbot_skin_succeeded || @drbot_skin_failed || recognized_refusal
+      return stop_for_skinning_knife('SKIN outcome could not be verified')
+    end
+    @drbot_harvest_corpse[:skinned] = true if @drbot_skin_succeeded && @drbot_harvest_ids && @drbot_harvest_corpse
     return unless restore_skinning_weapon(game_state)
-    if Flags['ct-successful-skin']
+    if @drbot_skin_succeeded
       @drbot_harvest_deferred = false
       @drbot_harvest_retry_at = nil
     end
@@ -1867,7 +1987,8 @@ class LootProcess
       # A vanished corpse or temporary capacity limit says nothing about the noun.
       return
     end
-    pause 1
+    return if @drbot_skin_failed
+
     waitrt?
     if game_state.need_bundle && snap != [DRC.left_hand, DRC.right_hand]
       stored_moon = false
@@ -5148,6 +5269,13 @@ class AttackProcess
              end
     waitrt?
     return :stealth_stopped if result == :deadline_stopped
+    if result == :target_lost
+      # The guarded writer proved no command was sent to this departed ID.
+      # Keep loaded ammunition and settle only the old aim before selecting
+      # another target. An unknown written reply never returns this status.
+      drbot_cancel_identity_aim(game_state)
+      return :target_lost
+    end
 
     if (game_state.respond_to?(:combat_stealth_always?) && game_state.combat_stealth_always?)
       if result.to_s.empty?
@@ -5360,7 +5488,7 @@ class AttackProcess
         load_weapon_success = [
           /\AYou reach (?:into .+|down to your feet) to load .+ with .+\.\z/,
           /\AYou (?:carefully )?load\b.+/,
-          /\A(?:Your|The) .+already loaded[.!]?\z/i,
+          /\A(?:Your|The) #{Regexp.escape(game_state.weapon_name)} is already loaded(?: with [^.!?\r\n]+)?\.\z/i,
           /\AA rapid series of clicks\b.+/,
           /\AYou push\b.+into firing position[.!]?\z/,
           /\AYou realize readying\b.+/,
@@ -5602,6 +5730,10 @@ class AttackProcess
                DRC.bput(command, *aim_success_messages, *unloaded_messages, *no_enemy_messages, *wait_and_retry_messages)
              end
     return if result == :deadline_stopped
+    if result == :target_lost
+      drbot_cancel_identity_aim(game_state)
+      return
+    end
     case result
     when *aim_success_messages
       if game_state.drbot_identity_targets? && !game_state.drbot_living_target_current?(@drbot_aim_target)
@@ -8947,10 +9079,20 @@ class GameState
     true
   end
 
+  # Absence is known only from a complete census in the same room generation.
+  # A failed census, room transition or rebound target is uncertainty, not a
+  # no-action cancellation receipt.
+  def combat_stealth_target_missing?(target)
+    context = drbot_target_context
+    target && context && context[:room] == target[:room] &&
+      context[:room_count] == target[:generation] && context[:xml_room] == target[:xml_room] &&
+      !context[:ids].include?(target[:id])
+  end
+
   # Chain the existing harvest predicate and recheck this original attempt
   # at the watchdog's post-wait socket boundary. Only an actual cutoff with
   # unchanged pre-write count may report a known not-attempted cancellation.
-  def combat_stealth_guarded_put(command, token, before_write, retry_limit: nil)
+  def combat_stealth_guarded_put(command, token, before_write, retry_limit: nil, target: nil)
     outcome = {}
     previous = Thread.current.thread_variable_get(:drbot_combat_stealth_write)
     prior_guard = Thread.current.thread_variable_get(:drbot_final_write_guard)
@@ -8959,6 +9101,10 @@ class GameState
       next true unless actual == command && combat_stealth_safe? &&
         combat_stealth_producer_current?(token, idle: true) &&
         (!before_write || token.first['write_count'] == before_write)
+      if target && !drbot_living_target_current?(target)
+        outcome[:target_lost] = true if combat_stealth_target_missing?(target)
+        next true
+      end
       if retry_limit && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= retry_limit
         outcome[:budget] = true
         next true
@@ -9042,7 +9188,8 @@ class GameState
     target = nil
     if drbot_identity_targets? && (id = command[/\s+#(\d+)\z/, 1])
       context = drbot_target_context
-      return stop.call('hidden ranged target census unavailable') unless context && context[:ids].include?(id)
+      return stop.call('hidden ranged target census unavailable') unless context
+      return :target_lost unless context[:ids].include?(id)
       target = { id: id, room: context[:room], generation: context[:room_count], xml_room: context[:xml_room] }.freeze
     end
     retry_limit = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 60.0
@@ -9050,20 +9197,29 @@ class GameState
       return stop.call('confirmed ranged cooldown bounded retry budget exhausted') if
         attempt.positive? && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= retry_limit
       if attempt.positive?
-        return stop.call('hidden ranged retry target changed') if target && !drbot_living_target_current?(target)
+        if target && !drbot_living_target_current?(target)
+          return :target_lost if combat_stealth_target_missing?(target)
+          return stop.call('hidden ranged retry target changed')
+        end
         return nil unless require_combat_hiding('after confirmed ranged cooldown', retry_limit: retry_limit)
       end
       expected_write = nil
       dispatch = proc do
         next 'hidden ranged dispatch interrupted' unless combat_stealth_safe? &&
           combat_stealth_producer_current?(token, idle: true) && hiding?
-        next 'hidden ranged retry target changed' if target && !drbot_living_target_current?(target)
+        if target && !drbot_living_target_current?(target)
+          next :target_lost if combat_stealth_target_missing?(target)
+          next 'hidden ranged retry target changed'
+        end
         clear
         if token.is_a?(Array)
           next 'hidden ranged write counter unavailable' unless token.first['write_count'].is_a?(Integer)
           expected_write = token.first['write_count'] + 1
         end
-        outcome = combat_stealth_guarded_put(command, token, expected_write && expected_write - 1, retry_limit: retry_limit)
+        outcome = combat_stealth_guarded_put(command, token, expected_write && expected_write - 1,
+          retry_limit: retry_limit, target: target)
+        next :target_lost if outcome[:target_lost] && expected_write && token.first['write_count'] == expected_write - 1 &&
+          combat_stealth_producer_current?(token, idle: true)
         next 'confirmed ranged cooldown bounded retry budget exhausted before dispatch' if outcome[:budget] &&
           expected_write && token.first['write_count'] == expected_write - 1 && combat_stealth_producer_current?(token, idle: true)
         next :deadline if outcome[:deadline] && expected_write && token.first['write_count'] == expected_write - 1 &&
@@ -9073,6 +9229,7 @@ class GameState
       end
       dispatched = token.is_a?(Array) ? token.first['lock'].synchronize { dispatch.call } : dispatch.call
       return :deadline_stopped if dispatched == :deadline
+      return :target_lost if dispatched == :target_lost
       return stop.call(dispatched) unless dispatched == :written
       reply = combat_stealth_read_result(token, expected_write, patterns)
       case reply[:status]

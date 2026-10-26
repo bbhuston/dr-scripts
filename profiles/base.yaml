@@ -125,13 +125,15 @@ combat_trainer_use_yiamura: false
 skinning:
   skin: true                     # Whether to skin or not
   arrange_all: false             # Whether to Arrange All, or not. Make sure to set arrange_count to 1
-  arrange_count: 0               # How many times to arrange
+  arrange_count: 5               # Full arrangement without an ARRANGE ALL technique
   arrange_for_dissect: true      # Whether to arrange when dissecting or not
-  tie_bundle: false              # Whether to tie bundles or not
-  dissect: false                 # Whether to dissect or not
-  dissect_priority:              # Skinning | First Aid | Thanatology - Breaks ties when mindstate is equal
+  tie_bundle: true               # Keep harvested products in the normal sale bundle
+  dissect: true                  # Fallback after a confirmed failed or unskinnable corpse
+  dissect_priority: Skinning      # Skin first; dissect only confirmed no-skin outcomes
   dissect_retry_once: false      # Whether to retry dissecting once on failure
   dissect_for_thanatology: false # Redeemed necros can turn off rituals entirely and use this instead
+  knife: skinning knife
+  knife_container: backpack
   arrange_types:                 # Hash of creature noun to the type of arranging to do. Defaults to skin.
     adder: part
     ape: skin
@@ -148,10 +150,11 @@ skinning:
     drake: bone
     elsralael: part
     gremlin: part
+    goblin: bone
     grendel: part
     grub: part
     hawk: part
-    hog: part
+    hog: skin
     kartais: part
     larva: part
     malchata: part
@@ -160,6 +163,7 @@ skinning:
     moruryn: part
     moth: part
     peccary: part
+    rat: bone
     sluagh: bone
     spider: part
     stalker: bone
@@ -470,7 +474,7 @@ autoloot_fill_gem_pouch_delay: 120
 # loot bodies after killing them
 loot_bodies: true
 # Delay for looting bodies, in seconds
-loot_delay: 5
+loot_delay: 0
 # dump junk when braiding or other training actions that generate junk.
 dump_junk: false
 # items to wait for before junking
@@ -756,9 +760,9 @@ loot_subtractions:
 # define a special way to handle certain loot.  See Sarvatt-setup
 loot_specials:
 # only loot up to this many boxes
-box_loot_limit:
+box_loot_limit: 10
 # if boxes: true is set in a hunt, then the hunt will only hunt until it gets this box minimum
-box_hunt_minimum: 1
+box_hunt_minimum: 10
 
 # Non-combat settings
 crossing_training_max_threshold: 28
@@ -1365,7 +1369,7 @@ refill_town:
 # the container that serves as your lockpick ring.
 lockpick_container: lockpick ring
 lockpick_type: ordinary
-picking_box_source:
+picking_box_source: backpack
 lockpick_dismantle:
 lockpick_room_id:
 # leave empty to use fill pouch only when no loot_specials are present or true = always and false = never

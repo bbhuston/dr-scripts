@@ -1907,18 +1907,51 @@ RSpec.describe LootProcess do
       expect(DRCI).to have_received(:put_away_item?).with('skinning knife', 'backpack').twice
     end
 
-    it 'falls back to arrange and skin for the refused corpse and skips DISSECT afterwards' do
+    it 'skins before dissection even when First Aid has the lower learning rate' do
       instance = build_dissector
-      dissect_reply(refused)
+      allow(DRSkill).to receive(:getxp).and_return(10)
       allow(game_state).to receive(:sort_by_rate_then_rank).and_return(['First Aid', 'Skinning'])
       allow(instance).to receive(:arrange_mob)
+      allow(instance).to receive(:check_skinning) do
+        instance.instance_variable_set(:@drbot_skin_succeeded, true)
+      end
+      allow(instance).to receive(:dissected?)
+
+      instance.skin_or_dissect('hog', game_state)
+
+      expect(instance).to have_received(:arrange_mob).with('hog', game_state).ordered
+      expect(instance).to have_received(:check_skinning).with('hog', game_state).ordered
+      expect(instance).not_to have_received(:dissected?)
+    end
+
+    it 'dissects after a confirmed failed skin, never after missing success alone' do
+      instance = build_dissector
+      allow(DRSkill).to receive(:getxp).and_return(10)
+      allow(instance).to receive(:arrange_mob)
       allow(instance).to receive(:check_skinning)
+      allow(instance).to receive(:dissected?)
 
       instance.skin_or_dissect('hog', game_state)
+      expect(instance).not_to have_received(:dissected?)
+
+      allow(instance).to receive(:check_skinning) do
+        instance.instance_variable_set(:@drbot_skin_failed, true)
+      end
+      instance.skin_or_dissect('hog', game_state)
+      expect(instance).to have_received(:dissected?).with('hog', game_state).once
+    end
+
+    it 'uses First Aid when Skinning is locked without attempting a locked skin first' do
+      instance = build_dissector(arrange_for_dissect: false)
+      allow(DRSkill).to receive(:getxp).with('Skinning').and_return(34)
+      allow(DRSkill).to receive(:getxp).with('First Aid').and_return(10)
+      allow(instance).to receive(:check_skinning)
+      allow(instance).to receive(:dissected?).and_return(true)
+
       instance.skin_or_dissect('hog', game_state)
 
-      expect(DRC).to have_received(:bput).with('dissect hog', any_args).once
-      expect(instance).to have_received(:check_skinning).with('hog', game_state).twice
+      expect(instance).to have_received(:dissected?).with('hog', game_state).once
+      expect(instance).not_to have_received(:check_skinning)
     end
 
     it 'stops the hunt without dissecting when the weapon cannot be stowed' do
