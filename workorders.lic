@@ -690,6 +690,14 @@ class WorkOrders
     match ? match[:remaining].to_i : nil
   end
 
+  # Live Khazdar 2026-10-26 04:22:32: an expired forging logbook answers
+  # 'You have nothing bundled with the logbook.' to UNTIE, and the trainer then
+  # gives a new order directly.
+  def expired_logbook_empty?(logbook)
+    DRC.bput("untie my #{logbook} logbook", 'You have nothing bundled with the logbook', 'You untie', 'You remove',
+             'What were you', 'I could not find').to_s.start_with?('You have nothing bundled with the logbook')
+  end
+
   def resume_or_request_work_order(recipes, npc_rooms, npc, npc_last_name, discipline, logbook, diff)
     exit if forging_purchase_pending?
     unless DRCI.get_item?("#{logbook} logbook")
@@ -704,7 +712,10 @@ class WorkOrders
     result = DRC.bput("read my #{logbook} logbook", *RESUME_LOGBOOK_PATTERNS)
     if rotating_forging? && result && !LOGBOOK_NO_ORDER_PATTERN.match?(result)
       identity = result.match(LOGBOOK_COMPLETE_PATTERN) || result.match(LOGBOOK_ITEM_PATTERN)
-      if result.include?('has expired') || !identity || !same_forging_discipline?(identity[:item], discipline)
+      # An expired order with nothing bundled is cleared only by asking the
+      # trainer; any other untie reply keeps the logbook and its custody.
+      expired_empty = result.include?('has expired') && expired_logbook_empty?(logbook)
+      if !expired_empty && (result.include?('has expired') || !identity || !same_forging_discipline?(identity[:item], discipline))
         stow_tool('logbook')
         publish_result('foreign_or_ambiguous_order', 'preserved logbook; reconcile its discipline, deadline and custody')
         Lich::Messaging.msg('bold', 'WorkOrders: Existing forging debt is expired, foreign or unidentified; no replacement, purchase or turn-in')
