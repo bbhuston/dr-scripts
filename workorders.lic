@@ -1624,12 +1624,23 @@ class WorkOrders
         end
         if smelted_recipe?(recipe, materials_info)
           pieces, ingots = smelt_batches(recipe, materials_info, quantity - attempts).first
-          Lich::Messaging.msg('plain', "WorkOrders: Buying #{ingots} #{materials_info['stock-name']} ingots to smelt for #{pieces} #{recipe['name']}")
+          need = pieces * recipe['volume']
+          remnants = forging_remnants(materials_info, need)
+          return false unless remnants
+
+          reused = remnants.sum { |_id, volume| volume }
+          ingots = [(need - reused + materials_info['stock-volume'] - 1) / materials_info['stock-volume'], 0].max if remnants.any?
+          Lich::Messaging.msg('plain', "WorkOrders: Buying #{ingots} #{materials_info['stock-name']} ingots to smelt for #{pieces} #{recipe['name']}" +
+                                       (remnants.any? ? " with #{remnants.length} owned remnants (#{reused} volumes)" : ''))
           ingots.times do
             return false unless purchase_and_stow_stock(stock_room, materials_info)
           end
-          remaining_volume = smelt_stock_safely(info, materials_info, ingots)
-          return false unless remaining_volume
+          if ingots.zero? && remnants.length == 1
+            @forging_stock_id, remaining_volume = remnants.first
+          else
+            remaining_volume = smelt_stock_safely(info, materials_info, ingots, remnants)
+            return false unless remaining_volume
+          end
         else
           return false unless purchase_and_stow_stock(stock_room, materials_info)
           remaining_volume = materials_info['stock-volume']
@@ -1877,37 +1888,96 @@ class WorkOrders
   # crucible. Returns the new ingot's analyzed volume, stowed, or nil after
   # stopping with the metal accounted for (backpack, crucible or at his feet).
   # Every reply is one the live canary saw; anything else stops.
-  def smelt_stock_safely(info, stock, count)
+  FORGING_REMNANT_LIMIT = 10
+
+  # drf (drg-7bpv, Jetski 2026-10-26 Bug 10): exact-stock forging kept every
+  # 1-2 volume split in the bag (Khazdar 04:20Z: 41 bronze ingot remnants,
+  # Very Heavy Burden). Before buying a smelted batch, owned remnants of the
+  # metal are taken by exact ID, measured with COUNT ("About 2 volumes of
+  # material make up the bronze ingot.", live 2026-10-26) and put back; those
+  # that fit within the batch's need join its crucible, and only the shortfall
+  # is bought fresh. nil when an owned ingot's custody became unconfirmed.
+  def forging_remnants(stock, need)
+    return [] unless exact_forging_stock? && defined?(GameObj) && GameObj.respond_to?(:containers)
+    return [] if DRC.left_hand || DRC.right_hand
+
     metal = stock['stock-name']
-    expected = count * stock['stock-volume']
+    bag = Array(GameObj.inv).find { |obj| obj.noun.to_s == @bag.to_s.split.last }
+    return [] unless bag
+    return [] unless DRC.bput("look in my #{@bag}", 'In the', 'There is nothing', 'I could not find', 'What were you').to_s.start_with?('In the')
+
+    contents = GameObj.containers[bag.id] || GameObj.containers[bag.id.to_s]
+    pending = Array(@purchased_stock_ids).map(&:to_s)
+    ids = Array(contents).select { |obj| obj.name.to_s.match?(/\b#{Regexp.escape(metal)} ingot\z/i) }
+                         .map { |obj| obj.id.to_s }.select { |id| id.match?(/\A[1-9]\d*\z/) }.uniq - pending
+    chosen = []
+    used = 0
+    ids.first(FORGING_REMNANT_LIMIT * 2).each do |id|
+      break if chosen.length >= FORGING_REMNANT_LIMIT || used >= need
+
+      volume = measure_forging_remnant(id, metal)
+      return nil if volume.nil?
+      next unless volume.positive? && used + volume <= need
+
+      chosen << [id, volume]
+      used += volume
+    end
+    chosen
+  end
+
+  # One owned ingot taken by its exact ID, counted and put back: its volume,
+  # 0 when it was not taken, nil when what is in hand is unconfirmed.
+  def measure_forging_remnant(id, metal)
+    DRC.bput("get ##{id} from my #{@bag}", 'You get', 'You pick up', 'I could not find', 'What were you', "You can't")
+    30.times do
+      break if held_forging_stock_id(metal) == id
+
+      pause 0.1
+    end
+    return 0 if !DRC.left_hand && !DRC.right_hand
+    return nil unless held_forging_stock_id(metal) == id
+
+    counted = DRC.bput('count my ingot', /About \d+ volumes? of material make up the #{Regexp.escape(metal)} ingot\./, 'I could not find', 'What were you')
+    volume = counted.to_s[/\AAbout (\d+) volumes?/, 1].to_i
+    return nil unless DRCI.put_away_item?("#{metal} ingot", @bag) && !DRCI.in_hands?("#{metal} ingot")
+
+    volume
+  end
+
+  def smelt_stock_safely(info, stock, count, remnants = [])
+    metal = stock['stock-name']
+    expected = count * stock['stock-volume'] + remnants.sum { |_id, volume| volume }
+    total = count + remnants.length
     room = Array(info['crucibles']).find do |candidate|
       DRCT.walk_to(candidate) && Room.current&.id == candidate &&
         DRC.bput('look in crucible', 'There is nothing in there', 'In the .* you see', 'I could not find', 'What were you') == 'There is nothing in there'
     end
     unless room
-      Lich::Messaging.msg('bold', "WorkOrders: No empty crucible was found; #{count} #{metal} ingots stay in the #{@bag}")
+      Lich::Messaging.msg('bold', "WorkOrders: No empty crucible was found; #{total} #{metal} ingots stay in the #{@bag}")
       return nil
     end
     if exact_forging_stock? && (!@purchased_stock_ids.is_a?(Array) || @purchased_stock_ids.length != count || @purchased_stock_ids.uniq.length != count)
       Lich::Messaging.msg('bold', 'WorkOrders: Fresh smelt input identities are incomplete; no crucible loading')
       return nil
     end
-    count.times do |index|
+    # Purchased ingots first, then any measured remnants (exact stock only).
+    inputs = Array.new(count) { [nil, stock['stock-volume'], true] } + remnants.map { |id, volume| [id, volume, false] }
+    inputs.each_with_index do |(remnant_id, volume, purchased), index|
+      id = purchased ? @purchased_stock_ids&.first : remnant_id
       taken = if exact_forging_stock?
-                take_exact_forging_stock(@purchased_stock_ids.first, metal, stock['stock-volume'])
+                take_exact_forging_stock(id, metal, volume)
               else
                 DRCI.get_item?("#{metal} ingot", @bag) && DRCI.in_hands?("#{metal} ingot")
               end
       unless taken
-        Lich::Messaging.msg('bold', "WorkOrders: Ingot #{index + 1} of #{count} was not taken for smelting; stopping")
+        Lich::Messaging.msg('bold', "WorkOrders: Ingot #{index + 1} of #{total} was not taken for smelting; stopping")
         return nil
       end
       unless DRC.bput('put my ingot in crucible', 'You put your ingot in the', 'I could not find', 'What were you', "You can't", 'too full').to_s.start_with?('You put your ingot in the')
-        Lich::Messaging.msg('bold', "WorkOrders: Ingot #{index + 1} of #{count} did not go into the crucible; stopping")
+        Lich::Messaging.msg('bold', "WorkOrders: Ingot #{index + 1} of #{total} did not go into the crucible; stopping")
         return nil
       end
       if exact_forging_stock?
-        id = @purchased_stock_ids.first
         30.times do
           break unless held_forging_stock_id(metal) == id
 
@@ -1915,12 +1985,12 @@ class WorkOrders
         end
         return nil if held_forging_stock_id(metal) == id
 
-        @purchased_stock_ids.shift
+        @purchased_stock_ids.shift if purchased
       end
     end
     counted = DRC.bput('count crucible', /a #{metal} ingot - \d+/, 'There is nothing', 'I could not find', 'What were you')
-    unless counted == "a #{metal} ingot - #{count}"
-      Lich::Messaging.msg('bold', "WorkOrders: The crucible holds #{counted.inspect}, not #{count} #{metal} ingots; stopping")
+    unless counted == "a #{metal} ingot - #{total}"
+      Lich::Messaging.msg('bold', "WorkOrders: The crucible holds #{counted.inspect}, not #{total} #{metal} ingots; stopping")
       return nil
     end
     return nil unless smelt_tool_in_hand?('stirring rod', :right)
@@ -2001,7 +2071,7 @@ class WorkOrders
       Lich::Messaging.msg('bold', 'WorkOrders: The smelted ingot was not stowed; stopping')
       return nil
     end
-    Lich::Messaging.msg('plain', "WorkOrders: Smelted #{count} #{metal} ingots into one #{volume}-volume ingot")
+    Lich::Messaging.msg('plain', "WorkOrders: Smelted #{total} #{metal} ingots into one #{volume}-volume ingot")
     volume
   end
 
