@@ -1759,7 +1759,7 @@ class LootProcess
     return if @harvest_corpse_gone || @drbot_harvest_deferred || @harvest_stopped
     return if @drbot_harvest_ids && @drbot_harvest_corpse && @drbot_harvest_corpse[:skinned]
 
-    dissected?(mob_noun, game_state) if dissect_eligible && game_state.dissectable?(mob_noun)
+    dissected?(mob_noun, game_state) if @dissect && game_state.dissectable?(mob_noun) && !checkinvisible && !checkhidden
   end
 
   def dissected?(mob_noun, game_state)
